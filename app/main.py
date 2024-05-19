@@ -24,12 +24,22 @@ MONGO_URI = "mongodb://mongodb:27017"
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["mydb"]
 users_collection = db["users"]
+books_collection = db["books"]
 book_pages_collection = db["book_pages"]
+
 
 class UserCreate(BaseModel):
     username: str
     email: str
     password: str
+
+
+class Book(BaseModel):
+    title: str
+    author: str
+    isbn: str
+    # Add any other fields as needed
+
 
 class BookPage(BaseModel):
     title: str
@@ -50,6 +60,7 @@ async def create_user(user: UserCreate):
 
     return user  # Return the UserCreate object directly
 
+
 @app.post("/login")
 async def login(email: str = Form(...), password: str = Form(...)):
     # Check if the user exists and the password is correct
@@ -57,18 +68,26 @@ async def login(email: str = Form(...), password: str = Form(...)):
     if user is None:
         raise HTTPException(status_code=400, detail="Invalid credentials")
     token = jwt.encode({"user_id": str(user["_id"])}, SECRET_KEY, algorithm="HS256")
-    return {"message": "Login successful", "username": user.get('username'), "token": token}
+    return {
+        "message": "Login successful",
+        "username": user.get("username"),
+        "token": token,
+    }
 
-@app.post("/reset_password")    
+
+@app.post("/reset_password")
 async def reset_password(email: str = Form(...), new_password: str = Form(...)):
     # Check if the user exists and update the password
     user = await users_collection.find_one({"email": email})
     if user is None:
         raise HTTPException(status_code=400, detail="User not found")
 
-    await users_collection.update_one({"email": email}, {"$set": {"password": new_password}})
+    await users_collection.update_one(
+        {"email": email}, {"$set": {"password": new_password}}
+    )
 
     return {"message": "Password reset successful"}
+
 
 def get_current_user_authorization(request: Request, token: str = Header(None)):
     if token is None:
@@ -80,22 +99,34 @@ def get_current_user_authorization(request: Request, token: str = Header(None)):
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    
+
+
+@app.post("/create_book")
+async def create_book(book: Book):
+    # Insert the book into the MongoDB collection
+    result = await books_collection.insert_one(book.dict())
+    inserted_id = str(result.inserted_id)
+    return {"message": "Book created successfully", "book_id": inserted_id}
+
+
 @app.post("/save_book_page")
-async def save_book_page(book_page: BookPage, current_user: dict = Depends(get_current_user_authorization)):
+async def save_book_page(
+    book_page: BookPage, current_user: dict = Depends(get_current_user_authorization)
+):
     # Associate the book page with the user who is currently logged in
-    book_page.username = current_user.get('username')
+    book_page.username = current_user.get("username")
 
     # Insert the book page into the MongoDB collection
     await book_pages_collection.insert_one(book_page.dict())
     return {"message": "Book page saved successfully"}
 
+
 @app.get("/get_book_page/{book_id}/{page_number}")
 async def get_book_page(book_id: str, page_number: int):
     # Retrieve the book page by book_id and page_number from the MongoDB collection
-    book_page = await book_pages_collection.find_one({"_id": book_id, "page_number": page_number})
+    book_page = await book_pages_collection.find_one(
+        {"_id": book_id, "page_number": page_number}
+    )
     if book_page is None:
         raise HTTPException(status_code=404, detail="Page not found")
     return book_page
-
-

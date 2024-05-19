@@ -4,3 +4,4 @@ pydantic
 motor
 python-multipart
 PyJWT
+black

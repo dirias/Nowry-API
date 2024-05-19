@@ -17,6 +17,9 @@ services:
       - mongodb
     volumes:
       - .:/app
+    environment:
+      - ENV=local
+      - DEBUG=True
 
   mongo-express:
     image: mongo-express
