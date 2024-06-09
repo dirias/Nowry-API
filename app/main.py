@@ -10,14 +10,14 @@ SECRET_KEY = secrets.token_hex(32)
 app = FastAPI()
 
 origins = [
-    "http://localhost:3000",  # Add the origin of your React application
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
