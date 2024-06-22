@@ -1,6 +1,7 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from pymongo.collection import Collection
+from bson import ObjectId
 from app.models.Book import Book
 from app.config.database import books_collection
 
@@ -46,8 +47,7 @@ async def edit_book(
 async def delete_book(
     book_id: str, books_collection: Collection = Depends(get_books_collection)
 ):
-    # Check if the book exists
-    existing_book = await books_collection.find_one({"_id": book_id})
+    existing_book = await books_collection.find_one({"_id": ObjectId(book_id)})
     if existing_book is None:
         raise HTTPException(status_code=404, detail="Book not found")
 
@@ -72,4 +72,20 @@ async def get_all_books(books_collection: Collection = Depends(get_books_collect
     # Retrieve all books from the MongoDB collection
     cursor = books_collection.find({})
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
+    for book in books:
+        book["_id"] = str(book["_id"])  # TODO: Improve to avoid this loop
     return books
+
+
+@router.get("/{book_id}", response_model=Book)
+async def get_book_by_id(
+    book_id: str, books_collection: Collection = Depends(get_books_collection)
+):
+    # Find the book by its ID in the MongoDB collection
+    print("testing")
+    book = await books_collection.find_one({"_id": ObjectId(book_id)})
+    if book:
+        book["_id"] = str(book["_id"])
+        return book
+    else:
+        raise HTTPException(status_code=404, detail="Book not found")
