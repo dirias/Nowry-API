@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.models.Page import Page
-from app.config.database import book_pages_collection
+from bson import ObjectId
+from app.config.database import book_pages_collection, books_collection
+from pymongo.collection import Collection
 from app.auth import get_current_user_authorization
 
 router = APIRouter(
@@ -10,16 +12,30 @@ router = APIRouter(
 )
 
 
+def get_page_collection() -> Collection:
+    # Assuming books_collection is defined in your MongoDB configuration
+    return book_pages_collection
+
+
+def get_book_collection() -> Collection:
+    # Assuming books_collection is defined in your MongoDB configuration
+    return books_collection
+
+
 @router.post("/save_book_page", response_model=Page)
 async def save_book_page(
-    book_page: Page, current_user: dict = Depends(get_current_user_authorization)
+    book_page: Page,
+    book_pages_collection: Collection = Depends(get_page_collection),
+    books_collection: Collection = Depends(get_book_collection),
 ):
-    # Associate the book page with the user who is currently logged in
-    book_page.username = current_user.get("username")
-
     # Insert the book page into the MongoDB collection
-    await book_pages_collection.insert_one(book_page.dict())
-    return {"message": "Book page saved successfully"}
+    result = await book_pages_collection.insert_one(book_page.dict(by_alias=True))
+
+    await books_collection.update_one(
+        {"_id": ObjectId(book_page.book_id)}, {"$push": {"pages": result.inserted_id}}
+    )
+
+    return book_page
 
 
 @router.get("/get_book_page/{book_id}/{page_number}", response_model=Page)

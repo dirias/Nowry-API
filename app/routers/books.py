@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book
-from app.config.database import books_collection
+from app.config.database import books_collection, book_pages_collection
 
 router = APIRouter(
     prefix="/book",
@@ -17,12 +17,16 @@ def get_books_collection() -> Collection:
     # Assuming books_collection is defined in your MongoDB configuration
     return books_collection
 
+def get_page_collection() -> Collection:
+    # Assuming books_collection is defined in your MongoDB configuration
+    return book_pages_collection
+
 
 @router.post("/create", summary="Create a new book", response_model=Book)
 async def create_book(
     book: Book, books_collection: Collection = Depends(get_books_collection)
 ):
-    await books_collection.insert_one(book.dict())
+    await books_collection.insert_one(book.dict(by_alias=True))
     return book
 
 
@@ -74,18 +78,31 @@ async def get_all_books(books_collection: Collection = Depends(get_books_collect
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
     for book in books:
         book["_id"] = str(book["_id"])  # TODO: Improve to avoid this loop
+        book["pages"] = [str(page) for page in book["pages"]]
     return books
 
 
-@router.get("/{book_id}", response_model=Book)
+@router.get("/{book_id}")
 async def get_book_by_id(
-    book_id: str, books_collection: Collection = Depends(get_books_collection)
+    book_id: str, books_collection: Collection = Depends(get_books_collection), book_pages_collection: Collection = Depends(get_page_collection)
 ):
     # Find the book by its ID in the MongoDB collection
     print("testing")
     book = await books_collection.find_one({"_id": ObjectId(book_id)})
     if book:
         book["_id"] = str(book["_id"])
+
+        
+        # Retrieve all pages related to this book
+        cursor = book_pages_collection.find({"book_id": book_id})
+        pages = await cursor.to_list(length=50)  # Limit to 100 pages for safety
+
+        # Convert ObjectId to str for _id in pages
+        for page in pages:
+            page["_id"] = str(page["_id"])
+
+        # Add pages to the book dictionary
+        book["pages"] = pages
         return book
     else:
         raise HTTPException(status_code=404, detail="Book not found")
