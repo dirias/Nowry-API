@@ -8,7 +8,7 @@ from datetime import datetime
 class Page(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     book_id: PyObjectId
-    page_number: int
+    page_number: int = 1
     content: str = ""
     word_count: int = 0
     created_at: datetime = Field(default_factory=datetime.now)

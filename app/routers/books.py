@@ -3,7 +3,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book
+from app.models.Page import Page
 from app.config.database import books_collection, book_pages_collection
+
+from ..routers.book_pages import save_book_page
 
 router = APIRouter(
     prefix="/book",
@@ -17,6 +20,7 @@ def get_books_collection() -> Collection:
     # Assuming books_collection is defined in your MongoDB configuration
     return books_collection
 
+
 def get_page_collection() -> Collection:
     # Assuming books_collection is defined in your MongoDB configuration
     return book_pages_collection
@@ -26,7 +30,12 @@ def get_page_collection() -> Collection:
 async def create_book(
     book: Book, books_collection: Collection = Depends(get_books_collection)
 ):
-    await books_collection.insert_one(book.dict(by_alias=True))
+    new_book = await books_collection.insert_one(book.dict(by_alias=True))
+    if new_book:
+        await save_book_page(
+            Page(book_id=str(book.id)), book_pages_collection, books_collection
+        )
+        # raise error in case
     return book
 
 
@@ -84,7 +93,9 @@ async def get_all_books(books_collection: Collection = Depends(get_books_collect
 
 @router.get("/{book_id}")
 async def get_book_by_id(
-    book_id: str, books_collection: Collection = Depends(get_books_collection), book_pages_collection: Collection = Depends(get_page_collection)
+    book_id: str,
+    books_collection: Collection = Depends(get_books_collection),
+    book_pages_collection: Collection = Depends(get_page_collection),
 ):
     # Find the book by its ID in the MongoDB collection
     print("testing")
@@ -92,7 +103,6 @@ async def get_book_by_id(
     if book:
         book["_id"] = str(book["_id"])
 
-        
         # Retrieve all pages related to this book
         cursor = book_pages_collection.find({"book_id": book_id})
         pages = await cursor.to_list(length=50)  # Limit to 100 pages for safety
