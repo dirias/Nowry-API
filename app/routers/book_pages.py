@@ -28,12 +28,28 @@ async def save_book_page(
     book_pages_collection: Collection = Depends(get_page_collection),
     books_collection: Collection = Depends(get_book_collection),
 ):
-    # Insert the book page into the MongoDB collection
-    result = await book_pages_collection.insert_one(book_page.dict(by_alias=True))
-
-    await books_collection.update_one(
-        {"_id": ObjectId(book_page.book_id)}, {"$push": {"pages": result.inserted_id}}
+    # Check if the page already exists
+    existing_page = await book_pages_collection.find_one(
+        {"_id": ObjectId(book_page.id)}
     )
+    if existing_page:
+        # Update the existing page
+        result = await book_pages_collection.update_one(
+            {"_id": ObjectId(book_page.id)},
+            {"$set": book_page.dict(by_alias=True, exclude={"id"})},
+        )
+        if not result.acknowledged:
+            raise HTTPException(
+                status_code=404, detail="Unable to update page {book_page.id}"
+            )
+    else:
+        # Insert the book page into the MongoDB collection
+        result = await book_pages_collection.insert_one(book_page.dict(by_alias=True))
+
+        await books_collection.update_one(
+            {"_id": ObjectId(book_page.book_id)},
+            {"$push": {"pages": result.inserted_id}},
+        )
 
     return book_page
 

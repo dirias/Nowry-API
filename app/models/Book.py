@@ -23,9 +23,8 @@ class Book(BaseModel):
         allow_population_by_field_name = True
         json_encoders = {ObjectId: str}
         arbitrary_types_allowed = True
-    
+
     def dict(self, **kwargs):
         d = super().dict(**kwargs)
-        d['id'] = str(d['id'])
-        d['pages'] = [str(page) for page in d['pages']]
+        d["pages"] = [str(page) for page in d["pages"]]
         return d
