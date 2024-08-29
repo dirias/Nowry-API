@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from pymongo.collection import Collection
@@ -46,28 +47,55 @@ async def edit_book(
     books_collection: Collection = Depends(get_books_collection),
 ):
     # Check if the book exists
-    existing_book = await books_collection.find_one({"_id": book_id})
+    existing_book = await books_collection.find_one({"_id": ObjectId(book_id)})
     if existing_book is None:
         raise HTTPException(status_code=404, detail="Book not found")
 
     # Update the book data
-    await books_collection.update_one({"_id": book_id}, {"$set": book_data.dict()})
+    res = await books_collection.update_one(
+        {"_id": ObjectId(book_id)},
+        {
+            "$set": {
+                "title": book_data.title,
+                "updated_at": datetime.now(),
+                "summary": book_data.summary,
+                "cover_color": book_data.cover_color,
+                "tags": book_data.tags,
+            }
+        },
+    )
+
+    if res.modified_count == 0:
+        raise HTTPException(
+            status_code=404, detail="Book update failed or no changes were made"
+        )
 
     return {"message": "Book updated successfully"}
 
 
 @router.delete("/delete/{book_id}", summary="Delete a book by ID")
 async def delete_book(
-    book_id: str, books_collection: Collection = Depends(get_books_collection)
+    book_id: str,
+    books_collection: Collection = Depends(get_books_collection),
+    pages_collection: Collection = Depends(get_page_collection),
 ):
+    # Check if the book exists
     existing_book = await books_collection.find_one({"_id": ObjectId(book_id)})
     if existing_book is None:
         raise HTTPException(status_code=404, detail="Book not found")
 
+    # Delete all pages associated with the book
+    deleted_pages_result = await pages_collection.delete_many({"book_id": book_id})
     # Delete the book
-    await books_collection.delete_one({"_id": book_id})
+    deleted_book_result = await books_collection.delete_one({"_id": ObjectId(book_id)})
 
-    return {"message": "Book deleted successfully"}
+    if deleted_book_result.deleted_count == 1:
+        return {
+            "message": "Book and associated pages deleted successfully",
+            "deleted_pages_count": deleted_pages_result.deleted_count,
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Error deleting the book")
 
 
 @router.get("/search", summary="Search books by title", response_model=List[Book])
