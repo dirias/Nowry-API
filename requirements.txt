@@ -6,3 +6,4 @@ motor
 python-multipart
 PyJWT
 black
+groq
