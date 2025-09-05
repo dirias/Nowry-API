@@ -7,7 +7,7 @@ class Groq_client:
     def __init__(self) -> None:
         """ """
         self.client = Groq(
-            api_key="",
+            api_key="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",
         )
         self.model = "llama3-8b-8192"
 

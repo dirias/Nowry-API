@@ -41,7 +41,7 @@ async def generate_card(payload: CardGenerationRequest):
 
         # Assuming the AI returns a response with card details
         response_content = ai_response.choices[0].message.content
-        print(f'reponse_content', response_content)
+        print(f"reponse_content", response_content)
         study_cards = response_content[
             response_content.find("[") : response_content.rfind("]") + 1
         ]
