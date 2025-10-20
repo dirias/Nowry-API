@@ -9,7 +9,7 @@ class Groq_client:
         self.client = Groq(
             api_key="",
         )
-        self.model = "llama3-8b-8192"
+        self.model = "openai/gpt-oss-20b"
 
     def request(self, request_string) -> dict:
         """ """
