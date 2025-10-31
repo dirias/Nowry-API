@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import book_pages, books, users, sessions, cards, study_cards
+from app.routers import book_pages, books, users, sessions, cards, study_cards, tasks
 
 import secrets
 
@@ -29,3 +29,4 @@ app.include_router(cards.router)
 app.include_router(study_cards.router)
 
 # Additional routes and middleware if needed
+app.include_router(tasks.router)
