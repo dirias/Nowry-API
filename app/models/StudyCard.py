@@ -1,10 +1,11 @@
 from pydantic import BaseModel, Field
+from .types import PyObjectId
 from typing import List, Optional
 from datetime import datetime, timedelta
 
 
 class StudyCard(BaseModel):
-    id: int
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     title: str = Field(..., max_length=100)
     content: str
     tags: Optional[List[str]] = None
