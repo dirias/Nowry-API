@@ -1,9 +1,11 @@
-# main.py
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import book_pages, books, users, sessions, cards, study_cards
 
 import secrets
+
+load_dotenv()
 
 SECRET_KEY = secrets.token_hex(32)
 

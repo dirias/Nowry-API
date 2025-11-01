@@ -15,6 +15,7 @@ router = APIRouter(
 
 logger = get_logger(__name__)
 
+
 def get_cards_collection() -> Collection:
     return cards_collection
 
@@ -52,6 +53,7 @@ async def get_study_card(
 
     card["_id"] = str(card["_id"])
     return StudyCard(**card)
+
 
 @router.get("/", summary="List all study cards", response_model=List[StudyCard])
 async def list_study_cards(
