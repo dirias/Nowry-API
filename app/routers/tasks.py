@@ -37,3 +37,55 @@ async def create_task(task: Task, collection: Collection = Depends(get_tasks_col
 
     logger.info(f"Task created successfully with ID: {task.id}")
     return task
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pymongo.collection import Collection
+from datetime import datetime
+from uuid import UUID
+from app.models.Task import Task
+from app.config.database import tasks_collection
+from app.utils.logger import get_logger
+
+router = APIRouter(
+    prefix="/tasks",
+    tags=["tasks"],
+    responses={404: {"description": "Not found"}},
+)
+
+logger = get_logger(__name__)
+
+def get_tasks_collection() -> Collection:
+    return tasks_collection
+
+
+@router.delete(
+    "/{id}",
+    summary="Soft delete a task",
+    status_code=status.HTTP_204_NO_CONTENT
+)
+async def soft_delete_task(id: str, collection: Collection = Depends(get_tasks_collection)):
+    logger.info(f"Attempting to soft delete task with ID: {id}")
+
+    try:
+        task_id = UUID(id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
+
+    task = await collection.find_one({"id": str(task_id)})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.get("deleted_at") is not None:
+        raise HTTPException(status_code=409, detail="Task already soft-deleted")
+
+    deleted_at = datetime.utcnow()
+    result = await collection.update_one(
+        {"id": str(task_id)},
+        {"$set": {"deleted_at": deleted_at, "updated_at": deleted_at}}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to soft delete task")
+
+    logger.info(f"Task {id} marked as deleted at {deleted_at.isoformat()}")
+    return None  
