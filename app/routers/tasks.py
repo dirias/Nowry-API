@@ -117,3 +117,32 @@ async def update_task(
 
     logger.info(f"Task {id} updated successfully")
     return updated_task
+
+from fastapi import Query
+
+@router.get("/search", summary="Search active tasks by name", response_model=list[Task])
+async def search_tasks(
+    name: str = Query(..., description="Partial name to search for"),
+    collection: Collection = Depends(get_tasks_collection)
+):
+    """
+    Search for active (non-deleted) tasks by partial, case-insensitive name match.
+    Returns only tasks where deleted_at is null.
+    """
+
+    logger.info(f"Searching tasks by name: {name}")
+
+    if not name or len(name.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Query parameter 'name' is required")
+
+    regex = {"$regex": name, "$options": "i"}
+
+    cursor = collection.find(
+        {"title": regex, "deleted_at": None}
+    )
+
+    tasks = await cursor.to_list(length=None)
+
+    logger.info(f"Found {len(tasks)} task(s) matching '{name}'")
+
+    return tasks
