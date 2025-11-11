@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
 from bson import ObjectId
 from pymongo.collection import Collection
 from datetime import datetime
@@ -117,8 +117,6 @@ async def update_task(
 
     logger.info(f"Task {id} updated successfully")
     return updated_task
-
-from fastapi import Query
 
 @router.get("/search", summary="Search active tasks by name", response_model=list[Task])
 async def search_tasks(
