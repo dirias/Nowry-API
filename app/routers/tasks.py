@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
+from bson import ObjectId
 from pymongo.collection import Collection
 from datetime import datetime
 from uuid import uuid4, UUID
@@ -75,3 +76,71 @@ async def soft_delete_task(id: str, collection: Collection = Depends(get_tasks_c
 
     logger.info(f"Task {id} marked as deleted at {deleted_at.isoformat()}")
     return None
+
+@router.patch("/{id}", summary="Update an existing task", response_model=Task)
+async def update_task(
+    id: str,
+    data: dict = Body(...),
+    collection: Collection = Depends(get_tasks_collection)
+):
+    """
+    Update one or more fields of an existing task.
+    - Only updates tasks where deleted_at is null.
+    - Refreshes updated_at timestamp automatically.
+    """
+    logger.info(f"Updating task {id}")
+
+    if not ObjectId.is_valid(id):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
+
+    existing_task = await collection.find_one({"_id": ObjectId(id), "deleted_at": None})
+    if not existing_task:
+        raise HTTPException(status_code=404, detail="Task not found or soft-deleted")
+
+    allowed_fields = {"title", "description", "status"}
+    update_data = {k: v for k, v in data.items() if k in allowed_fields}
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid fields provided for update")
+
+    update_data["updated_at"] = datetime.utcnow()
+
+    result = await collection.update_one(
+        {"_id": ObjectId(id)},
+        {"$set": update_data}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="No changes were applied")
+
+    updated_task = await collection.find_one({"_id": ObjectId(id)})
+
+    logger.info(f"Task {id} updated successfully")
+    return updated_task
+
+@router.get("/search", summary="Search active tasks by name", response_model=list[Task])
+async def search_tasks(
+    name: str = Query(..., description="Partial name to search for"),
+    collection: Collection = Depends(get_tasks_collection)
+):
+    """
+    Search for active (non-deleted) tasks by partial, case-insensitive name match.
+    Returns only tasks where deleted_at is null.
+    """
+
+    logger.info(f"Searching tasks by name: {name}")
+
+    if not name or len(name.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Query parameter 'name' is required")
+
+    regex = {"$regex": name, "$options": "i"}
+
+    cursor = collection.find(
+        {"title": regex, "deleted_at": None}
+    )
+
+    tasks = await cursor.to_list(length=None)
+
+    logger.info(f"Found {len(tasks)} task(s) matching '{name}'")
+
+    return tasks
