@@ -22,6 +22,9 @@ httpx>=0.27.0
 # --- Utils / Logging ---
 python-dotenv>=1.0.1
 python-json-logger>=2.0.7
+PyPDF2
+pymupdf
+mammoth
 
 # --- Testing ---
 #pytest>=8.2.0

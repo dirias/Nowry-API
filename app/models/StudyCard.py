@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 
 class StudyCard(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    user_id: Optional[PyObjectId] = None
+    deck_id: Optional[PyObjectId] = None
     title: str = Field(..., max_length=100)
     content: str
     tags: Optional[List[str]] = None

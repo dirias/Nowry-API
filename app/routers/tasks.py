@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
+from fastapi import APIRouter, Depends, HTTPException
+from typing import List, Optional
+from datetime import datetime
 from bson import ObjectId
 from pymongo.collection import Collection
-from datetime import datetime
-from uuid import uuid4, UUID
 from app.models.Task import Task
-from app.config.database import tasks_collection
+from app.config.database import db
 from app.utils.logger import get_logger
+from app.auth.auth import get_current_user_authorization
 
 router = APIRouter(
     prefix="/tasks",
@@ -17,130 +18,139 @@ logger = get_logger(__name__)
 
 
 def get_tasks_collection() -> Collection:
-    return tasks_collection
+    return db.get_collection("tasks")
 
 
-@router.post(
-    "/",
-    summary="Create a new task",
-    response_model=Task,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_task(task: Task, collection: Collection = Depends(get_tasks_collection)):
-    logger.info(f"Creating new task: {task.title}")
+@router.post("/", summary="Create a new task", response_model=Task)
+async def create_task(
+    task: Task,
+    collection: Collection = Depends(get_tasks_collection),
+    user: dict = Depends(get_current_user_authorization),
+):
+    user_id = user.get("user_id")
+    logger.info(f"User {user_id} creating task: {task.title}")
 
-    task.id = uuid4()
+    task.user_id = user_id
     task.created_at = datetime.utcnow()
     task.updated_at = datetime.utcnow()
 
-    if not task.title or len(task.title.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Title is required")
-
-    task_dict = task.dict(by_alias=True)
+    task_dict = task.dict(by_alias=True, exclude={"id"})
     result = await collection.insert_one(task_dict)
 
-    if not result.inserted_id:
-        raise HTTPException(status_code=500, detail="Failed to insert task")
+    created_task = await collection.find_one({"_id": result.inserted_id})
+    created_task["_id"] = str(created_task["_id"])
+    if created_task.get("user_id"):
+        created_task["user_id"] = str(created_task["user_id"])
 
-    logger.info(f"Task created successfully with ID: {task.id}")
-    return task
+    return created_task
 
-@router.delete(
-    "/{id}",
-    summary="Soft delete a task",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def soft_delete_task(id: str, collection: Collection = Depends(get_tasks_collection)):
-    logger.info(f"Attempting to soft delete task with ID: {id}")
 
-    try:
-        task_id = UUID(id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid task ID format")
+@router.get("/", summary="List all tasks", response_model=List[Task])
+async def list_tasks(
+    completed: Optional[bool] = None,
+    category: Optional[str] = None,
+    collection: Collection = Depends(get_tasks_collection),
+    user: dict = Depends(get_current_user_authorization),
+):
+    user_id = user.get("user_id")
+    logger.info(f"Listing tasks for user: {user_id}")
 
-    task = await collection.find_one({"id": str(task_id)})
+    # Build query
+    query = {"user_id": user_id}
+    if completed is not None:
+        query["is_completed"] = completed
+    if category:
+        query["category"] = category
+
+    tasks = await collection.find(query).sort("created_at", -1).to_list(1000)
+
+    for task in tasks:
+        task["_id"] = str(task["_id"])
+        if task.get("user_id"):
+            task["user_id"] = str(task["user_id"])
+
+    return tasks
+
+
+@router.get("/{id}", summary="Get a task by ID", response_model=Task)
+async def get_task(
+    id: str,
+    collection: Collection = Depends(get_tasks_collection),
+    user: dict = Depends(get_current_user_authorization),
+):
+    user_id = user.get("user_id")
+    logger.info(f"User {user_id} fetching task with ID: {id}")
+
+    task = await collection.find_one({"_id": ObjectId(id)})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task.get("deleted_at") is not None:
-        raise HTTPException(status_code=409, detail="Task already soft-deleted")
+    # Authorization check
+    if str(task.get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to view this task")
 
-    deleted_at = datetime.utcnow()
-    result = await collection.update_one(
-        {"id": str(task_id)},
-        {"$set": {"deleted_at": deleted_at, "updated_at": deleted_at}},
-    )
+    task["_id"] = str(task["_id"])
+    if task.get("user_id"):
+        task["user_id"] = str(task["user_id"])
 
-    if result.modified_count == 0:
-        raise HTTPException(status_code=500, detail="Failed to soft delete task")
+    return task
 
-    logger.info(f"Task {id} marked as deleted at {deleted_at.isoformat()}")
-    return None
 
-@router.patch("/{id}", summary="Update an existing task", response_model=Task)
+@router.patch("/{id}", summary="Update a task", response_model=Task)
 async def update_task(
     id: str,
-    data: dict = Body(...),
-    collection: Collection = Depends(get_tasks_collection)
+    updates: dict,
+    collection: Collection = Depends(get_tasks_collection),
+    user: dict = Depends(get_current_user_authorization),
 ):
-    """
-    Update one or more fields of an existing task.
-    - Only updates tasks where deleted_at is null.
-    - Refreshes updated_at timestamp automatically.
-    """
-    logger.info(f"Updating task {id}")
+    user_id = user.get("user_id")
+    logger.info(f"User {user_id} updating task {id}")
 
-    if not ObjectId.is_valid(id):
-        raise HTTPException(status_code=400, detail="Invalid task ID format")
+    # Fetch the task
+    task = await collection.find_one({"_id": ObjectId(id)})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-    existing_task = await collection.find_one({"_id": ObjectId(id), "deleted_at": None})
-    if not existing_task:
-        raise HTTPException(status_code=404, detail="Task not found or soft-deleted")
+    # Authorization check
+    if str(task.get("user_id")) != str(user_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to update this task"
+        )
 
-    allowed_fields = {"title", "description", "status"}
-    update_data = {k: v for k, v in data.items() if k in allowed_fields}
+    # Add updated timestamp
+    updates["updated_at"] = datetime.utcnow()
 
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No valid fields provided for update")
+    # Update the task
+    await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
 
-    update_data["updated_at"] = datetime.utcnow()
-
-    result = await collection.update_one(
-        {"_id": ObjectId(id)},
-        {"$set": update_data}
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=400, detail="No changes were applied")
-
+    # Return updated task
     updated_task = await collection.find_one({"_id": ObjectId(id)})
+    updated_task["_id"] = str(updated_task["_id"])
+    if updated_task.get("user_id"):
+        updated_task["user_id"] = str(updated_task["user_id"])
 
-    logger.info(f"Task {id} updated successfully")
     return updated_task
 
-@router.get("/search", summary="Search active tasks by name", response_model=list[Task])
-async def search_tasks(
-    name: str = Query(..., description="Partial name to search for"),
-    collection: Collection = Depends(get_tasks_collection)
+
+@router.delete("/{id}", summary="Delete a task")
+async def delete_task(
+    id: str,
+    collection: Collection = Depends(get_tasks_collection),
+    user: dict = Depends(get_current_user_authorization),
 ):
-    """
-    Search for active (non-deleted) tasks by partial, case-insensitive name match.
-    Returns only tasks where deleted_at is null.
-    """
+    user_id = user.get("user_id")
+    logger.info(f"User {user_id} deleting task {id}")
 
-    logger.info(f"Searching tasks by name: {name}")
+    # Fetch the task
+    task = await collection.find_one({"_id": ObjectId(id)})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-    if not name or len(name.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Query parameter 'name' is required")
+    # Authorization check
+    if str(task.get("user_id")) != str(user_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to delete this task"
+        )
 
-    regex = {"$regex": name, "$options": "i"}
-
-    cursor = collection.find(
-        {"title": regex, "deleted_at": None}
-    )
-
-    tasks = await cursor.to_list(length=None)
-
-    logger.info(f"Found {len(tasks)} task(s) matching '{name}'")
-
-    return tasks
+    await collection.delete_one({"_id": ObjectId(id)})
+    return {"message": "Task deleted successfully"}

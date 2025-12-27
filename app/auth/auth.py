@@ -1,17 +1,18 @@
 from fastapi import HTTPException, Header, Request
 import jwt
-import secrets
-
-SECRET_KEY = secrets.token_hex(32)
+from app.config.auth_config import SECRET_KEY
 
 
 def get_current_user_authorization(request: Request):
-    if request.headers.get("Authorization") is None:
+    auth_header = request.headers.get("Authorization")
+    if auth_header is None:
         raise HTTPException(status_code=401, detail="Token is missing")
+
+    # Handle 'Bearer <token>' format
+    token = auth_header.replace("Bearer ", "")
+
     try:
-        payload = jwt.decode(
-            request.headers.get("Authorization"), SECRET_KEY, algorithms=["HS256"]
-        )
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")

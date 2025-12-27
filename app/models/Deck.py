@@ -6,7 +6,7 @@ from .types import PyObjectId
 
 class Deck(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
-    user_id: PyObjectId
+    user_id: Optional[PyObjectId] = None
     name: str
     description: Optional[str] = None
     image_url: Optional[str] = None

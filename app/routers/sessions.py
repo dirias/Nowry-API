@@ -1,9 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Form
 import jwt
 from app.config.database import users_collection
-import secrets
-
-SECRET_KEY = secrets.token_hex(32)
+from app.config.auth_config import SECRET_KEY
 
 router = APIRouter(
     prefix="/session",
