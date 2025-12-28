@@ -14,6 +14,7 @@ langgraph>=0.0.53
 langchain>=0.2.12
 langchain-core>=0.2.24
 langchain-community>=0.2.9
+langchain-groq>=0.1.6
 faiss-cpu>=1.8.0
 sentence-transformers>=2.7.0
 torch>=2.2.2

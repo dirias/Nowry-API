@@ -10,6 +10,8 @@ from app.routers import (
     study_cards,
     tasks,
     decks,
+    quizzes,
+    visualizer,
 )
 
 load_dotenv()
@@ -32,3 +34,5 @@ app.include_router(cards.router)
 app.include_router(study_cards.router)
 app.include_router(decks.router)
 app.include_router(tasks.router)
+app.include_router(quizzes.router)
+app.include_router(visualizer.router)

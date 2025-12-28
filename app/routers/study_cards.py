@@ -79,8 +79,12 @@ async def get_statistics(
 
         # Get all cards for the user
         all_cards = await collection.find({"user_id": user_id}).to_list(None)
+        
+        # Get books collection for book stats
+        from app.config.database import books_collection
+        all_books = await books_collection.find({"user_id": user_id}).to_list(None)
 
-        # Calculate weekly progress (last 7 days)
+        # Calculate weekly progress (last 7 days) - separated by type
         from datetime import datetime, timedelta
 
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -90,23 +94,54 @@ async def get_statistics(
             day_start = today - timedelta(days=i)
             day_end = day_start + timedelta(days=1)
 
-            # Count cards reviewed on this day
-            cards_reviewed = sum(
+            # Count by card type
+            flashcards_count = sum(
                 1
                 for card in all_cards
                 if card.get("last_reviewed")
                 and day_start <= card["last_reviewed"] < day_end
+                and card.get("card_type") in [None, "flashcard", "studycard"]
             )
+            
+            quizzes_count = sum(
+                1
+                for card in all_cards
+                if card.get("last_reviewed")
+                and day_start <= card["last_reviewed"] < day_end
+                and card.get("card_type") == "quiz"
+            )
+            
+            visual_count = sum(
+                1
+                for card in all_cards
+                if card.get("last_reviewed")
+                and day_start <= card["last_reviewed"] < day_end
+                and card.get("card_type") == "visual"
+            )
+            
+            # Count books accessed/updated on this day
+            books_count = sum(
+                1
+                for book in all_books
+                if book.get("updated_at")
+                and day_start <= book["updated_at"] < day_end
+            )
+            
+            total_count = flashcards_count + quizzes_count + visual_count + books_count
 
             weekly_data.append(
                 {
                     "day": day_start.strftime("%A")[:3],  # Mon, Tue, etc.
                     "date": day_start.strftime("%Y-%m-%d"),
-                    "cards": cards_reviewed,
+                    "cards": total_count,  # Keep for backwards compatibility
+                    "flashcards": flashcards_count,
+                    "quizzes": quizzes_count,
+                    "visual": visual_count,
+                    "books": books_count,
                 }
             )
 
-        # Get recent performance (last 10 reviews)
+        # Get recent performance (last 10 reviews) - include type
         reviewed_cards = [card for card in all_cards if card.get("last_reviewed")]
         reviewed_cards.sort(
             key=lambda x: x.get("last_reviewed", datetime.min), reverse=True
@@ -117,6 +152,11 @@ async def get_statistics(
             # Calculate performance score based on ease_factor
             ease = card.get("ease_factor", 2.5)
             score = min(10, max(1, int((ease - 1.3) / (2.5 - 1.3) * 10)))
+            
+            # Determine card type
+            card_type = card.get("card_type")
+            if card_type in [None, "studycard"]:
+                card_type = "flashcard"
 
             recent_performance.append(
                 {
@@ -126,10 +166,32 @@ async def get_statistics(
                         else "Unknown"
                     ),
                     "card_title": card.get("title", "Untitled"),
-                    "score": f"{score} / 10",
+                    "score": score,  # Just the number, not formatted
+                    "type": card_type,
                     "ease_factor": ease,
                 }
             )
+        
+        # Add recent book activity
+        recent_books = [book for book in all_books if book.get("updated_at")]
+        recent_books.sort(
+            key=lambda x: x.get("updated_at", datetime.min), reverse=True
+        )
+        
+        for book in recent_books[:3]:  # Add top 3 recent books
+            recent_performance.insert(0, {
+                "date": (
+                    book.get("updated_at").strftime("%A, %d %b")
+                    if book.get("updated_at")
+                    else "Unknown"
+                ),
+                "card_title": book.get("title", "Untitled Book"),
+                "score": 10,  # Books don't have scores, default to 10
+                "type": "book",
+            })
+        
+        # Keep only last 10 total
+        recent_performance = recent_performance[:10]
 
         # Overall stats
         total_cards = len(all_cards)

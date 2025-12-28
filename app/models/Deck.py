@@ -17,11 +17,13 @@ class Deck(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     deleted_at: Optional[datetime] = None
+    deck_type: Literal["flashcard", "quiz", "visual"] = "flashcard"
 
     class Config:
-        orm_mode = True
+        from_attributes = True
+        populate_by_name = True
         json_encoders = {PyObjectId: str}
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "_id": "64f7b0a9f2a1e3c8b1234567",
                 "user_id": "64f7b0a9f2a1e3c8b7654321",

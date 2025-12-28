@@ -18,9 +18,20 @@ class StudyCard(BaseModel):
     interval: int = Field(default=1)  # days until the next review
     repetitions: int = Field(default=0)  # number of times the card has been reviewed
 
+    # Quiz Specific Fields
+    card_type: str = Field(default="basic")  # "basic", "quiz", "visual"
+    options: Optional[List[str]] = None
+    correct_answer: Optional[str] = None
+    explanation: Optional[str] = None
+
+    # Visual Specific Fields
+    diagram_code: Optional[str] = None
+    diagram_type: Optional[str] = None
+
     class Config:
-        orm_mode = True
-        schema_extra = {
+        from_attributes = True
+        populate_by_name = True
+        json_schema_extra = {
             "example": {
                 "id": 1,
                 "title": "Quantum Physics Basics",

@@ -2,6 +2,8 @@ from fastapi import HTTPException
 from typing import Dict, Any
 from app.utils.logger import get_logger
 from app.ai_orchestrator.rag.rag_graph import rag_app
+from app.ai_orchestrator.quiz.quiz_graph import quiz_app
+from app.ai_orchestrator.visualizer.visualizer_graph import visualizer_app
 
 logger = get_logger(__name__)
 
@@ -12,6 +14,8 @@ class AIOrchestrator:
     def __init__(self):
         self.graphs = {
             "rag": rag_app,
+            "quiz": quiz_app,
+            "visualizer": visualizer_app,
         }
 
     def invoke(self, graph_name: str, state: Dict[str, Any]) -> Dict[str, Any]:
