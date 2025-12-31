@@ -1,6 +1,10 @@
 import os
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
+# Load env before importing other modules that rely on env vars
+load_dotenv()
+
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
