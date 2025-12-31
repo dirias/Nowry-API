@@ -12,6 +12,7 @@ class Book(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     title: Optional[str] = ""
     author: Optional[str] = ""
+    user_id: Optional[str] = None  # Owner of the book
     created_at: Optional[datetime] = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     pages: Optional[List[PyObjectId]] = []

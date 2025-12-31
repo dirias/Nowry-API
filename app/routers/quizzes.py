@@ -12,8 +12,34 @@ router = APIRouter(
 logger = get_logger(__name__)
 
 
+from app.auth.auth import get_current_user_authorization
+from app.config.database import users_collection
+from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
+from bson import ObjectId
+
+
 @router.post("/generate", summary="Generate a quiz from text")
-async def generate_quiz(payload: QuizGenerationRequest):
+async def generate_quiz(
+    payload: QuizGenerationRequest,
+    current_user: dict = Depends(get_current_user_authorization),
+):
+    # --- Subscription Check ---
+    user_id = current_user.get("user_id")
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    subscription_data = user.get("subscription", {"tier": "free"})
+    tier_key = subscription_data.get("tier", "free")
+    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
+
+    if not plan["features"]["ai_content_generation"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"AI Quiz Generation is not available on the {plan['name']} plan. Upgrade to unlock.",
+        )
+    # --------------------------
     try:
         logger.info(
             f"Received quiz generation request with {payload.numQuestions} questions."

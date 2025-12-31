@@ -19,7 +19,7 @@ class StudyCard(BaseModel):
     repetitions: int = Field(default=0)  # number of times the card has been reviewed
 
     # Quiz Specific Fields
-    card_type: str = Field(default="basic")  # "basic", "quiz", "visual"
+    card_type: str = Field(default="flashcard")  # "flashcard", "quiz", "visual"
     options: Optional[List[str]] = None
     correct_answer: Optional[str] = None
     explanation: Optional[str] = None

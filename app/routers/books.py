@@ -6,6 +6,7 @@ from bson import ObjectId
 from app.models.Book import Book
 from app.models.Page import Page
 from app.config.database import books_collection, book_pages_collection
+from app.auth.auth import get_current_user_authorization
 
 from ..routers.book_pages import save_book_page
 
@@ -29,12 +30,48 @@ def get_page_collection() -> Collection:
 
 @router.post("/create", summary="Create a new book", response_model=Book)
 async def create_book(
-    book: Book, books_collection: Collection = Depends(get_books_collection)
+    book: Book,
+    books_collection: Collection = Depends(get_books_collection),
+    current_user: dict = Depends(get_current_user_authorization),
 ):
+    # Set user_id from token
+    user_id = current_user.get("user_id")
+    book.user_id = user_id
+
+    # --- Subscription Limit Check ---
+    from app.config.database import users_collection
+    from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
+
+    # Get user subscription
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    subscription_data = user.get("subscription", {"tier": "free"})
+    tier_key = subscription_data.get("tier", "free")
+    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
+
+    book_limit = plan["limits"]["books"]
+
+    # Check limit if not unlimited (-1)
+    if book_limit != -1:
+        current_book_count = await books_collection.count_documents(
+            {"user_id": user_id}
+        )
+        if current_book_count >= book_limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Book limit reached for {plan['name']} plan. Upgrade to create more books.",
+            )
+    # --------------------------------
+
     new_book = await books_collection.insert_one(book.dict(by_alias=True))
     if new_book:
         await save_book_page(
-            Page(book_id=str(book.id)), book_pages_collection, books_collection
+            Page(book_id=str(book.id)),
+            book_pages_collection,
+            books_collection,
+            current_user=current_user,
         )
         # raise error in case
     return book
@@ -60,6 +97,7 @@ async def edit_book(
                 "updated_at": datetime.now(),
                 "summary": book_data.summary,
                 "cover_color": book_data.cover_color,
+                "cover_image": book_data.cover_image,
                 "tags": book_data.tags,
             }
         },
@@ -109,9 +147,13 @@ async def search_books(
 
 
 @router.get("/all", summary="Get all books", response_model=List[Book])
-async def get_all_books(books_collection: Collection = Depends(get_books_collection)):
-    # Retrieve all books from the MongoDB collection
-    cursor = books_collection.find({})
+async def get_all_books(
+    books_collection: Collection = Depends(get_books_collection),
+    current_user: dict = Depends(get_current_user_authorization),
+):
+    user_id = current_user.get("user_id")
+    # Retrieve all books for the current user
+    cursor = books_collection.find({"user_id": user_id})
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
     for book in books:
         book["_id"] = str(book["_id"])  # TODO: Improve to avoid this loop
@@ -153,6 +195,7 @@ async def import_book_from_file(
     preview: bool = Form(False),  # Preview mode for validation
     books_collection: Collection = Depends(get_books_collection),
     pages_collection: Collection = Depends(get_page_collection),
+    current_user: dict = Depends(get_current_user_authorization),
 ):
     """
     Import a book from an uploaded file.
@@ -243,6 +286,7 @@ async def import_book_from_file(
     new_book = Book(
         title=book_title,
         author=username,
+        user_id=current_user.get("user_id"),
         isbn="Importado",
         summary=f"Imported from {filename} - {len(extracted_pages)} pages",
         created_at=datetime.now(),

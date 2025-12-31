@@ -33,6 +33,49 @@ async def create_study_card(
     user: dict = Depends(get_current_user_authorization),
 ):
     user_id = user.get("user_id")
+
+    # --- Subscription Limit Check ---
+    from app.config.database import users_collection
+    from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
+
+    # Get user subscription
+    user_data = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    subscription_data = user_data.get("subscription", {"tier": "free"})
+    tier_key = subscription_data.get("tier", "free")
+    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
+
+    # Determine card type and applicable limit
+    limit_key = "flashcards"  # default
+    query_type = {"$in": [None, "basic", "flashcard", "studycard"]}
+
+    if card.card_type == "quiz":
+        limit_key = "quiz_questions"
+        query_type = "quiz"
+    elif card.card_type == "visual":
+        limit_key = "visual_diagrams"
+        query_type = "visual"
+
+    limit_value = plan["limits"].get(limit_key, 0)
+
+    # Check limit if not unlimited (-1)
+    if limit_value != -1:
+        # Count only cards of this type
+        current_count = await collection.count_documents(
+            {"user_id": user_id, "card_type": query_type}
+        )
+
+        if current_count >= limit_value:
+            # Format readable name
+            feature_name = limit_key.replace("_", " ").title()
+            raise HTTPException(
+                status_code=403,
+                detail=f"{feature_name} limit reached for {plan['name']} plan. Upgrade to create more.",
+            )
+    # --------------------------------
+
     logger.info(f"User {user_id} creating study card: {card.title}")
 
     card.user_id = user_id
@@ -79,9 +122,10 @@ async def get_statistics(
 
         # Get all cards for the user
         all_cards = await collection.find({"user_id": user_id}).to_list(None)
-        
+
         # Get books collection for book stats
         from app.config.database import books_collection
+
         all_books = await books_collection.find({"user_id": user_id}).to_list(None)
 
         # Calculate weekly progress (last 7 days) - separated by type
@@ -100,9 +144,9 @@ async def get_statistics(
                 for card in all_cards
                 if card.get("last_reviewed")
                 and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") in [None, "flashcard", "studycard"]
+                and card.get("card_type") in [None, "flashcard"]
             )
-            
+
             quizzes_count = sum(
                 1
                 for card in all_cards
@@ -110,7 +154,7 @@ async def get_statistics(
                 and day_start <= card["last_reviewed"] < day_end
                 and card.get("card_type") == "quiz"
             )
-            
+
             visual_count = sum(
                 1
                 for card in all_cards
@@ -118,15 +162,14 @@ async def get_statistics(
                 and day_start <= card["last_reviewed"] < day_end
                 and card.get("card_type") == "visual"
             )
-            
+
             # Count books accessed/updated on this day
             books_count = sum(
                 1
                 for book in all_books
-                if book.get("updated_at")
-                and day_start <= book["updated_at"] < day_end
+                if book.get("updated_at") and day_start <= book["updated_at"] < day_end
             )
-            
+
             total_count = flashcards_count + quizzes_count + visual_count + books_count
 
             weekly_data.append(
@@ -152,11 +195,9 @@ async def get_statistics(
             # Calculate performance score based on ease_factor
             ease = card.get("ease_factor", 2.5)
             score = min(10, max(1, int((ease - 1.3) / (2.5 - 1.3) * 10)))
-            
-            # Determine card type
-            card_type = card.get("card_type")
-            if card_type in [None, "studycard"]:
-                card_type = "flashcard"
+
+            # Determine card type (default to flashcard if not specified)
+            card_type = card.get("card_type") or "flashcard"
 
             recent_performance.append(
                 {
@@ -171,25 +212,26 @@ async def get_statistics(
                     "ease_factor": ease,
                 }
             )
-        
+
         # Add recent book activity
         recent_books = [book for book in all_books if book.get("updated_at")]
-        recent_books.sort(
-            key=lambda x: x.get("updated_at", datetime.min), reverse=True
-        )
-        
+        recent_books.sort(key=lambda x: x.get("updated_at", datetime.min), reverse=True)
+
         for book in recent_books[:3]:  # Add top 3 recent books
-            recent_performance.insert(0, {
-                "date": (
-                    book.get("updated_at").strftime("%A, %d %b")
-                    if book.get("updated_at")
-                    else "Unknown"
-                ),
-                "card_title": book.get("title", "Untitled Book"),
-                "score": 10,  # Books don't have scores, default to 10
-                "type": "book",
-            })
-        
+            recent_performance.insert(
+                0,
+                {
+                    "date": (
+                        book.get("updated_at").strftime("%A, %d %b")
+                        if book.get("updated_at")
+                        else "Unknown"
+                    ),
+                    "card_title": book.get("title", "Untitled Book"),
+                    "score": 10,  # Books don't have scores, default to 10
+                    "type": "book",
+                },
+            )
+
         # Keep only last 10 total
         recent_performance = recent_performance[:10]
 
