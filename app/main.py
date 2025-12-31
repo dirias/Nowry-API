@@ -27,7 +27,7 @@ from app.routers import (
     bugs,
 )
 
-load_dotenv()
+
 
 # Initialize Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
