@@ -74,3 +74,8 @@ app.include_router(quizzes.router)
 app.include_router(visualizer.router)
 app.include_router(news.router)
 app.include_router(bugs.router)
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Nowry API is running"}

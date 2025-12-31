@@ -6,7 +6,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config.database import users_collection
-from app.config.auth_config import SECRET_KEY, SECURE_COOKIE
+from app.config.auth_config import SECRET_KEY, SECURE_COOKIE, SAMESITE_COOKIE
 
 router = APIRouter(
     prefix="/session",
@@ -53,8 +53,8 @@ async def login(request: Request, credentials: LoginRequest):
         key="access_token",
         value=token,
         httponly=True,
-        secure=SECURE_COOKIE,  # True in prod (HTTPS), False in dev (HTTP)
-        samesite="lax",
+        secure=SECURE_COOKIE,  # Dynamic based on ENV
+        samesite=SAMESITE_COOKIE,  # 'none' for prod (cross-origin), 'lax' for dev
         path="/",  # Explicitly set path to root
         max_age=60 * 60 * 24 * 7,  # 7 days
     )
@@ -66,7 +66,7 @@ async def login(request: Request, credentials: LoginRequest):
 async def logout():
     response = JSONResponse(content={"message": "Logout successful"})
     response.delete_cookie(
-        key="access_token", httponly=True, secure=SECURE_COOKIE, samesite="lax"
+        key="access_token", httponly=True, secure=SECURE_COOKIE, samesite=SAMESITE_COOKIE
     )
     return response
 
