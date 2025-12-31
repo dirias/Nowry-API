@@ -12,7 +12,9 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Secure cookie is required for production (HTTPS), but disabled for dev (HTTP)
+# Secure cookie is required for production (HTTPS), but disabled for dev (HTTP)
 SECURE_COOKIE = os.getenv("ENV") == "production"
+SAMESITE_COOKIE = "none" if SECURE_COOKIE else "lax"
 
 
 def get_current_user_authorization(authorization: str = Header(None)):
