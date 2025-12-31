@@ -2,13 +2,10 @@ import os
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- Load MongoDB URI and DB name from environment ---
-MONGO_USER = os.getenv("MONGO_USER", "root")
-MONGO_PASS = os.getenv("MONGO_PASS", "example")
-MONGO_HOST = os.getenv("MONGO_HOST", "mongodb")
-MONGO_PORT = os.getenv("MONGO_PORT", "27017")
 MONGO_DB = os.getenv("MONGO_DB", "mydb")
 
-MONGO_URI = f"mongodb://{MONGO_USER}:{MONGO_PASS}@{MONGO_HOST}:{MONGO_PORT}/"
+# Use single URI for both Local (Docker) and Production
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://root:example@mongodb:27017/")
 
 # --- Create client ---
 mongo_client = AsyncIOMotorClient(MONGO_URI)
