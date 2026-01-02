@@ -50,6 +50,7 @@ async def get_current_user_profile(
         "subscription": user.get("subscription", {}),
         "preferences": user.get("preferences", {}),
         "created_at": user.get("created_at"),
+        "wizard_completed": user.get("wizard_completed", False),
     }
 
 
@@ -391,6 +392,19 @@ async def update_general_preferences(
     return {"message": "Preferences updated successfully"}
 
 
+@router.post("/complete-wizard")
+async def complete_wizard(current_user: dict = Depends(get_current_user_authorization)):
+    """Mark the onboarding wizard as completed"""
+    user_id = current_user.get("user_id")
+    
+    await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"wizard_completed": True, "updated_at": datetime.utcnow()}}
+    )
+    
+    return {"message": "Wizard completed successfully"}
+
+
 @router.post("/2fa/enable")
 async def enable_2fa(current_user: dict = Depends(get_current_user_authorization)):
     """Enable two-factor authentication"""
@@ -476,6 +490,9 @@ async def create_user(user: User):
 
     # Set default role to 'user'
     user_dict["role"] = "user"
+    
+    # Initialize wizard status
+    user_dict["wizard_completed"] = False
 
     # Insert the new user into the database
     insert_result = await users_collection.insert_one(user_dict)

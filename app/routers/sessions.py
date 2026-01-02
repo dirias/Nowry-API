@@ -45,6 +45,7 @@ async def login(request: Request, credentials: LoginRequest):
             "message": "Login successful",
             "username": user.get("username"),
             "role": user.get("role", "user"),
+            "wizard_completed": user.get("wizard_completed", False),
             # We don't send token in body anymore for security, or we can send it but client ignores it
         }
     )

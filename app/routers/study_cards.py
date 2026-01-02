@@ -170,7 +170,7 @@ async def get_statistics(
                 if book.get("updated_at") and day_start <= book["updated_at"] < day_end
             )
 
-            total_count = flashcards_count + quizzes_count + visual_count + books_count
+            total_count = flashcards_count + quizzes_count + visual_count
 
             weekly_data.append(
                 {
