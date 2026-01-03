@@ -31,3 +31,4 @@ feedparser
 #pytest-asyncio>=0.23.7
 gunicorn
 slowapi
+cloudinary

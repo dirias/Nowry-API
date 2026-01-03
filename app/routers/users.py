@@ -18,7 +18,6 @@ from app.config.database import (
     users_collection,
     study_cards_collection,
     books_collection,
-    book_pages_collection,
     decks_collection,
 )
 from app.auth.auth import get_current_user_authorization
@@ -469,7 +468,6 @@ async def delete_account(current_user: dict = Depends(get_current_user_authoriza
 
     # Delete all user data
     await books_collection.delete_many({"user_id": user_id})
-    await book_pages_collection.delete_many({"user_id": user_id})
     await study_cards_collection.delete_many({"user_id": user_id})
     await decks_collection.delete_many({"user_id": user_id})
 
