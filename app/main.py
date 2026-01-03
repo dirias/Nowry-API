@@ -25,6 +25,7 @@ from app.routers import (
     visualizer,
     news,
     bugs,
+    annual_planning,
 )
 
 
@@ -74,6 +75,7 @@ app.include_router(quizzes.router)
 app.include_router(visualizer.router)
 app.include_router(news.router)
 app.include_router(bugs.router)
+app.include_router(annual_planning.router)
 
 
 @app.get("/")

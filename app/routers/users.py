@@ -82,6 +82,11 @@ class UserPreferences(BaseModel):
     interests: Optional[List[str]] = None
     theme_color: Optional[str] = None
     language: Optional[str] = None
+    pomodoro_work_minutes: Optional[int] = None
+    pomodoro_short_break_minutes: Optional[int] = None
+    pomodoro_long_break_minutes: Optional[int] = None
+    pomodoro_auto_start: Optional[bool] = None
+    pomodoro_enabled: Optional[bool] = None
 
 
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
@@ -384,6 +389,16 @@ async def update_general_preferences(
         update_data["preferences.theme_color"] = prefs.theme_color
     if prefs.language is not None:
         update_data["preferences.language"] = prefs.language
+    if prefs.pomodoro_work_minutes is not None:
+        update_data["preferences.pomodoro_work_minutes"] = prefs.pomodoro_work_minutes
+    if prefs.pomodoro_short_break_minutes is not None:
+        update_data["preferences.pomodoro_short_break_minutes"] = prefs.pomodoro_short_break_minutes
+    if prefs.pomodoro_long_break_minutes is not None:
+        update_data["preferences.pomodoro_long_break_minutes"] = prefs.pomodoro_long_break_minutes
+    if prefs.pomodoro_auto_start is not None:
+        update_data["preferences.pomodoro_auto_start"] = prefs.pomodoro_auto_start
+    if prefs.pomodoro_enabled is not None:
+        update_data["preferences.pomodoro_enabled"] = prefs.pomodoro_enabled
 
     update_data["updated_at"] = datetime.utcnow()
 

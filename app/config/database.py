@@ -21,6 +21,14 @@ study_cards_collection = db["cards"]  # Alias for cards collection
 tasks_collection = db["tasks"]
 bugs_collection = db["bugs"]
 
+# --- Annual Planning Collections ---
+annual_plans_collection = db["annual_plans"]
+focus_areas_collection = db["focus_areas"]
+priorities_collection = db["priorities"]
+goals_collection = db["goals"]
+activities_collection = db["activities"]
+daily_routines_collection = db["daily_routines"]
+
 
 async def create_indexes():
     # User indexes
@@ -34,5 +42,14 @@ async def create_indexes():
     await cards_collection.create_index("deck_id")
     await tasks_collection.create_index("user_id")
     await tasks_collection.create_index("status")
+
+    # Annual Planning indexes
+    await annual_plans_collection.create_index("user_id")
+    await annual_plans_collection.create_index([("user_id", 1), ("year", 1)], unique=True)
+    await focus_areas_collection.create_index("annual_plan_id")
+    await priorities_collection.create_index("focus_area_id")
+    await goals_collection.create_index("focus_area_id")
+    await activities_collection.create_index("goal_id")
+    await daily_routines_collection.create_index("user_id", unique=True)
 
     print("Database indexes created successfully.")
