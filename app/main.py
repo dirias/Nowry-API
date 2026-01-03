@@ -13,7 +13,6 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from app.config.database import create_indexes
 from app.routers import (
-    book_pages,
     books,
     users,
     sessions,
@@ -25,6 +24,8 @@ from app.routers import (
     visualizer,
     news,
     bugs,
+    annual_planning,
+    image_upload,
 )
 
 
@@ -62,7 +63,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(book_pages.router)
 app.include_router(books.router)
 app.include_router(users.router)
 app.include_router(sessions.router)
@@ -74,6 +74,8 @@ app.include_router(quizzes.router)
 app.include_router(visualizer.router)
 app.include_router(news.router)
 app.include_router(bugs.router)
+app.include_router(annual_planning.router)
+app.include_router(image_upload.router)
 
 
 @app.get("/")

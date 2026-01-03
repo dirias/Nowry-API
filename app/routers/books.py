@@ -1,14 +1,11 @@
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book
-from app.models.Page import Page
-from app.config.database import books_collection, book_pages_collection
+from app.config.database import books_collection
 from app.auth.auth import get_current_user_authorization
-
-from ..routers.book_pages import save_book_page
 
 router = APIRouter(
     prefix="/book",
@@ -23,9 +20,6 @@ def get_books_collection() -> Collection:
     return books_collection
 
 
-def get_page_collection() -> Collection:
-    # Assuming books_collection is defined in your MongoDB configuration
-    return book_pages_collection
 
 
 @router.post("/create", summary="Create a new book", response_model=Book)
@@ -64,17 +58,33 @@ async def create_book(
                 detail=f"Book limit reached for {plan['name']} plan. Upgrade to create more books.",
             )
     # --------------------------------
-
-    new_book = await books_collection.insert_one(book.dict(by_alias=True))
-    if new_book:
-        await save_book_page(
-            Page(book_id=str(book.id)),
-            book_pages_collection,
-            books_collection,
-            current_user=current_user,
-        )
-        # raise error in case
-    return book
+    
+    print(f"[DEBUG CREATE] Attempting to insert book: {book.title}")
+    # Exclude _id to let MongoDB generate it as ObjectId
+    book_dict = book.dict(by_alias=True, exclude={'id'})
+    print(f"[DEBUG CREATE] Book dict keys: {book_dict.keys()}")
+    
+    new_book = await books_collection.insert_one(book_dict)
+    book_id = str(new_book.inserted_id)
+    print(f"[DEBUG CREATE] Book inserted with ID: {book_id}")
+    print(f"[DEBUG CREATE] Insert result acknowledged: {new_book.acknowledged}")
+    
+    print(f"[DEBUG CREATE] Insert result acknowledged: {new_book.acknowledged}")
+    
+    # We no longer create a "first page" as the book uses full_content now.
+    
+    # Fetch and return the created book
+    print(f"[DEBUG CREATE] Fetching created book from database...")
+    created_book = await books_collection.find_one({"_id": new_book.inserted_id})
+    print(f"[DEBUG CREATE] Created book found in DB: {created_book is not None}")
+    
+    if created_book:
+        created_book["_id"] = str(created_book["_id"])
+        print(f"[DEBUG CREATE] Returning book: {created_book['_id']}")
+        return created_book
+    
+    print(f"[DEBUG CREATE] ERROR: Book was inserted but not found in database!")
+    raise HTTPException(status_code=500, detail="Failed to create book")
 
 
 @router.put("/edit/{book_id}", summary="Edit a book by ID", response_model=Book)
@@ -83,57 +93,75 @@ async def edit_book(
     book_data: Book,
     books_collection: Collection = Depends(get_books_collection),
 ):
-    # Check if the book exists
-    existing_book = await books_collection.find_one({"_id": ObjectId(book_id)})
+    # Check if the book exists (Try both ObjectId and String ID)
+    query = {"_id": ObjectId(book_id)}
+    existing_book = await books_collection.find_one(query)
+    
+    if existing_book is None:
+        # Fallback to string ID
+        query = {"_id": book_id}
+        existing_book = await books_collection.find_one(query)
+        
     if existing_book is None:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    # Update the book data
+    # Update the book data using partial update (exclude_unset=True)
+    update_data = book_data.dict(exclude_unset=True)
+    
+    # Remove immutable/system fields that shouldn't be updated by user
+    fields_to_remove = ["id", "_id", "user_id", "created_at"]
+    for field in fields_to_remove:
+        update_data.pop(field, None)
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data provided for update")
+
+    # Add updated_at timestamp
+    update_data["updated_at"] = datetime.now()
+
     res = await books_collection.update_one(
-        {"_id": ObjectId(book_id)},
-        {
-            "$set": {
-                "title": book_data.title,
-                "updated_at": datetime.now(),
-                "summary": book_data.summary,
-                "cover_color": book_data.cover_color,
-                "cover_image": book_data.cover_image,
-                "tags": book_data.tags,
-            }
-        },
+        query, # Use the query that successfully found the book
+        {"$set": update_data},
     )
 
-    if res.modified_count == 0:
-        raise HTTPException(
-            status_code=404, detail="Book update failed or no changes were made"
-        )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Book not found")
 
-    return {"message": "Book updated successfully"}
+    # Fetch and return the updated book
+    # Fetch and return the updated book
+    updated_book = await books_collection.find_one(query)
+    if updated_book:
+        updated_book["_id"] = str(updated_book["_id"])
+        return updated_book
+    
+    raise HTTPException(status_code=500, detail="Error fetching updated book")
 
 
 @router.delete("/delete/{book_id}", summary="Delete a book by ID")
 async def delete_book(
     book_id: str,
     books_collection: Collection = Depends(get_books_collection),
-    pages_collection: Collection = Depends(get_page_collection),
 ):
-    # Check if the book exists
-    existing_book = await books_collection.find_one({"_id": ObjectId(book_id)})
-    if existing_book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
+    # Strategy 1: Delete by ObjectId
+    try:
+        obj_id = ObjectId(book_id)
+        deleted_book = await books_collection.find_one_and_delete({"_id": obj_id})
+        if deleted_book:
+            print(f"[DEBUG DELETE] Book deleted successfully by ObjectId: {book_id}")
+            return {"message": "Book deleted successfully"}
+    except Exception as e:
+        print(f"[DEBUG DELETE] Invalid ObjectId format or error: {e}")
 
-    # Delete all pages associated with the book
-    deleted_pages_result = await pages_collection.delete_many({"book_id": book_id})
-    # Delete the book
-    deleted_book_result = await books_collection.delete_one({"_id": ObjectId(book_id)})
-
-    if deleted_book_result.deleted_count == 1:
-        return {
-            "message": "Book and associated pages deleted successfully",
-            "deleted_pages_count": deleted_pages_result.deleted_count,
-        }
-    else:
-        raise HTTPException(status_code=500, detail="Error deleting the book")
+    # Strategy 2: Delete by String ID (Fallback for potential import mismatches)
+    print(f"[DEBUG DELETE] Fallback: Attempting delete by String ID: {book_id}")
+    deleted_book_str = await books_collection.find_one_and_delete({"_id": book_id})
+    
+    if deleted_book_str:
+        print(f"[DEBUG DELETE] Book deleted successfully by String ID: {book_id}")
+        return {"message": "Book deleted successfully"}
+    
+    print(f"[DEBUG DELETE] Book not found (tried both ObjectId and String): {book_id}")
+    raise HTTPException(status_code=404, detail="Book not found")
 
 
 @router.get("/search", summary="Search books by title", response_model=List[Book])
@@ -156,36 +184,53 @@ async def get_all_books(
     cursor = books_collection.find({"user_id": user_id})
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
     for book in books:
-        book["_id"] = str(book["_id"])  # TODO: Improve to avoid this loop
-        book["pages"] = [str(page) for page in book["pages"]]
+        book["_id"] = str(book["_id"])
     return books
 
 
-@router.get("/{book_id}")
+@router.get("/{book_id}", response_model=Book)
 async def get_book_by_id(
     book_id: str,
     books_collection: Collection = Depends(get_books_collection),
-    book_pages_collection: Collection = Depends(get_page_collection),
 ):
     # Find the book by its ID in the MongoDB collection
-    print("testing")
-    book = await books_collection.find_one({"_id": ObjectId(book_id)})
+    # Find the book by its ID in the MongoDB collection
+    print(f"[DEBUG] Searching for book with ID: {book_id} (Code Version: Fallback-Enabled)")
+    object_id = None
+    try:
+        object_id = ObjectId(book_id)
+        print(f"[DEBUG] Converted to ObjectId: {object_id}")
+    except Exception as e:
+        print(f"[DEBUG] '{book_id}' is not a valid ObjectId: {e}")
+    
+    book = None
+    if object_id:
+        book = await books_collection.find_one({"_id": object_id})
+    
+    if not book:
+        print(f"[DEBUG] Book not found by ObjectId. Trying String ID: {book_id}")
+        book = await books_collection.find_one({"_id": book_id})
+
+    print(f"[DEBUG] Book found: {book is not None}")
+    
+    if not book:
+        # DB Dump for debugging
+        print(f"[DEBUG] --- START DB DUMP (First 20) ---")
+        try:
+            all_books_cursor = books_collection.find({}, {"_id": 1, "title": 1})
+            all_books = await all_books_cursor.to_list(length=20)
+            for b in all_books:
+                # Print repr to see types clearly (ObjectId(...) vs 'string')
+                print(f" - ID: {repr(b['_id'])} | Title: {b.get('title', 'No Title')}")
+        except Exception as ex:
+            print(f"[DEBUG] Error dumping DB: {ex}")
+        print(f"[DEBUG] --- END DB DUMP ---")
+        
+        raise HTTPException(status_code=404, detail="Book not found")
+
     if book:
         book["_id"] = str(book["_id"])
-
-        # Retrieve all pages related to this book
-        cursor = book_pages_collection.find({"book_id": book_id})
-        pages = await cursor.to_list(length=50)  # Limit to 100 pages for safety
-
-        # Convert ObjectId to str for _id in pages
-        for page in pages:
-            page["_id"] = str(page["_id"])
-
-        # Add pages to the book dictionary
-        book["pages"] = pages
         return book
-    else:
-        raise HTTPException(status_code=404, detail="Book not found")
 
 
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
@@ -193,8 +238,8 @@ async def import_book_from_file(
     file: UploadFile = File(...),
     username: str = Form("Unknown"),
     preview: bool = Form(False),  # Preview mode for validation
+    title: Optional[str] = Form(None), # Optional title override
     books_collection: Collection = Depends(get_books_collection),
-    pages_collection: Collection = Depends(get_page_collection),
     current_user: dict = Depends(get_current_user_authorization),
 ):
     """
@@ -219,8 +264,8 @@ async def import_book_from_file(
             status_code=400, detail="Failed to extract content from file"
         )
 
-    # Create book title from filename
-    book_title = filename.rsplit(".", 1)[0]  # Remove extension
+    # Create book title from filename or use provided title
+    book_title = title if title and title.strip() else filename.rsplit(".", 1)[0]
 
     # Get extraction metadata
     metadata = extracted_pages[0].get("extraction_metadata", {})
@@ -283,6 +328,11 @@ async def import_book_from_file(
         }
 
     # SAVE MODE: Create the book and pages
+    # SAVE MODE: Create the book with full_content
+    # Concatenate all pages into one continuous HTML string
+    # Concatenate all pages into one continuous HTML string with separators
+    full_content = "\n".join([p.get("content", "") for p in extracted_pages])
+
     new_book = Book(
         title=book_title,
         author=username,
@@ -291,38 +341,21 @@ async def import_book_from_file(
         summary=f"Imported from {filename} - {len(extracted_pages)} pages",
         created_at=datetime.now(),
         updated_at=datetime.now(),
-        pages=[],
+        full_content=full_content,
         cover_color="#4A90E2",
     )
 
-    book_dict = new_book.dict(by_alias=True)
+    # Exclude 'id' so MongoDB generates a proper ObjectId, identifying this as a new document
+    book_dict = new_book.dict(by_alias=True, exclude={'id'})
     result = await books_collection.insert_one(book_dict)
     book_id = str(result.inserted_id)
 
-    # Create pages for the book
-    created_pages = []
-    for page_data in extracted_pages:
-        page = Page(
-            book_id=book_id,
-            title=page_data["title"],
-            content=page_data["content"],
-            page_number=page_data.get("page_number", len(created_pages) + 1),
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-        )
-
-        page_dict = page.dict(by_alias=True, exclude={"id"})
-        page_result = await pages_collection.insert_one(page_dict)
-        page_dict["_id"] = str(page_result.inserted_id)
-        created_pages.append(page_dict)
-
-    # Return the book with pages and quality info
+    # Return the book info
     return {
         "_id": book_id,
         "title": book_title,
         "author": username,
-        "pages": created_pages,
-        "page_count": len(created_pages),
+        "page_count": len(extracted_pages), # Keep count for meta info
         "extraction_quality": {
             "total_words": metadata.get("total_words", 0),
             "multi_column_pages": metadata.get("multi_column_pages", 0),

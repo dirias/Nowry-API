@@ -15,12 +15,14 @@ class Book(BaseModel):
     user_id: Optional[str] = None  # Owner of the book
     created_at: Optional[datetime] = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
-    pages: Optional[List[PyObjectId]] = []
+    # pages: Optional[List[PyObjectId]] = [] # DEPRECATED
     page_limit: Optional[int] = 50
     tags: Optional[List[str]] = []
     summary: Optional[str] = ""
     cover_image: Optional[str] = ""
     cover_color: Optional[str] = ""
+    page_size: Optional[str] = "a4"  # Page size preference (a4, letter, legal, etc.)
+    full_content: Optional[str] = ""  # Single continuous document content
 
     class Config:
         populate_by_name = True

@@ -18,7 +18,6 @@ from app.config.database import (
     users_collection,
     study_cards_collection,
     books_collection,
-    book_pages_collection,
     decks_collection,
 )
 from app.auth.auth import get_current_user_authorization
@@ -50,6 +49,7 @@ async def get_current_user_profile(
         "subscription": user.get("subscription", {}),
         "preferences": user.get("preferences", {}),
         "created_at": user.get("created_at"),
+        "wizard_completed": user.get("wizard_completed", False),
     }
 
 
@@ -81,6 +81,11 @@ class UserPreferences(BaseModel):
     interests: Optional[List[str]] = None
     theme_color: Optional[str] = None
     language: Optional[str] = None
+    pomodoro_work_minutes: Optional[int] = None
+    pomodoro_short_break_minutes: Optional[int] = None
+    pomodoro_long_break_minutes: Optional[int] = None
+    pomodoro_auto_start: Optional[bool] = None
+    pomodoro_enabled: Optional[bool] = None
 
 
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
@@ -383,12 +388,35 @@ async def update_general_preferences(
         update_data["preferences.theme_color"] = prefs.theme_color
     if prefs.language is not None:
         update_data["preferences.language"] = prefs.language
+    if prefs.pomodoro_work_minutes is not None:
+        update_data["preferences.pomodoro_work_minutes"] = prefs.pomodoro_work_minutes
+    if prefs.pomodoro_short_break_minutes is not None:
+        update_data["preferences.pomodoro_short_break_minutes"] = prefs.pomodoro_short_break_minutes
+    if prefs.pomodoro_long_break_minutes is not None:
+        update_data["preferences.pomodoro_long_break_minutes"] = prefs.pomodoro_long_break_minutes
+    if prefs.pomodoro_auto_start is not None:
+        update_data["preferences.pomodoro_auto_start"] = prefs.pomodoro_auto_start
+    if prefs.pomodoro_enabled is not None:
+        update_data["preferences.pomodoro_enabled"] = prefs.pomodoro_enabled
 
     update_data["updated_at"] = datetime.utcnow()
 
     await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
 
     return {"message": "Preferences updated successfully"}
+
+
+@router.post("/complete-wizard")
+async def complete_wizard(current_user: dict = Depends(get_current_user_authorization)):
+    """Mark the onboarding wizard as completed"""
+    user_id = current_user.get("user_id")
+    
+    await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"wizard_completed": True, "updated_at": datetime.utcnow()}}
+    )
+    
+    return {"message": "Wizard completed successfully"}
 
 
 @router.post("/2fa/enable")
@@ -440,7 +468,6 @@ async def delete_account(current_user: dict = Depends(get_current_user_authoriza
 
     # Delete all user data
     await books_collection.delete_many({"user_id": user_id})
-    await book_pages_collection.delete_many({"user_id": user_id})
     await study_cards_collection.delete_many({"user_id": user_id})
     await decks_collection.delete_many({"user_id": user_id})
 
@@ -476,6 +503,9 @@ async def create_user(user: User):
 
     # Set default role to 'user'
     user_dict["role"] = "user"
+    
+    # Initialize wizard status
+    user_dict["wizard_completed"] = False
 
     # Insert the new user into the database
     insert_result = await users_collection.insert_one(user_dict)
