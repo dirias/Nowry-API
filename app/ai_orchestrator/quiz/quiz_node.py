@@ -17,20 +17,18 @@ def quiz_node(state):
             status_code=400, detail="No text provided for quiz generation"
         )
 
-    # Default robust prompt
-    system_prompt = (
-        f"You are an expert teacher. Create a {difficulty} level multiple-choice quiz "
-        f"with {num_questions} questions based PROPERLY and STRICTLY on the Provided Context below.\n"
-        "Return the result as a raw JSON array of objects. Do not wrap in markdown code blocks.\n"
-        "Each object must have:\n"
-        "- 'question': The question string\n"
-        "- 'options': An array of 4 distinct string choices\n"
-        "- 'answer': The correct option string (exact match to one of the options)\n"
-        "- 'explanation': A brief explanation of why the answer is correct\n\n"
-    )
+    from app.core.prompts import QUIZ_GENERATION_TEMPLATE
 
+    # Prepare custom instructions
+    custom_instr = ""
     if custom_prompt:
-        system_prompt += f"Additional Instructions: {custom_prompt}\n\n"
+        custom_instr = f"Additional Instructions: {custom_prompt}\n\n"
+
+    system_prompt = QUIZ_GENERATION_TEMPLATE.format(
+        difficulty=difficulty,
+        num_questions=num_questions,
+        custom_instructions=custom_instr
+    )
 
     request_string = f"{system_prompt}\n\nProvided Context:\n{sample_text}"
 
