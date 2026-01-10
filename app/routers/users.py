@@ -77,6 +77,14 @@ class NotificationPreferences(BaseModel):
     marketing: Optional[bool] = None
 
 
+class FavoriteArticle(BaseModel):
+    url: str
+    title: str
+    description: Optional[str] = None
+    urlToImage: Optional[str] = None
+    category: Optional[str] = None
+
+
 class UserPreferences(BaseModel):
     interests: Optional[List[str]] = None
     theme_color: Optional[str] = None
@@ -86,6 +94,9 @@ class UserPreferences(BaseModel):
     pomodoro_long_break_minutes: Optional[int] = None
     pomodoro_auto_start: Optional[bool] = None
     pomodoro_enabled: Optional[bool] = None
+    favorite_news: Optional[List[FavoriteArticle]] = None
+
+
 
 
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
@@ -398,10 +409,15 @@ async def update_general_preferences(
         update_data["preferences.pomodoro_auto_start"] = prefs.pomodoro_auto_start
     if prefs.pomodoro_enabled is not None:
         update_data["preferences.pomodoro_enabled"] = prefs.pomodoro_enabled
+    if prefs.favorite_news is not None:
+        # Convert Pydantic models to dicts for MongoDB
+        update_data["preferences.favorite_news"] = [article.dict() for article in prefs.favorite_news]
+        print(f"📰 Updating favorite_news for user {user_id}: {len(prefs.favorite_news)} articles")
 
     update_data["updated_at"] = datetime.utcnow()
 
-    await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
+    result = await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
+    print(f"✅ Update result: matched={result.matched_count}, modified={result.modified_count}")
 
     return {"message": "Preferences updated successfully"}
 

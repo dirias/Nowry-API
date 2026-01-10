@@ -25,6 +25,66 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+
+# --- Daily Routine ---
+
+@router.get("/daily-routine", response_model=DailyRoutineTemplate)
+async def get_daily_routine(
+    current_user: dict = Depends(get_current_user_authorization),
+):
+    user_id = current_user.get("user_id")
+    routine = await daily_routines_collection.find_one({"user_id": user_id})
+    
+    if not routine:
+        new_routine = DailyRoutineTemplate(user_id=user_id)
+        result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
+        routine = await daily_routines_collection.find_one({"_id": result.inserted_id})
+        
+    return routine
+
+@router.put("/daily-routine", response_model=DailyRoutineTemplate)
+async def update_daily_routine(
+    routine: DailyRoutineTemplate,
+    current_user: dict = Depends(get_current_user_authorization),
+):
+    user_id = current_user.get("user_id")
+    
+    # Update by user_id since it's a singleton per user
+    # This avoids issues with stale IDs from the frontend
+    
+    result = await daily_routines_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "morning_routine": routine.morning_routine,
+            "afternoon_routine": routine.afternoon_routine,
+            "evening_routine": routine.evening_routine,
+            "updated_at": datetime.now()
+        }}
+    )
+    
+    if result.matched_count == 0:
+        # If for some reason it doesn't exist (shouldn't happen if GET was called, but safety first)
+        # We can create it or raise 404. Let's raise 404 to be safe, or just insert.
+        # Given the previous flow, let's create it implicitly if we want to be super robust, 
+        # but technically the user should have GET it first.
+        # Let's revert to finding it to return it.
+        # Actually, let's try to upsert.
+        
+        # Check if we should insert? 
+        # For now, let's raise 404 but with a clear message, or create a new one.
+        # Let's create a new one to be helpful.
+        new_routine = DailyRoutineTemplate(
+            user_id=user_id,
+            morning_routine=routine.morning_routine,
+            afternoon_routine=routine.afternoon_routine,
+            evening_routine=routine.evening_routine
+        )
+        insert_result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
+        return await daily_routines_collection.find_one({"_id": insert_result.inserted_id})
+
+    return await daily_routines_collection.find_one({"user_id": user_id})
+
+
 # --- Annual Plan ---
 
 @router.get("", response_model=AnnualPlan)
@@ -73,6 +133,47 @@ async def update_annual_plan(
     )
     
     return await annual_plans_collection.find_one({"_id": ObjectId(plan_update.id)})
+
+@router.put("/{id}", response_model=AnnualPlan)
+async def update_annual_plan_by_id(
+    id: str,
+    plan_update: dict,
+    current_user: dict = Depends(get_current_user_authorization),
+):
+    user_id = current_user.get("user_id")
+    
+    # Try to find plan by string ID first (seems to be stored as string in DB)
+    print(f"Looking for plan with ID: {id}, user: {user_id}")
+    existing_plan = await annual_plans_collection.find_one({"_id": id})
+    
+    # If not found, try as ObjectId
+    if not existing_plan:
+        try:
+            object_id = ObjectId(id)
+            existing_plan = await annual_plans_collection.find_one({"_id": object_id})
+        except:
+            pass
+    
+    print(f"Found plan: {existing_plan}")
+    
+    if not existing_plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+        
+    if existing_plan["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Only update allowed fields
+    update_data = {}
+    if "title" in plan_update:
+        update_data["title"] = plan_update["title"]
+    update_data["updated_at"] = datetime.now()
+    
+    await annual_plans_collection.update_one(
+        {"_id": id},  # Use string ID
+        {"$set": update_data}
+    )
+    
+    return await annual_plans_collection.find_one({"_id": id})
 
 
 # --- Focus Areas ---
@@ -250,6 +351,10 @@ async def update_goal(
                 "progress": goal.progress,
                 "status": goal.status,
                 "milestones": goal.milestones,
+                "parent_id": goal.parent_id,
+                "quarter": goal.quarter,
+                "year": goal.year,
+                "type": goal.type,
                 "updated_at": datetime.now()
             }}
         )
@@ -356,60 +461,4 @@ async def delete_activity(id: str, current_user: dict = Depends(get_current_user
     return {"message": "Activity deleted"}
 
 
-# --- Daily Routine ---
 
-@router.get("/daily-routine", response_model=DailyRoutineTemplate)
-async def get_daily_routine(
-    current_user: dict = Depends(get_current_user_authorization),
-):
-    user_id = current_user.get("user_id")
-    routine = await daily_routines_collection.find_one({"user_id": user_id})
-    
-    if not routine:
-        new_routine = DailyRoutineTemplate(user_id=user_id)
-        result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
-        routine = await daily_routines_collection.find_one({"_id": result.inserted_id})
-        
-    return routine
-
-@router.put("/daily-routine", response_model=DailyRoutineTemplate)
-async def update_daily_routine(
-    routine: DailyRoutineTemplate,
-    current_user: dict = Depends(get_current_user_authorization),
-):
-    user_id = current_user.get("user_id")
-    
-    # Update by user_id since it's a singleton per user
-    # This avoids issues with stale IDs from the frontend
-    
-    result = await daily_routines_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "morning_routine": routine.morning_routine,
-            "afternoon_routine": routine.afternoon_routine,
-            "evening_routine": routine.evening_routine,
-            "updated_at": datetime.now()
-        }}
-    )
-    
-    if result.matched_count == 0:
-        # If for some reason it doesn't exist (shouldn't happen if GET was called, but safety first)
-        # We can create it or raise 404. Let's raise 404 to be safe, or just insert.
-        # Given the previous flow, let's create it implicitly if we want to be super robust, 
-        # but technically the user should have GET it first.
-        # Let's revert to finding it to return it.
-        # Actually, let's try to upsert.
-        
-        # Check if we should insert? 
-        # For now, let's raise 404 but with a clear message, or create a new one.
-        # Let's create a new one to be helpful.
-        new_routine = DailyRoutineTemplate(
-            user_id=user_id,
-            morning_routine=routine.morning_routine,
-            afternoon_routine=routine.afternoon_routine,
-            evening_routine=routine.evening_routine
-        )
-        insert_result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
-        return await daily_routines_collection.find_one({"_id": insert_result.inserted_id})
-
-    return await daily_routines_collection.find_one({"user_id": user_id})

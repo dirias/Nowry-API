@@ -15,8 +15,14 @@ def text_node(state):
     if not prompt or not sample_text or sample_number is None:
         raise HTTPException(status_code=400, detail="Invalid input data")
 
+    from app.core.prompts import RAG_CARD_GENERATION_TEMPLATE
+
     # Construct LLM request
-    request_string = f"{prompt}\n\nContext:\n{sample_text}\n\nCreate {sample_number} study card samples as JSON."
+    request_string = RAG_CARD_GENERATION_TEMPLATE.format(
+        prompt=prompt,
+        sample_text=sample_text,
+        sample_number=sample_number
+    )
 
     groq_client = Groq_client()
     ai_response = groq_client.request(request_string)

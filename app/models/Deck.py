@@ -18,6 +18,10 @@ class Deck(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     deleted_at: Optional[datetime] = None
     deck_type: Literal["flashcard", "quiz", "visual"] = "flashcard"
+    voice_settings: Optional[dict] = {
+        "front": {"voice_name": None, "rate": 1.0, "pitch": 1.0},
+        "back": {"voice_name": None, "rate": 1.0, "pitch": 1.0}
+    }
 
     class Config:
         from_attributes = True

@@ -23,6 +23,7 @@ class Book(BaseModel):
     cover_color: Optional[str] = ""
     page_size: Optional[str] = "a4"  # Page size preference (a4, letter, legal, etc.)
     full_content: Optional[str] = ""  # Single continuous document content
+    auto_save_enabled: Optional[bool] = False  # Auto-save preference (default: off)
 
     class Config:
         populate_by_name = True
