@@ -96,10 +96,31 @@ async def get_annual_plan(
     plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year})
     
     if not plan:
-        # Create default plan if not exists
-        new_plan = AnnualPlan(user_id=user_id, year=year)
-        result = await annual_plans_collection.insert_one(new_plan.dict(by_alias=True))
-        plan = await annual_plans_collection.find_one({"_id": result.inserted_id})
+        raise HTTPException(status_code=404, detail="No annual plan found for this year")
+    
+    return plan
+
+@router.post("", response_model=AnnualPlan, status_code=201)
+async def create_annual_plan(
+    plan_data: dict = Body(...),
+    current_user: dict = Depends(get_current_user_authorization),
+):
+    user_id = current_user.get("user_id")
+    year = plan_data.get("year", datetime.now().year)
+    
+    # Check if plan already exists
+    existing_plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year})
+    if existing_plan:
+        raise HTTPException(status_code=400, detail=f"Annual plan for {year} already exists")
+    
+    # Create new plan
+    new_plan = AnnualPlan(
+        user_id=user_id,
+        year=year,
+        title=plan_data.get("title", f"My {year} Plan")
+    )
+    result = await annual_plans_collection.insert_one(new_plan.dict(by_alias=True))
+    plan = await annual_plans_collection.find_one({"_id": result.inserted_id})
     
     return plan
 
