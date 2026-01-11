@@ -19,15 +19,39 @@ def initialize_firebase():
         print("✅ Firebase Admin SDK already initialized")
     except ValueError:
         # Not initialized yet
-        firebase_service_account = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
         
-        if firebase_service_account and os.path.exists(firebase_service_account):
-            # Production: Use service account file
-            cred = credentials.Certificate(firebase_service_account)
+        # Priority 1: Check for JSON content in ENV (Base64 or Raw String)
+        # This is best for production (Heroku, Vercel, Docker, etc.)
+        firebase_service_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        firebase_service_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
+
+        if firebase_service_json:
+            import json
+            import base64
+            
+            try:
+                # Try decoding base64 first
+                try:
+                    decoded_json = base64.b64decode(firebase_service_json).decode('utf-8')
+                    service_account_info = json.loads(decoded_json)
+                except Exception:
+                    # If not base64, try loading as raw JSON string
+                    service_account_info = json.loads(firebase_service_json)
+                
+                cred = credentials.Certificate(service_account_info)
+                firebase_admin.initialize_app(cred)
+                print("✅ Firebase Admin SDK initialized with ENV JSON content")
+                return
+            except Exception as e:
+                print(f"⚠️ Failed to load FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
+
+        # Priority 2: Check for file path
+        if firebase_service_path and os.path.exists(firebase_service_path):
+            cred = credentials.Certificate(firebase_service_path)
             firebase_admin.initialize_app(cred)
-            print(f"✅ Firebase Admin SDK initialized with service account: {firebase_service_account}")
+            print(f"✅ Firebase Admin SDK initialized with service account file: {firebase_service_path}")
         else:
-            # Development: Use default credentials or manual config
+            # Priority 3: Default Credentials (useful for local dev with gcloud CLI)
             firebase_admin.initialize_app()
             print("⚠️  Firebase Admin SDK initialized with default credentials")
 
