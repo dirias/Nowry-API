@@ -12,7 +12,7 @@ router = APIRouter(
 logger = get_logger(__name__)
 
 
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 from app.config.database import users_collection
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from bson import ObjectId
@@ -21,7 +21,7 @@ from bson import ObjectId
 @router.post("/generate", summary="Generate a quiz from text")
 async def generate_quiz(
     payload: QuizGenerationRequest,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     # --- Subscription Check ---
     user_id = current_user.get("user_id")

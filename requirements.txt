@@ -32,3 +32,5 @@ feedparser
 gunicorn
 slowapi
 cloudinary
+firebase-admin
+email-validator

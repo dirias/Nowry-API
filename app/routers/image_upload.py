@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 from app.utils.storage import get_storage_backend
 from typing import Dict, Any
 import os
@@ -32,7 +32,7 @@ def validate_image_file(file: UploadFile) -> None:
 async def upload_image(
     file: UploadFile = File(...),
     book_id: str = None,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ) -> Dict[str, Any]:
     """
     Upload an image to cloud storage
@@ -106,7 +106,7 @@ async def upload_image(
 @router.delete("/delete/{public_id:path}", summary="Delete an image")
 async def delete_image(
     public_id: str,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ) -> Dict[str, str]:
     """Delete an image from storage"""
     try:

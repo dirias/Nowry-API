@@ -5,7 +5,7 @@ from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book
 from app.config.database import books_collection
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter(
     prefix="/book",
@@ -26,7 +26,7 @@ def get_books_collection() -> Collection:
 async def create_book(
     book: Book,
     books_collection: Collection = Depends(get_books_collection),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     # Set user_id from token
     user_id = current_user.get("user_id")
@@ -177,7 +177,7 @@ async def search_books(
 @router.get("/all", summary="Get all books", response_model=List[Book])
 async def get_all_books(
     books_collection: Collection = Depends(get_books_collection),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
     # Retrieve all books for the current user
@@ -240,7 +240,7 @@ async def import_book_from_file(
     preview: bool = Form(False),  # Preview mode for validation
     title: Optional[str] = Form(None), # Optional title override
     books_collection: Collection = Depends(get_books_collection),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """
     Import a book from an uploaded file.

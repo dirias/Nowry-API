@@ -20,7 +20,7 @@ from app.config.database import (
     books_collection,
     decks_collection,
 )
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter(
     prefix="/users",
@@ -31,11 +31,17 @@ router = APIRouter(
 
 @router.get("/me")
 async def get_current_user_profile(
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """Get current user profile"""
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    # With Firebase auth, we get firebase_uid from the token
+    firebase_uid = current_user.get("firebase_uid")
+    
+    if not firebase_uid:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    
+    # Find user by firebase_uid
+    user = await users_collection.find_one({"firebase_uid": firebase_uid})
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -43,6 +49,7 @@ async def get_current_user_profile(
     # Return safe user data
     return {
         "id": str(user["_id"]),
+        "firebase_uid": user.get("firebase_uid"),
         "username": user.get("username"),
         "email": user.get("email"),
         "role": user.get("role", "user"),
@@ -192,7 +199,7 @@ async def get_user_stats(user_id: str) -> dict:
 
 # Routes
 @router.get("/profile")
-async def get_profile(current_user: dict = Depends(get_current_user_authorization)):
+async def get_profile(current_user: dict = Depends(get_firebase_user)):
     """Get current user's profile"""
     user_id = current_user.get("user_id")
 
@@ -271,7 +278,7 @@ async def get_profile(current_user: dict = Depends(get_current_user_authorizatio
 @router.put("/profile")
 async def update_profile(
     profile_update: ProfileUpdate,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """Update user profile information"""
     user_id = current_user.get("user_id")
@@ -296,7 +303,7 @@ async def update_profile(
 @router.post("/avatar")
 async def upload_avatar(
     file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """Upload user avatar"""
     user_id = current_user.get("user_id")
@@ -326,7 +333,7 @@ async def upload_avatar(
 @router.put("/password")
 async def change_password(
     password_data: PasswordChange,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """Change user password"""
     user_id = current_user.get("user_id")
@@ -360,7 +367,7 @@ async def change_password(
 @router.put("/notifications")
 async def update_notification_preferences(
     preferences: NotificationPreferences,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """Update notification preferences"""
     user_id = current_user.get("user_id")
@@ -387,7 +394,7 @@ async def update_notification_preferences(
 @router.put("/preferences/general")
 async def update_general_preferences(
     prefs: UserPreferences,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """Update general user preferences (Interests, Theme, Language)"""
     user_id = current_user.get("user_id")
@@ -423,7 +430,7 @@ async def update_general_preferences(
 
 
 @router.post("/complete-wizard")
-async def complete_wizard(current_user: dict = Depends(get_current_user_authorization)):
+async def complete_wizard(current_user: dict = Depends(get_firebase_user)):
     """Mark the onboarding wizard as completed"""
     user_id = current_user.get("user_id")
     
@@ -436,7 +443,7 @@ async def complete_wizard(current_user: dict = Depends(get_current_user_authoriz
 
 
 @router.post("/2fa/enable")
-async def enable_2fa(current_user: dict = Depends(get_current_user_authorization)):
+async def enable_2fa(current_user: dict = Depends(get_firebase_user)):
     """Enable two-factor authentication"""
     user_id = current_user.get("user_id")
 
@@ -458,7 +465,7 @@ async def enable_2fa(current_user: dict = Depends(get_current_user_authorization
 
 
 @router.post("/2fa/disable")
-async def disable_2fa(current_user: dict = Depends(get_current_user_authorization)):
+async def disable_2fa(current_user: dict = Depends(get_firebase_user)):
     """Disable two-factor authentication"""
     user_id = current_user.get("user_id")
 
@@ -478,7 +485,7 @@ async def disable_2fa(current_user: dict = Depends(get_current_user_authorizatio
 
 
 @router.delete("/account")
-async def delete_account(current_user: dict = Depends(get_current_user_authorization)):
+async def delete_account(current_user: dict = Depends(get_firebase_user)):
     """Delete user account and all associated data"""
     user_id = current_user.get("user_id")
 

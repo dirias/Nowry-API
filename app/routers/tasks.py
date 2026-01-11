@@ -6,7 +6,7 @@ from pymongo.collection import Collection
 from app.models.Task import Task
 from app.config.database import db
 from app.utils.logger import get_logger
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter(
     prefix="/tasks",
@@ -25,7 +25,7 @@ def get_tasks_collection() -> Collection:
 async def create_task(
     task: Task,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} creating task: {task.title}")
@@ -50,7 +50,7 @@ async def list_tasks(
     completed: Optional[bool] = None,
     category: Optional[str] = None,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"Listing tasks for user: {user_id}")
@@ -76,7 +76,7 @@ async def list_tasks(
 async def get_task(
     id: str,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} fetching task with ID: {id}")
@@ -101,7 +101,7 @@ async def update_task(
     id: str,
     updates: dict,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} updating task {id}")
@@ -136,7 +136,7 @@ async def update_task(
 async def delete_task(
     id: str,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} deleting task {id}")

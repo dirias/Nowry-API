@@ -10,14 +10,14 @@ from app.models.Bug import (
     BugStatusUpdate,
 )
 from app.config.database import bugs_collection, users_collection
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter(prefix="/bugs", tags=["bugs"])
 
 
 @router.post("", response_model=BugReportResponse)
 async def submit_bug_report(
-    bug_data: BugReportCreate, current_user=Depends(get_current_user_authorization)
+    bug_data: BugReportCreate, current_user=Depends(get_firebase_user)
 ):
     """
     Submit a new bug report.
@@ -78,7 +78,7 @@ async def submit_bug_report(
 
 
 @router.get("/my-reports", response_model=List[BugReport])
-async def get_my_bug_reports(current_user=Depends(get_current_user_authorization)):
+async def get_my_bug_reports(current_user=Depends(get_firebase_user)):
     """
     Get all bug reports submitted by the current user.
 
@@ -106,7 +106,7 @@ async def get_all_bugs(
     status: str = None,
     severity: str = None,
     category: str = None,
-    current_user=Depends(get_current_user_authorization),
+    current_user=Depends(get_firebase_user),
 ):
     """
     Get all bug reports with optional filters (Dev only).
@@ -147,7 +147,7 @@ async def get_all_bugs(
 
 
 @router.get("/stats", response_model=dict)
-async def get_bug_stats(current_user=Depends(get_current_user_authorization)):
+async def get_bug_stats(current_user=Depends(get_firebase_user)):
     """
     Get bug statistics (Dev only).
 
@@ -194,7 +194,7 @@ async def get_bug_stats(current_user=Depends(get_current_user_authorization)):
 
 @router.get("/{bug_id}", response_model=BugReport)
 async def get_bug_by_id(
-    bug_id: str, current_user=Depends(get_current_user_authorization)
+    bug_id: str, current_user=Depends(get_firebase_user)
 ):
     """
     Get a specific bug report by ID.
@@ -228,7 +228,7 @@ async def get_bug_by_id(
 
 @router.delete("/{bug_id}")
 async def delete_bug_report(
-    bug_id: str, current_user=Depends(get_current_user_authorization)
+    bug_id: str, current_user=Depends(get_firebase_user)
 ):
     """
     Delete a bug report.
@@ -267,7 +267,7 @@ async def delete_bug_report(
 async def update_bug_status(
     bug_id: str,
     status_update: BugStatusUpdate,
-    current_user=Depends(get_current_user_authorization),
+    current_user=Depends(get_firebase_user),
 ):
     """
     Update bug status, priority, and notes (Dev only).

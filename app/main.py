@@ -26,6 +26,7 @@ from app.routers import (
     bugs,
     annual_planning,
     image_upload,
+    auth,
 )
 
 
@@ -63,6 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)  # Firebase auth
 app.include_router(books.router)
 app.include_router(users.router)
 app.include_router(sessions.router)

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.ai_orchestrator.orchestrator import orchestrator
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 from app.config.database import users_collection
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from bson import ObjectId
@@ -16,7 +16,7 @@ class VisualRequest(BaseModel):
 
 @router.post("/generate")
 async def generate_visual(
-    request: VisualRequest, current_user: dict = Depends(get_current_user_authorization)
+    request: VisualRequest, current_user: dict = Depends(get_firebase_user)
 ):
     # --- Subscription Check ---
     user_id = current_user.get("user_id")

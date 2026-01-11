@@ -3,7 +3,7 @@ from typing import List, Optional
 from datetime import datetime
 from bson import ObjectId
 
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 from app.config.database import (
     annual_plans_collection,
     focus_areas_collection,
@@ -30,7 +30,7 @@ router = APIRouter(
 
 @router.get("/daily-routine", response_model=DailyRoutineTemplate)
 async def get_daily_routine(
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
     routine = await daily_routines_collection.find_one({"user_id": user_id})
@@ -45,7 +45,7 @@ async def get_daily_routine(
 @router.put("/daily-routine", response_model=DailyRoutineTemplate)
 async def update_daily_routine(
     routine: DailyRoutineTemplate,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
     
@@ -89,7 +89,7 @@ async def update_daily_routine(
 
 @router.get("", response_model=AnnualPlan)
 async def get_annual_plan(
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
     year: int = datetime.now().year
 ):
     user_id = current_user.get("user_id")
@@ -103,7 +103,7 @@ async def get_annual_plan(
 @router.post("", response_model=AnnualPlan, status_code=201)
 async def create_annual_plan(
     plan_data: dict = Body(...),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
     year = plan_data.get("year", datetime.now().year)
@@ -127,7 +127,7 @@ async def create_annual_plan(
 @router.put("", response_model=AnnualPlan)
 async def update_annual_plan(
     plan_update: AnnualPlan,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
     # We only allow updating the current year's plan for now or based on ID if we passed it, 
@@ -159,7 +159,7 @@ async def update_annual_plan(
 async def update_annual_plan_by_id(
     id: str,
     plan_update: dict,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
     
@@ -202,7 +202,7 @@ async def update_annual_plan_by_id(
 @router.get("/focus-areas", response_model=List[FocusArea])
 async def get_focus_areas(
     annual_plan_id: str,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=10)
     return areas
@@ -210,7 +210,7 @@ async def get_focus_areas(
 @router.post("/focus-areas", response_model=FocusArea)
 async def create_focus_area(
     focus_area: FocusArea,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     # Check limit (max 3)
     count = await focus_areas_collection.count_documents({"annual_plan_id": focus_area.annual_plan_id})
@@ -225,7 +225,7 @@ async def create_focus_area(
 async def update_focus_area(
     id: str,
     focus_area: FocusArea,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     try:
         obj_id = ObjectId(id)
@@ -251,7 +251,7 @@ async def update_focus_area(
 @router.delete("/focus-areas/{id}")
 async def delete_focus_area(
     id: str,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     # Cascade delete priorities and goals?
     # For now, just delete the area. Logic for cascading should be handled carefully.
@@ -265,7 +265,7 @@ async def delete_focus_area(
 @router.get("/priorities", response_model=List[Priority])
 async def get_priorities(
     annual_plan_id: str,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=50)
     return priorities
@@ -273,7 +273,7 @@ async def get_priorities(
 @router.post("/priorities", response_model=Priority)
 async def create_priority(
     priority: Priority,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     result = await priorities_collection.insert_one(priority.dict(by_alias=True))
     return await priorities_collection.find_one({"_id": result.inserted_id})
@@ -282,7 +282,7 @@ async def create_priority(
 async def update_priority(
     id: str,
     priority: Priority,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     try:
         obj_id = ObjectId(id)
@@ -307,7 +307,7 @@ async def update_priority(
     return await priorities_collection.find_one({"_id": obj_id})
 
 @router.delete("/priorities/{id}")
-async def delete_priority(id: str, current_user: dict = Depends(get_current_user_authorization)):
+async def delete_priority(id: str, current_user: dict = Depends(get_firebase_user)):
     try:
         obj_id = ObjectId(id)
         result = await priorities_collection.delete_one({"_id": obj_id})
@@ -329,7 +329,7 @@ async def delete_priority(id: str, current_user: dict = Depends(get_current_user
 @router.get("/goals", response_model=List[Goal])
 async def get_goals(
     focus_area_id: Optional[str] = None,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     query = {}
     if focus_area_id:
@@ -347,7 +347,7 @@ async def get_goals(
 @router.post("/goals", response_model=Goal)
 async def create_goal(
     goal: Goal,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     result = await goals_collection.insert_one(goal.dict(by_alias=True))
     return await goals_collection.find_one({"_id": result.inserted_id})
@@ -356,7 +356,7 @@ async def create_goal(
 async def update_goal(
     id: str,
     goal: Goal,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     # Try validating/converting to ObjectId
     try:
@@ -423,7 +423,7 @@ async def update_goal(
     return updated_goal
 
 @router.delete("/goals/{id}")
-async def delete_goal(id: str, current_user: dict = Depends(get_current_user_authorization)):
+async def delete_goal(id: str, current_user: dict = Depends(get_firebase_user)):
     await goals_collection.delete_one({"_id": ObjectId(id)})
     return {"message": "Goal deleted"}
 
@@ -433,7 +433,7 @@ async def delete_goal(id: str, current_user: dict = Depends(get_current_user_aut
 @router.get("/goals/{goal_id}/activities", response_model=List[Activity])
 async def get_activities(
     goal_id: str,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     activities = await activities_collection.find({"goal_id": goal_id}).to_list(length=50)
     return activities
@@ -442,7 +442,7 @@ async def get_activities(
 async def create_activity(
     goal_id: str,
     activity: Activity,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     activity.goal_id = goal_id
     result = await activities_collection.insert_one(activity.dict(by_alias=True))
@@ -452,7 +452,7 @@ async def create_activity(
 async def update_activity(
     id: str,
     activity: Activity,
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     try:
         obj_id = ObjectId(id)
@@ -477,7 +477,7 @@ async def update_activity(
     return await activities_collection.find_one({"_id": obj_id})
 
 @router.delete("/activities/{id}")
-async def delete_activity(id: str, current_user: dict = Depends(get_current_user_authorization)):
+async def delete_activity(id: str, current_user: dict = Depends(get_firebase_user)):
     await activities_collection.delete_one({"_id": ObjectId(id)})
     return {"message": "Activity deleted"}
 

@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
 import feedparser
 import httpx
 from datetime import datetime, timedelta
 import re
 import os
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter()
 
@@ -85,7 +86,7 @@ CATEGORY_COLORS = {
 
 
 @router.get("/news/{language}/{category}")
-async def get_news(language: str = "en", category: str = "general"):
+async def get_news(language: str = "en", category: str = "general", user: dict = Depends(get_firebase_user)):
     """
     Fetch news from RSS feeds based on language and category
     Returns cached results if available (5 min cache)
