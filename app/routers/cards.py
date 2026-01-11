@@ -6,6 +6,7 @@ from app.models.StudyCard import StudyCard
 from app.models.CardGenerationRequest import CardGenerationRequest
 from app.config.database import cards_collection
 from app.ai_orchestrator.orchestrator import orchestrator
+from app.auth.firebase_auth import get_firebase_user
 from app.utils.logger import get_logger
 
 router = APIRouter(
@@ -45,7 +46,7 @@ async def generate_card(payload: CardGenerationRequest):
 
 @router.post("/create", summary="Create a new card", response_model=StudyCard)
 async def create_card(
-    card: StudyCard, cards_collection: Collection = Depends(get_cards_collection)
+    card: StudyCard, cards_collection: Collection = Depends(get_firebase_user)
 ):
     logger.info(f"Creating card: {card.title}")
     result = await cards_collection.insert_one(card.dict())

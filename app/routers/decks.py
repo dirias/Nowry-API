@@ -5,7 +5,7 @@ from typing import List
 from app.models.Deck import Deck
 from app.config.database import decks_collection
 from app.utils.logger import get_logger
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter(
     prefix="/decks",
@@ -29,7 +29,7 @@ def get_decks_collection() -> Collection:
 async def create_deck(
     deck: Deck,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     logger.info(f"User {user.get('user_id')} is creating new deck: {deck.name}")
 
@@ -58,7 +58,7 @@ async def create_deck(
 @router.get("/", summary="List all decks", response_model=List[Deck])
 async def list_decks(
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"Listing decks for user: {user_id}")
@@ -81,7 +81,7 @@ async def list_decks(
 async def get_deck(
     id: str,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     from bson import ObjectId
 
@@ -114,7 +114,7 @@ async def update_deck(
     id: str,
     updates: dict,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     from bson import ObjectId
 
@@ -160,7 +160,7 @@ async def update_deck(
 async def delete_deck(
     id: str,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     from bson import ObjectId
 

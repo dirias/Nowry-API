@@ -6,7 +6,7 @@ from pymongo.collection import Collection
 from app.models.StudyCard import StudyCard
 from app.config.database import cards_collection, decks_collection
 from app.utils.logger import get_logger
-from app.auth.auth import get_current_user_authorization
+from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter(
     prefix="/study-cards",
@@ -30,7 +30,7 @@ async def create_study_card(
     card: StudyCard,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
 
@@ -109,7 +109,7 @@ async def create_study_card(
 @router.get("/statistics", summary="Get study statistics for the current user")
 async def get_statistics(
     collection: Collection = Depends(get_cards_collection),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """
     Get study statistics including:
@@ -279,7 +279,7 @@ async def get_statistics(
 async def get_study_card(
     id: str,
     collection: Collection = Depends(get_cards_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} fetching study card with ID: {id}")
@@ -311,7 +311,7 @@ async def list_study_cards(
     tags: Optional[List[str]] = Query(None),
     search: Optional[str] = Query(None),
     collection: Collection = Depends(get_cards_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"Listing study cards for user: {user_id}")
@@ -344,7 +344,7 @@ async def update_study_card(
     updates: dict,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} updating study card with ID: {id}")
@@ -411,7 +411,7 @@ async def delete_study_card(
     id: str,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_current_user_authorization),
+    user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
     logger.info(f"User {user_id} deleting study card with ID: {id}")
@@ -447,7 +447,7 @@ async def review_card(
     id: str,
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
     collection: Collection = Depends(get_cards_collection),
-    current_user: dict = Depends(get_current_user_authorization),
+    current_user: dict = Depends(get_firebase_user),
 ):
     """
     Review a card and update its SM-2 spaced repetition parameters.
