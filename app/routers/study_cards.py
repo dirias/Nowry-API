@@ -25,7 +25,7 @@ def get_decks_collection() -> Collection:
     return decks_collection
 
 
-@router.post("/", summary="Create a new study card", response_model=StudyCard)
+@router.post("", summary="Create a new study card", response_model=StudyCard)
 async def create_study_card(
     card: StudyCard,
     collection: Collection = Depends(get_cards_collection),
@@ -304,7 +304,7 @@ async def get_study_card(
     return card
 
 
-@router.get("/", summary="List all study cards", response_model=List[StudyCard])
+@router.get("", summary="List all study cards", response_model=List[StudyCard])
 async def list_study_cards(
     limit: int = Query(50, ge=1, le=100),
     skip: int = Query(0, ge=0),
