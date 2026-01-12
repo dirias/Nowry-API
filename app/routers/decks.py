@@ -21,7 +21,7 @@ def get_decks_collection() -> Collection:
 
 
 @router.post(
-    "/",
+    "",
     summary="Create a new deck",
     response_model=Deck,
     status_code=status.HTTP_201_CREATED,
@@ -55,7 +55,7 @@ async def create_deck(
     return created_deck
 
 
-@router.get("/", summary="List all decks", response_model=List[Deck])
+@router.get("", summary="List all decks", response_model=List[Deck])
 async def list_decks(
     collection: Collection = Depends(get_decks_collection),
     user: dict = Depends(get_firebase_user),
