@@ -486,21 +486,106 @@ async def disable_2fa(current_user: dict = Depends(get_firebase_user)):
 
 @router.delete("/account")
 async def delete_account(current_user: dict = Depends(get_firebase_user)):
-    """Delete user account and all associated data"""
+    """
+    Soft delete user account and all associated data.
+    Data can be recovered within 30 days before permanent deletion.
+    """
+    from datetime import datetime, timedelta
+    from app.config.database import (
+        annual_plans_collection,
+        focus_areas_collection,
+        priorities_collection,
+        goals_collection,
+        activities_collection,
+        daily_routines_collection,
+    )
+    
     user_id = current_user.get("user_id")
-
-    # Delete all user data
-    await books_collection.delete_many({"user_id": user_id})
-    await study_cards_collection.delete_many({"user_id": user_id})
-    await decks_collection.delete_many({"user_id": user_id})
-
-    # Delete user
-    result = await users_collection.delete_one({"_id": ObjectId(user_id)})
-
-    if result.deleted_count == 0:
+    now = datetime.utcnow()
+    
+    # 1. Soft delete user account
+    user_update = await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {
+            "$set": {
+                "deleted_at": now,
+                "deleted_by": user_id,
+                "updated_at": now
+            }
+        }
+    )
+    
+    if user_update.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
-
-    return {"message": "Account deleted successfully"}
+    
+    # 2. Cascade soft delete to all user content
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "is_public": False,  # Auto-unpublish
+            "updated_at": now
+        }
+    }
+    
+    # Books (and their public metadata)
+    await books_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Decks (and auto-unpublish)
+    await decks_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Study Cards
+    await study_cards_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Annual Plans
+    await annual_plans_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Focus Areas
+    await focus_areas_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Goals
+    await goals_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Priorities
+    await priorities_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Activities
+    await activities_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # Daily Routines
+    await daily_routines_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    return {
+        "message": "Account deleted successfully. Data can be recovered within 30 days by contacting support.",
+        "recovery_deadline": (datetime.utcnow() + timedelta(days=30)).isoformat()
+    }
 
 
 # Legacy endpoint for backward compatibility

@@ -4,13 +4,18 @@ Handles Firebase token validation and user authentication with caching
 """
 
 from fastapi import HTTPException, Header, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config.firebase_config import verify_firebase_token
 from functools import lru_cache
+from typing import Optional
 import time
 
 # Simple in-memory cache for validated tokens (UID -> {token_data, expiry})
 _token_cache = {}
 _CACHE_TTL = 300  # 5 minutes cache
+
+# HTTP Bearer for optional auth
+security = HTTPBearer(auto_error=False)
 
 
 def _get_cached_token(token: str) -> dict | None:
@@ -100,6 +105,9 @@ async def get_firebase_user(request: Request) -> dict:
         else:
             # Should not happen for registered users, but handle gracefully
             token_data["user_id"] = None
+        
+        # Add uid alias for compatibility
+        token_data["uid"] = token_data.get("firebase_uid") or token_data.get("user_id")
             
         return token_data
     except Exception as e:
@@ -107,3 +115,67 @@ async def get_firebase_user(request: Request) -> dict:
             status_code=401,
             detail=f"Invalid Firebase token: {str(e)}"
         )
+
+
+async def get_current_user(request: Request) -> dict:
+    """
+    Get authenticated user (required).
+    Alias for get_firebase_user with uid compatibility.
+    """
+    user_data = await get_firebase_user(request)
+    return user_data
+
+
+async def optional_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Optional[dict]:
+    """
+    Get authenticated user (optional - returns None if not logged in).
+    Used for public endpoints that work for both authenticated and anonymous users.
+    
+    Args:
+        request: FastAPI Request object
+        credentials: Optional HTTP Bearer credentials
+        
+    Returns:
+        dict | None: User data if authenticated, None otherwise
+    """
+    if not credentials:
+        return None
+    
+    try:
+        # Extract token
+        token = credentials.credentials
+        
+        # Check cache first
+        cached_data = _get_cached_token(token)
+        if cached_data:
+            return cached_data
+        
+        # Verify token
+        decoded_token = verify_firebase_token(token)
+        
+        token_data = {
+            "firebase_uid": decoded_token.get("uid"),
+            "uid": decoded_token.get("uid"),  # Alias
+            "email": decoded_token.get("email"),
+            "email_verified": decoded_token.get("email_verified", False),
+            "name": decoded_token.get("name"),
+            "picture": decoded_token.get("picture"),
+        }
+        
+        # Fetch MongoDB user ID
+        from app.config.database import users_collection
+        user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"]})
+        
+        if user:
+            token_data["user_id"] = str(user["_id"])
+        
+        # Cache it
+        _cache_token(token, token_data)
+        
+        return token_data
+    except:
+        # Silent fail - user not logged in or invalid token
+        return None

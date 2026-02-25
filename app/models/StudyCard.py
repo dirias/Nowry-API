@@ -1,10 +1,11 @@
 from pydantic import BaseModel, Field
 from .types import PyObjectId
+from .mixins import SoftDeleteMixin
 from typing import List, Optional
 from datetime import datetime, timedelta
 
 
-class StudyCard(BaseModel):
+class StudyCard(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: Optional[PyObjectId] = None
     deck_id: Optional[PyObjectId] = None
@@ -12,6 +13,7 @@ class StudyCard(BaseModel):
     content: str
     tags: Optional[List[str]] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
     last_reviewed: Optional[datetime] = None
     next_review: Optional[datetime] = None
     ease_factor: float = Field(default=2.5, ge=1.3, le=2.5)  # SM-2 default ease factor

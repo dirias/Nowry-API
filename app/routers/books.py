@@ -49,9 +49,10 @@ async def create_book(
 
     # Check limit if not unlimited (-1)
     if book_limit != -1:
-        current_book_count = await books_collection.count_documents(
-            {"user_id": user_id}
-        )
+        current_book_count = await books_collection.count_documents({
+            "user_id": user_id,
+            "deleted_at": None  # Only count non-deleted books
+        })
         if current_book_count >= book_limit:
             raise HTTPException(
                 status_code=403,
@@ -137,30 +138,54 @@ async def edit_book(
     raise HTTPException(status_code=500, detail="Error fetching updated book")
 
 
-@router.delete("/delete/{book_id}", summary="Delete a book by ID")
+@router.delete("/delete/{book_id}", summary="Soft delete a book by ID")
 async def delete_book(
     book_id: str,
     books_collection: Collection = Depends(get_books_collection),
+    current_user: dict = Depends(get_firebase_user),
 ):
-    # Strategy 1: Delete by ObjectId
+    """
+    Soft delete a book (sets deleted_at timestamp).
+    Also auto-unpublishes if the book was public.
+    """
+    from datetime import datetime
+    
+    user_id = current_user.get("user_id")
+    
+    # Try ObjectId first
     try:
         obj_id = ObjectId(book_id)
-        deleted_book = await books_collection.find_one_and_delete({"_id": obj_id})
-        if deleted_book:
-            print(f"[DEBUG DELETE] Book deleted successfully by ObjectId: {book_id}")
+        
+        # Check ownership and existence
+        book = await books_collection.find_one({
+            "_id": obj_id,
+            "user_id": user_id
+        })
+        
+        if not book:
+            raise HTTPException(status_code=404, detail="Book not found or not authorized")
+        
+        # Soft delete + auto-unpublish
+        result = await books_collection.update_one(
+            {"_id": obj_id},
+            {
+                "$set": {
+                    "deleted_at": datetime.utcnow(),
+                    "deleted_by": user_id,
+                    "is_public": False,  # Auto-unpublish
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        if result.modified_count > 0:
+            print(f"[DEBUG DELETE] Book soft-deleted successfully: {book_id}")
             return {"message": "Book deleted successfully"}
+        
     except Exception as e:
-        print(f"[DEBUG DELETE] Invalid ObjectId format or error: {e}")
-
-    # Strategy 2: Delete by String ID (Fallback for potential import mismatches)
-    print(f"[DEBUG DELETE] Fallback: Attempting delete by String ID: {book_id}")
-    deleted_book_str = await books_collection.find_one_and_delete({"_id": book_id})
+        print(f"[DEBUG DELETE] Error: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting book")
     
-    if deleted_book_str:
-        print(f"[DEBUG DELETE] Book deleted successfully by String ID: {book_id}")
-        return {"message": "Book deleted successfully"}
-    
-    print(f"[DEBUG DELETE] Book not found (tried both ObjectId and String): {book_id}")
     raise HTTPException(status_code=404, detail="Book not found")
 
 
@@ -180,11 +205,24 @@ async def get_all_books(
     current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
-    # Retrieve all books for the current user
-    cursor = books_collection.find({"user_id": user_id})
+    
+    # Debug: Check total books for this user (including deleted)
+    total_count = await books_collection.count_documents({"user_id": user_id})
+    print(f"[DEBUG GET_ALL] Total books for user {user_id}: {total_count}")
+    
+    # Retrieve all books for the current user that are NOT soft-deleted
+    # Use deleted_at: None instead of $exists: False (matches SoftDeleteMixin pattern)
+    cursor = books_collection.find({
+        "user_id": user_id,
+        "deleted_at": None  # Only books where deleted_at is None
+    })
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
+    
+    print(f"[DEBUG GET_ALL] Non-deleted books: {len(books)}")
     for book in books:
+        print(f"[DEBUG GET_ALL] - Book: {book.get('_id')} | Title: {book.get('title')} | deleted_at: {book.get('deleted_at')}")
         book["_id"] = str(book["_id"])
+    
     return books
 
 
@@ -327,11 +365,24 @@ async def import_book_from_file(
             },
         }
 
-    # SAVE MODE: Create the book and pages
     # SAVE MODE: Create the book with full_content
-    # Concatenate all pages into one continuous HTML string
-    # Concatenate all pages into one continuous HTML string with separators
-    full_content = "\n".join([p.get("content", "") for p in extracted_pages])
+    # Convert extracted pages to clean JSON format (Content-First)
+    from app.utils.html_to_lexical import html_to_lexical_json
+    import json
+    
+    # Combine all pages into single HTML
+    combined_html = "\n".join([p.get("content", "") for p in extracted_pages])
+    
+    # Convert HTML to Lexical JSON
+    try:
+        lexical_json = html_to_lexical_json(combined_html)
+        full_content = json.dumps(lexical_json)
+        print(f"✓ Converted import to JSON format: {len(lexical_json['root']['children'])} blocks")
+    except Exception as e:
+        print(f"⚠ HTML conversion failed, using simple fallback: {e}")
+        from app.utils.html_to_lexical import simple_html_to_lexical
+        lexical_json = simple_html_to_lexical(combined_html)
+        full_content = json.dumps(lexical_json)
 
     new_book = Book(
         title=book_title,

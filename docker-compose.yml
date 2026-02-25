@@ -15,11 +15,17 @@ services:
     build: .
     ports: ["8000:8000"]
     depends_on: [mongodb]
-    volumes: [".:/app"]
+    volumes: 
+      - ".:/app"
+      - "../nowry/docs:/app/nowry/docs:ro"  # Mount UI docs (read-only)
+    env_file:
+      - ./app/.env
     environment:
       - ENV=local
       - DEBUG=True
       - MONGO_URI=mongodb://root:example@mongodb:27017/
+      - MONGO_DB=nowry-db
+      - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
 
   mongo-express:
     image: mongo-express:latest

@@ -253,11 +253,58 @@ async def delete_focus_area(
     id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    # Cascade delete priorities and goals?
-    # For now, just delete the area. Logic for cascading should be handled carefully.
-    # Ideally we check if there are goals.
-    await focus_areas_collection.delete_one({"_id": ObjectId(id)})
-    return {"message": "Focus area deleted"}
+    """
+    Soft delete a focus area and cascade to related goals, activities, and priorities.
+    All related data will be soft-deleted and can be recovered within 30 days.
+    """
+    from datetime import datetime
+    
+    user_id = current_user.get("user_id")
+    now = datetime.utcnow()
+    
+    # 1. Verify ownership
+    focus_area = await focus_areas_collection.find_one({
+        "_id": ObjectId(id),
+        "user_id": user_id,
+        "deleted_at": None
+    })
+    
+    if not focus_area:
+        raise HTTPException(status_code=404, detail="Focus area not found")
+    
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now
+        }
+    }
+    
+    # 2. Soft delete the focus area
+    await focus_areas_collection.update_one(
+        {"_id": ObjectId(id)},
+        soft_delete_update
+    )
+    
+    # 3. CASCADE: Soft delete all related goals
+    await goals_collection.update_many(
+        {"focus_area_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # 4. CASCADE: Soft delete all activities in these goals
+    await activities_collection.update_many(
+        {"focus_area_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # 5. CASCADE: Soft delete all related priorities
+    await priorities_collection.update_many(
+        {"focus_area_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    return {"message": "Focus area and all related data deleted successfully"}
 
 
 # --- Priorities ---
@@ -281,29 +328,62 @@ async def create_priority(
 @router.put("/priorities/{id}", response_model=Priority)
 async def update_priority(
     id: str,
-    priority: Priority,
+    priority_update: dict,
     current_user: dict = Depends(get_firebase_user),
 ):
     try:
         obj_id = ObjectId(id)
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] Invalid ObjectId format: {id}, error: {e}")
         raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    # Debug: Check if priority exists
+    existing = await priorities_collection.find_one({"_id": obj_id})
+    if not existing:
+        print(f"[DEBUG] Priority not found with ObjectId: {obj_id}")
+        # Try finding with string ID
+        existing = await priorities_collection.find_one({"_id": id})
+        if not existing:
+            print(f"[DEBUG] Priority not found with string ID either: {id}")
+            raise HTTPException(status_code=404, detail=f"Priority not found: {id}")
+        # Use string ID for update
+        obj_id = id
+
+    print(f"[DEBUG] Found priority: {existing.get('title')} with ID: {obj_id}")
+
+    # Build update dict with only provided fields
+    update_data = {"updated_at": datetime.now()}
+    
+    if "title" in priority_update:
+        update_data["title"] = priority_update["title"]
+    if "description" in priority_update:
+        update_data["description"] = priority_update["description"]
+    if "deadline" in priority_update:
+        update_data["deadline"] = priority_update["deadline"]
+    if "is_completed" in priority_update:
+        update_data["is_completed"] = priority_update["is_completed"]
+        update_data["completed_at"] = datetime.now() if priority_update["is_completed"] else None
+    if "linked_entity_id" in priority_update:
+        update_data["linked_entity_id"] = priority_update["linked_entity_id"]
+    if "linked_entity_type" in priority_update:
+        update_data["linked_entity_type"] = priority_update["linked_entity_type"]
+    if "annual_plan_id" in priority_update:
+        update_data["annual_plan_id"] = priority_update["annual_plan_id"]
+    if "focus_area_id" in priority_update:
+        update_data["focus_area_id"] = priority_update["focus_area_id"]
+
+    print(f"[DEBUG] Updating priority with data: {update_data}")
 
     result = await priorities_collection.update_one(
         {"_id": obj_id},
-        {"$set": {
-            "title": priority.title,
-            "description": priority.description,
-            "deadline": priority.deadline,
-            "is_completed": priority.is_completed,
-            "completed_at": datetime.now() if priority.is_completed else None,
-            "updated_at": datetime.now()
-        }}
+        {"$set": update_data}
     )
     
     if result.matched_count == 0:
+        print(f"[DEBUG] Update matched 0 documents for ID: {obj_id}")
         raise HTTPException(status_code=404, detail="Priority not found")
 
+    print(f"[DEBUG] Successfully updated priority")
     return await priorities_collection.find_one({"_id": obj_id})
 
 @router.delete("/priorities/{id}")
@@ -355,44 +435,49 @@ async def create_goal(
 @router.put("/goals/{id}", response_model=Goal)
 async def update_goal(
     id: str,
-    goal: Goal,
+    goal_update: dict,
     current_user: dict = Depends(get_firebase_user),
 ):
     # Try validating/converting to ObjectId
     try:
         obj_id = ObjectId(id)
+        
+        # Build update dict with only provided fields
+        update_data = {"updated_at": datetime.now()}
+        
+        if "title" in goal_update:
+            update_data["title"] = goal_update["title"]
+        if "description" in goal_update:
+            update_data["description"] = goal_update["description"]
+        if "image_url" in goal_update:
+            update_data["image_url"] = goal_update["image_url"]
+        if "target_date" in goal_update:
+            update_data["target_date"] = goal_update["target_date"]
+        if "progress" in goal_update:
+            update_data["progress"] = goal_update["progress"]
+        if "status" in goal_update:
+            update_data["status"] = goal_update["status"]
+        if "milestones" in goal_update:
+            update_data["milestones"] = goal_update["milestones"]
+        if "parent_id" in goal_update:
+            update_data["parent_id"] = goal_update["parent_id"]
+        if "quarter" in goal_update:
+            update_data["quarter"] = goal_update["quarter"]
+        if "year" in goal_update:
+            update_data["year"] = goal_update["year"]
+        if "type" in goal_update:
+            update_data["type"] = goal_update["type"]
+        
         # Try updating with ObjectId
         result = await goals_collection.update_one(
             {"_id": obj_id},
-            {"$set": {
-                "title": goal.title,
-                "description": goal.description,
-                "image_url": goal.image_url,
-                "target_date": goal.target_date,
-                "progress": goal.progress,
-                "status": goal.status,
-                "milestones": goal.milestones,
-                "parent_id": goal.parent_id,
-                "quarter": goal.quarter,
-                "year": goal.year,
-                "type": goal.type,
-                "updated_at": datetime.now()
-            }}
+            {"$set": update_data}
         )
         # If no match, maybe it's stored as a string?
         if result.matched_count == 0:
              result = await goals_collection.update_one(
                 {"_id": id},
-                {"$set": {
-                    "title": goal.title,
-                    "description": goal.description,
-                    "image_url": goal.image_url,
-                    "target_date": goal.target_date,
-                    "progress": goal.progress,
-                    "status": goal.status,
-                    "milestones": goal.milestones,
-                    "updated_at": datetime.now()
-                }}
+                {"$set": update_data}
             )
              if result.matched_count > 0:
                  # It was a string ID
@@ -404,16 +489,7 @@ async def update_goal(
         # If ObjectId conversion failed completely, try as string directly
         result = await goals_collection.update_one(
             {"_id": id},
-            {"$set": {
-                "title": goal.title,
-                "description": goal.description,
-                "image_url": goal.image_url,
-                "target_date": goal.target_date,
-                "progress": goal.progress,
-                "status": goal.status,
-                "milestones": goal.milestones,
-                "updated_at": datetime.now()
-            }}
+            {"$set": update_data}
         )
         if result.matched_count == 0:
              raise HTTPException(status_code=404, detail="Goal not found")
@@ -424,8 +500,46 @@ async def update_goal(
 
 @router.delete("/goals/{id}")
 async def delete_goal(id: str, current_user: dict = Depends(get_firebase_user)):
-    await goals_collection.delete_one({"_id": ObjectId(id)})
-    return {"message": "Goal deleted"}
+    """
+    Soft delete a goal and cascade to related activities.
+    All related data will be soft-deleted and can be recovered within 30 days.
+    """
+    from datetime import datetime
+    
+    user_id = current_user.get("user_id")
+    now = datetime.utcnow()
+    
+    # 1. Verify ownership
+    goal = await goals_collection.find_one({
+        "_id": ObjectId(id),
+        "user_id": user_id,
+        "deleted_at": None
+    })
+    
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now
+        }
+    }
+    
+    # 2. Soft delete the goal
+    await goals_collection.update_one(
+        {"_id": ObjectId(id)},
+        soft_delete_update
+    )
+    
+    # 3. CASCADE: Soft delete all related activities
+    await activities_collection.update_many(
+        {"goal_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    return {"message": "Goal and all activities deleted successfully"}
 
 
 # --- Activities ---

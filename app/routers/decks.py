@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pymongo.collection import Collection
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from app.models.Deck import Deck
 from app.config.database import decks_collection
 from app.utils.logger import get_logger
-from app.auth.firebase_auth import get_firebase_user
+from app.auth.firebase_auth import get_firebase_user, optional_auth
 
 router = APIRouter(
     prefix="/decks",
@@ -109,6 +109,61 @@ async def get_deck(
     return deck
 
 
+@router.get("/{id}/cards", summary="Get cards for a deck")
+async def get_deck_cards(
+    id: str,
+    limit: int = 100,
+    skip: int = 0,
+    current_user: Optional[dict] = Depends(optional_auth),
+):
+    """Get all cards belonging to a specific deck (supports optional auth for public decks)"""
+    from bson import ObjectId
+    from app.config.database import cards_collection
+    from app.auth.firebase_auth import optional_auth
+    
+    logger.info(f"Fetching cards for deck ID: {id}")
+    
+    # Verify deck exists
+    try:
+        deck = await decks_collection.find_one({"_id": ObjectId(id)})
+    except Exception:
+        deck = await decks_collection.find_one({"id": id})
+    
+    if not deck:
+        raise HTTPException(status_code=404, detail="Deck not found")
+    
+    # Security check: only allow if deck is public OR user owns it
+    user_id = current_user.get("user_id") if current_user else None
+    is_owner = user_id and str(deck.get("user_id")) == str(user_id)
+    is_public = deck.get("is_public", False)  # Check root-level is_public
+    
+    if not is_owner and not is_public:
+        raise HTTPException(status_code=403, detail="Not authorized to view this deck")
+    
+    # Fetch cards for this deck
+    try:
+        cards_cursor = cards_collection.find({
+            "deck_id": ObjectId(id),
+            "deleted_at": None
+        }).skip(skip).limit(limit)
+    except Exception:
+        cards_cursor = cards_collection.find({
+            "deck_id": id,
+            "deleted_at": None
+        }).skip(skip).limit(limit)
+    
+    cards = await cards_cursor.to_list(length=limit)
+    
+    # Convert ObjectIds to strings
+    for card in cards:
+        card["_id"] = str(card["_id"])
+        if card.get("deck_id"):
+            if isinstance(card["deck_id"], ObjectId):
+                card["deck_id"] = str(card["deck_id"])
+    
+    return {"items": cards, "total": len(cards)}
+
+
 @router.patch("/{id}", summary="Update a deck", response_model=Deck)
 async def update_deck(
     id: str,
@@ -180,9 +235,28 @@ async def delete_deck(
             status_code=403, detail="Not authorized to delete this deck"
         )
 
-    # Soft delete
+    now = datetime.utcnow()
+    
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "is_public": False,  # Auto-unpublish
+            "updated_at": now
+        }
+    }
+    
+    # 1. Soft delete the deck
     await collection.update_one(
-        {"_id": existing_deck["_id"]}, {"$set": {"deleted_at": datetime.utcnow()}}
+        {"_id": existing_deck["_id"]},
+        soft_delete_update
+    )
+    
+    # 2. CASCADE: Soft delete all cards in this deck
+    from app.config.database import cards_collection
+    await cards_collection.update_many(
+        {"deck_id": str(existing_deck["_id"]), "deleted_at": None},
+        soft_delete_update
     )
 
     return None

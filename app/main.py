@@ -27,6 +27,8 @@ from app.routers import (
     annual_planning,
     image_upload,
     auth,
+    public_content,
+    moderation,
 )
 
 
@@ -78,6 +80,8 @@ app.include_router(news.router)
 app.include_router(bugs.router)
 app.include_router(annual_planning.router)
 app.include_router(image_upload.router)
+app.include_router(public_content.router)  # Public content sharing
+app.include_router(moderation.router)  # Content moderation
 
 
 @app.get("/")
