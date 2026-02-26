@@ -12,6 +12,8 @@ class DailyRoutineTemplate(BaseModel, SoftDeleteMixin):
     morning_routine: List[Dict[str, Any]] = []
     afternoon_routine: List[Dict[str, Any]] = []
     evening_routine: List[Dict[str, Any]] = []
+    # Keys: ISO date str "YYYY-MM-DD", values: list of completed item keys e.g. ["morning_0", "evening_2"]
+    daily_completions: Dict[str, List[str]] = {}
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 

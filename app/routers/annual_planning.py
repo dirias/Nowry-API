@@ -85,6 +85,31 @@ async def update_daily_routine(
     return await daily_routines_collection.find_one({"user_id": user_id})
 
 
+@router.patch("/daily-routine/completions")
+async def update_routine_completions(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_firebase_user),
+):
+    """
+    Update only the completion list for a specific date.
+    Uses dot-notation $set so other dates are untouched.
+    Expected payload: { "date": "YYYY-MM-DD", "items": ["morning_0", "evening_2"] }
+    """
+    user_id = current_user.get("user_id")
+    date_key = payload.get("date")
+    items = payload.get("items", [])
+
+    if not date_key:
+        raise HTTPException(status_code=400, detail="date field is required")
+
+    await daily_routines_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {f"daily_completions.{date_key}": items}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
 # --- Annual Plan ---
 
 @router.get("", response_model=AnnualPlan)
