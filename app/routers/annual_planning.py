@@ -125,6 +125,73 @@ async def get_annual_plan(
     
     return plan
 
+
+@router.get("/full")
+async def get_full_annual_plan(
+    current_user: dict = Depends(get_firebase_user),
+    year: int = datetime.now().year
+):
+    """
+    Aggregation endpoint — returns the plan, focus areas, priorities, and all
+    goals for every focus area in a single round-trip.
+
+    Replaces the 3-level sequential waterfall:
+      /annual-plan  →  /focus-areas + /priorities  →  /goals × N
+
+    All DB queries run concurrently via asyncio.gather so the response time is
+    bounded by the slowest single query, not the sum of all of them.
+    """
+    import asyncio
+
+    user_id = current_user.get("user_id")
+    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year})
+
+    if not plan:
+        raise HTTPException(status_code=404, detail="No annual plan found for this year")
+
+    plan_id = str(plan["_id"])
+
+    # Level 2: focus areas + priorities in parallel
+    areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id}).to_list(length=10)
+    priorities_coro = priorities_collection.find({"annual_plan_id": plan_id}).to_list(length=50)
+    areas, priorities = await asyncio.gather(areas_coro, priorities_coro)
+
+    # Level 3: goals for every area — all in parallel
+    goal_lists = await asyncio.gather(
+        *[goals_collection.find({"focus_area_id": str(area["_id"])}).to_list(length=100) for area in areas]
+    )
+
+    # Attach goals to each area and build flat goals list
+    goals_by_area = {}
+    all_goals = []
+    for area, area_goals in zip(areas, goal_lists):
+        area_id = str(area["_id"])
+        goals_by_area[area_id] = area_goals
+        all_goals.extend(area_goals)
+
+    def serialize(doc):
+        """Convert ObjectId and other non-serializable types to strings."""
+        if doc is None:
+            return None
+        result = {}
+        for k, v in doc.items():
+            if hasattr(v, '__str__') and type(v).__name__ == 'ObjectId':
+                result[k] = str(v)
+            elif isinstance(v, list):
+                result[k] = [serialize(i) if isinstance(i, dict) else i for i in v]
+            elif isinstance(v, dict):
+                result[k] = serialize(v)
+            else:
+                result[k] = v
+        return result
+
+    return {
+        "plan": serialize(plan),
+        "focus_areas": [serialize(a) for a in areas],
+        "priorities": [serialize(p) for p in priorities],
+        "goals": [serialize(g) for g in all_goals],
+    }
+
 @router.post("", response_model=AnnualPlan, status_code=201)
 async def create_annual_plan(
     plan_data: dict = Body(...),
@@ -519,7 +586,34 @@ async def update_goal(
         if result.matched_count == 0:
              raise HTTPException(status_code=404, detail="Goal not found")
         obj_id = id
-        
+
+    # --- Priority cascade on status change ---
+    # When a goal is completed, archive all priorities linked to it.
+    # When a goal is un-completed, reactivate those priorities.
+    if "status" in goal_update:
+        new_status = goal_update["status"]
+        goal_id_str = str(id)
+        now = datetime.now()
+
+        if new_status == "completed":
+            priority_update = {
+                "is_completed": True,
+                "completed_at": now,
+                "updated_at": now,
+            }
+        else:
+            # Goal moved back to in_progress or not_started → reactivate
+            priority_update = {
+                "is_completed": False,
+                "completed_at": None,
+                "updated_at": now,
+            }
+
+        await priorities_collection.update_many(
+            {"linked_entity_id": goal_id_str, "linked_entity_type": "goal"},
+            {"$set": priority_update},
+        )
+
     updated_goal = await goals_collection.find_one({"_id": obj_id})
     return updated_goal
 
