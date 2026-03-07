@@ -14,6 +14,8 @@ class Activity(BaseModel):
     time_of_day: Optional[str] = "anytime"  # morning, afternoon, evening, anytime
     duration_minutes: Optional[int] = 30
     is_active: bool = True
+    streak: int = 0
+    last_completed_date: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
