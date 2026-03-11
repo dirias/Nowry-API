@@ -164,10 +164,17 @@ async def get_full_annual_plan(
     # Attach goals to each area and build flat goals list
     goals_by_area = {}
     all_goals = []
+    goal_ids = []
     for area, area_goals in zip(areas, goal_lists):
         area_id = str(area["_id"])
         goals_by_area[area_id] = area_goals
         all_goals.extend(area_goals)
+        goal_ids.extend([str(g["_id"]) for g in area_goals])
+
+    # Level 4: activities for all goals
+    all_activities = []
+    if goal_ids:
+        all_activities = await activities_collection.find({"goal_id": {"$in": goal_ids}}).to_list(length=500)
 
     def serialize(doc):
         """Convert ObjectId and other non-serializable types to strings."""
@@ -190,6 +197,7 @@ async def get_full_annual_plan(
         "focus_areas": [serialize(a) for a in areas],
         "priorities": [serialize(p) for p in priorities],
         "goals": [serialize(g) for g in all_goals],
+        "activities": [serialize(act) for act in all_activities],
     }
 
 @router.post("", response_model=AnnualPlan, status_code=201)
