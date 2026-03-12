@@ -172,7 +172,7 @@ async def get_public_book(
     from app.config.database import users_collection
     from bson import ObjectId
     
-    viewer_id = current_user.get("uid") if current_user else None
+    viewer_id = current_user.get("user_id") if current_user else None
     viewer_role = None
     viewer_is_beta = False
     
@@ -210,7 +210,7 @@ async def get_public_deck(
     from app.config.database import users_collection
     from bson import ObjectId
     
-    viewer_id = current_user.get("uid") if current_user else None
+    viewer_id = current_user.get("user_id") if current_user else None
     viewer_role = None
     viewer_is_beta = False
     
@@ -249,7 +249,7 @@ async def publish_book(
     result = await service.publish_content(
         content_type="book",
         content_id=book_id,
-        user_id=current_user["uid"],
+        user_id=current_user["user_id"],
         public_metadata=publish_data.dict()
     )
     
@@ -273,7 +273,7 @@ async def publish_deck(
     result = await service.publish_content(
         content_type="deck",
         content_id=deck_id,
-        user_id=current_user["uid"],
+        user_id=current_user["user_id"],
         public_metadata=publish_data.dict()
     )
     
@@ -293,7 +293,7 @@ async def unpublish_book(
     result = await service.unpublish_content(
         content_type="book",
         content_id=book_id,
-        user_id=current_user["uid"]
+        user_id=current_user["user_id"]
     )
     
     return {
@@ -312,7 +312,7 @@ async def unpublish_deck(
     result = await service.unpublish_content(
         content_type="deck",
         content_id=deck_id,
-        user_id=current_user["uid"]
+        user_id=current_user["user_id"]
     )
     
     return {
@@ -333,7 +333,7 @@ async def like_book(
     result = await service.like_content(
         content_type="book",
         content_id=book_id,
-        user_id=current_user["uid"]
+        user_id=current_user["user_id"]
     )
     
     return result
@@ -349,7 +349,7 @@ async def unlike_book(
     result = await service.unlike_content(
         content_type="book",
         content_id=book_id,
-        user_id=current_user["uid"]
+        user_id=current_user["user_id"]
     )
     
     return result
@@ -365,7 +365,7 @@ async def like_deck(
     result = await service.like_content(
         content_type="deck",
         content_id=deck_id,
-        user_id=current_user["uid"]
+        user_id=current_user["user_id"]
     )
     
     return result
@@ -381,7 +381,7 @@ async def unlike_deck(
     result = await service.unlike_content(
         content_type="deck",
         content_id=deck_id,
-        user_id=current_user["uid"]
+        user_id=current_user["user_id"]
     )
     
     return result
@@ -402,7 +402,7 @@ async def fork_book(
     result = await service.fork_content(
         content_type="book",
         original_content_id=book_id,
-        forking_user_id=current_user["uid"]
+        forking_user_id=current_user["user_id"]
     )
     
     return {
@@ -424,7 +424,7 @@ async def fork_deck(
     result = await service.fork_content(
         content_type="deck",
         original_content_id=deck_id,
-        forking_user_id=current_user["uid"]
+        forking_user_id=current_user["user_id"]
     )
     
     return {
@@ -452,7 +452,7 @@ async def get_my_liked_content(
     - page_size: Items per page
     """
     result = await service.get_user_liked_content(
-        user_id=current_user["uid"],
+        user_id=current_user["user_id"],
         content_type=content_type,
         page=page,
         page_size=page_size

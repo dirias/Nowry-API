@@ -89,9 +89,6 @@ async def get_firebase_user(request: Request) -> dict:
             "picture": decoded_token.get("picture"),
         }
         
-        # Cache the validated token
-        _cache_token(token, token_data)
-        
         # --- NEW: Fetch MongoDB User ID ---
         # Many endpoints expect "user_id" (MongoDB _id) to be present
         from app.config.database import users_collection
@@ -109,6 +106,9 @@ async def get_firebase_user(request: Request) -> dict:
         # Add uid alias for compatibility
         token_data["uid"] = token_data.get("firebase_uid") or token_data.get("user_id")
             
+        # Cache the validated token AFTER MongoDB data is fully joined
+        _cache_token(token, token_data)
+
         return token_data
     except Exception as e:
         raise HTTPException(

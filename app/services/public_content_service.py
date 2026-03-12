@@ -16,6 +16,21 @@ class PublicContentService:
     def __init__(self, db):
         self.db = db
     
+    def _serialize_doc(self, doc: Optional[dict]) -> Optional[dict]:
+        """Convert ObjectId fields to strings for JSON serialization"""
+        if not doc:
+            return None
+        
+        doc["_id"] = str(doc["_id"])
+        if doc.get("user_id") and isinstance(doc["user_id"], ObjectId):
+            doc["user_id"] = str(doc["user_id"])
+            
+        # Handle author/author_name consistency
+        if "author" in doc and "author_name" not in doc:
+            doc["author_name"] = doc["author"]
+            
+        return doc
+    
     # ========== Publishing ==========
     
     async def publish_content(
@@ -70,7 +85,7 @@ class PublicContentService:
         
         # Return updated content
         updated_content = await collection.find_one({"_id": ObjectId(content_id)})
-        return updated_content
+        return self._serialize_doc(updated_content)
     
     async def unpublish_content(
         self,
@@ -106,7 +121,7 @@ class PublicContentService:
         )
         
         updated_content = await collection.find_one({"_id": ObjectId(content_id)})
-        return updated_content
+        return self._serialize_doc(updated_content)
     
     # ========== Discovery & Browse ==========
     
@@ -202,14 +217,7 @@ class PublicContentService:
         items = await collection.find(query).sort(sort_field).skip(skip).limit(page_size).to_list(page_size)
         
         # Convert ObjectIds to strings for JSON serialization
-        for item in items:
-            # Map `author` to `author_name` for consistency
-            item["author_name"] = item.get("author_name") or item.get("author")
-            item["_id"] = str(item["_id"])
-            if item.get("user_id"):
-                # Handle both ObjectId and string user_id
-                if isinstance(item["user_id"], ObjectId):
-                    item["user_id"] = str(item["user_id"])
+        items = [self._serialize_doc(item) for item in items]
         
         return {
             "items": items,
@@ -278,13 +286,7 @@ class PublicContentService:
                 {"$inc": {"public_metadata.views": 1}}
             )
         
-        # Convert ObjectIds to strings for JSON serialization
-        content["_id"] = str(content["_id"])
-        if content.get("user_id"):
-            if isinstance(content["user_id"], ObjectId):
-                content["user_id"] = str(content["user_id"])
-        
-        return content
+        return self._serialize_doc(content)
     
     # ========== Engagement ==========
     
@@ -433,7 +435,7 @@ class PublicContentService:
         
         # Return the forked content
         forked = await collection.find_one({"_id": result.inserted_id})
-        return forked
+        return self._serialize_doc(forked)
     
     # ========== User Libraries ==========
     
@@ -465,7 +467,7 @@ class PublicContentService:
                 "deleted_at": None
             })
             if content:
-                items.append(content)
+                items.append(self._serialize_doc(content))
         
         return {
             "items": items,
