@@ -23,6 +23,7 @@ class Goal(BaseModel, SoftDeleteMixin):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
+    migration_count: int = 0
 
     class Config:
         populate_by_name = True

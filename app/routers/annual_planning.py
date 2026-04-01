@@ -11,6 +11,8 @@ from app.config.database import (
     goals_collection,
     activities_collection,
     daily_routines_collection,
+    quarter_reports_collection,
+    books_collection,
 )
 from app.models.AnnualPlan import AnnualPlan
 from app.models.FocusArea import FocusArea
@@ -18,6 +20,7 @@ from app.models.Priority import Priority
 from app.models.Goal import Goal
 from app.models.Activity import Activity
 from app.models.DailyRoutine import DailyRoutineTemplate
+from app.models.QuarterReport import QuarterReport
 
 router = APIRouter(
     prefix="/annual-plan",
@@ -295,6 +298,191 @@ async def update_annual_plan_by_id(
     )
     
     return await annual_plans_collection.find_one({"_id": id})
+
+
+# --- Quarter Reports ---
+
+@router.post("/close-quarter", response_model=QuarterReport)
+async def close_quarter(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_firebase_user),
+):
+    user_id = current_user.get("user_id")
+    year = payload.get("year")
+    quarter = payload.get("quarter")
+    annual_plan_id = payload.get("annual_plan_id")
+    migrated_goals = payload.get("migrated_goals", [])
+    reflections = payload.get("reflections", {})
+
+    if not all([year, quarter, annual_plan_id]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    # Determine quarter dates
+    if quarter == 1:
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year, 3, 31, 23, 59, 59)
+    elif quarter == 2:
+        start_date = datetime(year, 4, 1)
+        end_date = datetime(year, 6, 30, 23, 59, 59)
+    elif quarter == 3:
+        start_date = datetime(year, 7, 1)
+        end_date = datetime(year, 9, 30, 23, 59, 59)
+    else:
+        start_date = datetime(year, 10, 1)
+        end_date = datetime(year, 12, 31, 23, 59, 59)
+
+    # 1. Fetch all goals currently in this quarter BEFORE migrating them
+    focus_areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=100)
+    fa_ids = [str(fa["_id"]) for fa in focus_areas]
+    
+    current_goals = await goals_collection.find({
+        "focus_area_id": {"$in": fa_ids},
+        "quarter": quarter,
+        "year": year,
+        "deleted_at": None
+    }).to_list(length=500)
+
+    # 2. Calculate metrics
+    total_goals = len(current_goals)
+    completed_goals = 0
+    total_milestones = 0
+    completed_milestones = 0
+    
+    for g in current_goals:
+        if g.get("status") == "completed" or g.get("progress", 0) == 100:
+            completed_goals += 1
+            
+        milestones = g.get("milestones", [])
+        total_milestones += len(milestones)
+        completed_milestones += sum(1 for m in milestones if m.get("completed"))
+
+    if total_goals == 0:
+        progress_percentage = 0
+    else:
+        progress_percentage = int((sum(g.get("progress", 0) for g in current_goals) / total_goals))
+
+    def serialize_goal(g):
+        g_dict = dict(g)
+        g_dict["_id"] = str(g_dict["_id"])
+        if "target_date" in g_dict and isinstance(g_dict["target_date"], datetime):
+            g_dict["target_date"] = g_dict["target_date"].isoformat()
+        if "created_at" in g_dict and isinstance(g_dict["created_at"], datetime):
+            g_dict["created_at"] = g_dict["created_at"].isoformat()
+        if "updated_at" in g_dict and isinstance(g_dict["updated_at"], datetime):
+            g_dict["updated_at"] = g_dict["updated_at"].isoformat()
+        if "completed_at" in g_dict and isinstance(g_dict["completed_at"], datetime):
+            g_dict["completed_at"] = g_dict["completed_at"].isoformat()
+        return g_dict
+
+    goals_summary = [serialize_goal(g) for g in current_goals]
+
+    # 3. Perform the migration
+    for m_goal in migrated_goals:
+        goal_id = m_goal.get("id")
+        new_quarter = m_goal.get("new_quarter")
+        new_target_date = m_goal.get("new_target_date")
+        if goal_id and new_quarter and new_target_date:
+            try:
+                obj_id = ObjectId(goal_id)
+            except:
+                obj_id = goal_id
+            
+            # parse date string if it's string format (from frontend)
+            dt = new_target_date
+            if isinstance(dt, str):
+                dt = dt.replace('Z', '+00:00')
+                dt = datetime.fromisoformat(dt)
+            
+            update_payload = {
+                "$set": {
+                    "quarter": new_quarter,
+                    "target_date": dt,
+                    "updated_at": datetime.now()
+                },
+                "$inc": {"migration_count": 1}
+            }
+            
+            res = await goals_collection.update_one({"_id": obj_id}, update_payload)
+            if res.matched_count == 0:
+                await goals_collection.update_one({"_id": str(goal_id)}, update_payload)
+
+    # New: Aggregate Knowledge (Books finished in this quarter)
+    books = await books_collection.find({
+        "user_id": user_id,
+        "status": "completed",
+        "updated_at": {"$gte": start_date, "$lte": end_date}
+    }).to_list(length=100)
+    
+    def serialize_book(b):
+        b["_id"] = str(b["_id"])
+        if "created_at" in b and isinstance(b["created_at"], datetime):
+            b["created_at"] = b["created_at"].isoformat()
+        if "updated_at" in b and isinstance(b["updated_at"], datetime):
+            b["updated_at"] = b["updated_at"].isoformat()
+        return b
+        
+    knowledge_summary = {
+        "books_finished": [serialize_book(b) for b in books],
+        "cards_mastered_count": 0 # Placeholder for study center integration if needed later
+    }
+
+    # New: Aggregate Routines (Days active in this quarter)
+    routine_doc = await daily_routines_collection.find_one({"user_id": user_id})
+    routines_summary = {"average_completion_rate": 0.0, "active_days": 0}
+    if routine_doc and "daily_completions" in routine_doc:
+        completions = routine_doc["daily_completions"]
+        active_days = 0
+        total_items_checked = 0
+        for date_str, items in completions.items():
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d")
+                if start_date <= d <= end_date:
+                    if len(items) > 0:
+                        active_days += 1
+                        total_items_checked += len(items)
+            except:
+                continue
+                
+        # Simple heuristic: active vs total days in quarter (~90 days)
+        routines_summary = {
+            "active_days": active_days,
+            "total_items_checked": total_items_checked,
+            "completion_rate": min(100, int((active_days / 90) * 100)) if active_days > 0 else 0
+        }
+
+    # 4. Create and save QuarterReport
+    report = QuarterReport(
+        user_id=user_id,
+        annual_plan_id=annual_plan_id,
+        year=year,
+        quarter=quarter,
+        total_goals=total_goals,
+        completed_goals=completed_goals,
+        total_milestones=total_milestones,
+        completed_milestones=completed_milestones,
+        progress_percentage=progress_percentage,
+        goals_summary=goals_summary,
+        reflections=reflections,
+        routines_summary=routines_summary,
+        knowledge_summary=knowledge_summary
+    )
+    
+    result = await quarter_reports_collection.insert_one(report.dict(by_alias=True))
+    created_report = await quarter_reports_collection.find_one({"_id": result.inserted_id})
+    return created_report
+
+@router.get("/quarter-reports/{annual_plan_id}", response_model=List[QuarterReport])
+async def get_quarter_reports(
+    annual_plan_id: str,
+    current_user: dict = Depends(get_firebase_user),
+):
+    user_id = current_user.get("user_id")
+    reports = await quarter_reports_collection.find({
+        "annual_plan_id": annual_plan_id,
+        "user_id": user_id,
+        "deleted_at": None
+    }).sort("quarter", 1).to_list(length=10)
+    return reports
 
 
 # --- Focus Areas ---

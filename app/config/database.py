@@ -27,8 +27,7 @@ priorities_collection = db["priorities"]
 goals_collection = db["goals"]
 activities_collection = db["activities"]
 daily_routines_collection = db["daily_routines"]
-
-
+quarter_reports_collection = db["quarter_reports"]
 async def create_indexes():
     # User indexes
     await users_collection.create_index("email", unique=True)
@@ -49,5 +48,6 @@ async def create_indexes():
     await goals_collection.create_index("focus_area_id")
     await activities_collection.create_index("goal_id")
     await daily_routines_collection.create_index("user_id", unique=True)
+    await quarter_reports_collection.create_index("annual_plan_id")
 
     print("Database indexes created successfully.")
