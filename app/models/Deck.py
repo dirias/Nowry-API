@@ -6,6 +6,34 @@ from .mixins import SoftDeleteMixin
 from .PublicContent import PublicMetadata
 
 
+class DeckWithStats(BaseModel):
+    """Deck enriched with real-time computed stats returned by GET /decks."""
+    id: Optional[str] = Field(None, alias="_id")
+    user_id: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    deck_type: str = "flashcard"
+    status: str = "new"
+    tags: Optional[List[str]] = []
+    is_public: bool = False
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    # Computed at request time
+    total_cards: int = 0
+    due_cards: int = 0
+    new_cards: int = 0
+    mastery: int = 0
+    last_studied: Optional[datetime] = None
+    is_due_soon: bool = False
+    hours_until_due: Optional[int] = None
+    voice_settings: Optional[dict] = None
+
+    class Config:
+        populate_by_name = True
+        json_encoders = {PyObjectId: str}
+
+
 class Deck(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: Optional[PyObjectId] = None

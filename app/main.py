@@ -30,6 +30,7 @@ from app.routers import (
     public_content,
     moderation,
     blackboards,
+    import_apkg,
 )
 
 
@@ -84,6 +85,7 @@ app.include_router(image_upload.router)
 app.include_router(public_content.router)  # Public content sharing
 app.include_router(moderation.router)  # Content moderation
 app.include_router(blackboards.router)  # Blackboard brainstorm canvas
+app.include_router(import_apkg.router)  # Anki .apkg import
 
 
 @app.get("/")
