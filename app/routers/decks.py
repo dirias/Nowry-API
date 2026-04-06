@@ -25,6 +25,7 @@ from app.models.deck_config import (
     DeckConfigResponse,
     DeckConfigUpdate,
     PaceMode,
+    resolve_deck_budget,
 )
 from app.utils.logger import get_logger
 
@@ -170,16 +171,22 @@ async def list_decks(
         # how many cards were already studied today.
         today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # New cards studied today (first time they've ever been reviewed)
+        # New cards studied today (first time they've ever been reviewed).
+        # IMPORTANT: filter out soft-deleted cards so the dashboard count
+        # matches what `_select_session_cards` in study_cards.py actually
+        # serves — otherwise deleting a card you already reviewed today
+        # double-penalises the remaining daily budget.
         new_studied_today = await cards_collection.count_documents({
             **deck_filter,
+            "deleted_at": None,
             "last_reviewed": {"$gte": today_start},
-            "repetitions": {"$lte": 1} # Includes fails (0) and first-time success (1)
+            "repetitions": {"$lte": 1}  # Includes fails (0) and first-time success (1)
         })
-        
+
         # Reviews completed today (already had a history before today)
         reviews_done_today = await cards_collection.count_documents({
             **deck_filter,
+            "deleted_at": None,
             "last_reviewed": {"$gte": today_start},
             "repetitions": {"$gt": 1}
         })
@@ -387,19 +394,10 @@ async def delete_deck(
 # ---------------------------------------------------------------------------
 
 def _resolve_deck_config(deck_doc: dict) -> tuple[PaceMode, int, int]:
-    """Extract (pace_mode, new_per_day, max_reviews_per_day) from a deck document,
-    falling back to the balanced defaults when no config subdocument is present."""
-    cfg = deck_doc.get("config") or {}
-    mode_str: str = cfg.get("pace_mode", PaceMode.balanced.value)
-    # Guard against a stored value that no longer matches the enum
-    try:
-        mode = PaceMode(mode_str)
-    except ValueError:
-        mode = PaceMode.balanced
-    defaults = PACE_DEFAULTS[mode.value]
-    new_per_day: int = cfg.get("new_per_day", defaults["new_per_day"])
-    max_reviews: int = cfg.get("max_reviews_per_day", defaults["max_reviews_per_day"])
-    return mode, new_per_day, max_reviews
+    """Thin wrapper around the shared `resolve_deck_budget` so legacy callers
+    in this router stay compatible. Single source of truth lives in
+    `app.models.deck_config`."""
+    return resolve_deck_budget(deck_doc)
 
 
 async def _fetch_owned_deck(deck_id: str, user_id: str) -> dict:

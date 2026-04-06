@@ -16,6 +16,7 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     last_reviewed: Optional[datetime] = None
     next_review: Optional[datetime] = None
+    introduced_at: Optional[datetime] = None  # When this card was first served as a "new" card today
     ease_factor: float = Field(default=2.5, ge=1.3, le=2.5)  # SM-2 default ease factor
     interval: int = Field(default=1)  # days until the next review
     repetitions: int = Field(default=0)  # number of times the card has been reviewed

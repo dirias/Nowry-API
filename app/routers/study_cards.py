@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.StudyCard import StudyCard
+from app.models.deck_config import resolve_deck_budget
 from app.config.database import cards_collection, decks_collection
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
@@ -25,24 +26,109 @@ def get_decks_collection() -> Collection:
     return decks_collection
 
 
-_PACE_DEFAULTS: dict[str, dict[str, int]] = {
-    "relaxed":   {"new_per_day": 10,  "max_reviews_per_day": 50},
-    "balanced":  {"new_per_day": 20,  "max_reviews_per_day": 100},
-    "intensive": {"new_per_day": 40,  "max_reviews_per_day": 200},
-}
+async def _select_session_cards(
+    collection: Collection,
+    user_id: str,
+    deck_or: list,
+    new_cap: int,
+    review_cap: int,
+    now_dt: datetime,
+    today_start: datetime,
+) -> tuple[list, list]:
+    """Pick the new + review cards for a study session, locking today's plan.
+
+    New-card selection is sticky for the day:
+      1. Cards already introduced today (`introduced_at >= today_start`) are the
+         day's pool. Cards in that pool that have not been graded yet
+         (`last_reviewed is None`) are still pending.
+      2. If the day's pool is smaller than `new_cap`, top it up with fresh
+         never-seen cards (`introduced_at` unset, `last_reviewed` None) and
+         stamp them with `introduced_at = now` so they persist across sessions.
+      3. The session returns all pending cards from the locked pool.
+
+    Review cards keep the simple "due now, capped by remaining daily budget"
+    behaviour — they are intrinsically deterministic by `next_review`.
+    """
+    base_match = {"user_id": user_id, "deleted_at": None, "$or": deck_or}
+
+    # 1. Calculate how many NEW cards were studied today to adjust the remaining budget
+    new_studied_today = await collection.count_documents({
+        **base_match,
+        "last_reviewed": {"$gte": today_start},
+        "repetitions": {"$lte": 1},
+    })
+    new_remaining = max(0, new_cap - new_studied_today)
+
+    # 2. Get the currently active "sticky pool" for today
+    # We fetch cards introduced today that HAVEN'T been reviewed yet.
+    # We fetch up to `new_remaining` to fill our budget.
+    todays_pending_pool = await collection.find({
+        **base_match,
+        "introduced_at": {"$gte": today_start},
+        "last_reviewed": None,
+    }).sort("introduced_at", 1).to_list(length=new_remaining)
+
+    # 3. If we still have slots to fill after checking the sticky pool, top it up
+    slots_to_fill = max(0, new_remaining - len(todays_pending_pool))
+    new_cards_raw = list(todays_pending_pool)
+    if slots_to_fill > 0:
+        # A card is eligible to be (re)introduced today if it has never been
+        # graded (last_reviewed is None). This covers both brand-new cards and
+        # cards that were stamped on a previous day but never actually studied.
+        fresh_query = {
+            "user_id": user_id,
+            "deleted_at": None,
+            "last_reviewed": None,
+            "$and": [
+                {"$or": deck_or},
+                {"$or": [
+                    {"introduced_at": None},
+                    {"introduced_at": {"$exists": False}},
+                    {"introduced_at": {"$lt": today_start}},
+                ]},
+            ],
+        }
+        fresh_cards = await collection.find(fresh_query).sort("created_at", 1).limit(slots_to_fill).to_list(length=slots_to_fill)
+        if fresh_cards:
+            fresh_ids = [c["_id"] for c in fresh_cards]
+            await collection.update_many(
+                {"_id": {"$in": fresh_ids}},
+                {"$set": {"introduced_at": now_dt}},
+            )
+            for c in fresh_cards:
+                c["introduced_at"] = now_dt
+            new_cards_raw.extend(fresh_cards)
+
+    # We already have new_cards_raw from steps above
+
+    # --- Review cards: due now, capped by remaining daily review budget ---
+    reviews_done_today = await collection.count_documents({
+        **base_match,
+        "last_reviewed": {"$gte": today_start},
+        "repetitions": {"$gt": 1},
+    })
+    review_remaining = max(0, review_cap - reviews_done_today)
+
+    review_cards_raw: list = []
+    if review_remaining > 0:
+        review_query = {
+            **base_match,
+            "last_reviewed": {"$ne": None},
+            "next_review": {"$lte": now_dt},
+        }
+        review_cards_raw = await collection.find(review_query).sort("next_review", 1).limit(review_remaining).to_list(length=review_remaining)
+
+    return new_cards_raw, review_cards_raw
 
 
 def _get_deck_budget(deck_doc: dict) -> tuple[int, int]:
-    """Return (new_per_day, max_reviews_per_day) from a deck document."""
-    cfg = deck_doc.get("config") or {}
-    mode = cfg.get("pace_mode", "balanced")
-    if mode not in _PACE_DEFAULTS:
-        mode = "balanced"
-    defaults = _PACE_DEFAULTS[mode]
-    return (
-        cfg.get("new_per_day") or defaults["new_per_day"],
-        cfg.get("max_reviews_per_day") or defaults["max_reviews_per_day"],
-    )
+    """Return (new_per_day, max_reviews_per_day) from a deck document.
+
+    Thin wrapper around the shared `resolve_deck_budget` so this router cannot
+    drift from the dashboard counts in routers/decks.py.
+    """
+    _, new_per_day, max_reviews = resolve_deck_budget(deck_doc)
+    return new_per_day, max_reviews
 
 
 @router.post("", summary="Create a new study card", response_model=StudyCard)
@@ -358,6 +444,62 @@ async def get_card_tags(
     return tags
 
 
+@router.get("/daily-review", summary="Get today's locked daily review session across all decks")
+async def get_daily_review_cards(
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> dict:
+    """Aggregate today's session across every active deck.
+
+    Each deck contributes its own locked new-card pool (capped at the deck's
+    `new_per_day`) and its own remaining review budget. The selection is sticky
+    for the day via `introduced_at` — the same cards reappear across sessions
+    until they are graded.
+    """
+    user_id = user.get("user_id")
+    now_dt = datetime.utcnow()
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    active_decks = await decks_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=500)
+
+    all_new: list = []
+    all_review: list = []
+
+    for deck in active_decks:
+        new_cap, review_cap = _get_deck_budget(deck)
+        deck_oid = deck["_id"]
+        deck_or = [{"deck_id": deck_oid}, {"deck_id": str(deck_oid)}]
+
+        new_raw, review_raw = await _select_session_cards(
+            collection=collection,
+            user_id=user_id,
+            deck_or=deck_or,
+            new_cap=new_cap,
+            review_cap=review_cap,
+            now_dt=now_dt,
+            today_start=today_start,
+        )
+        all_new.extend(new_raw)
+        all_review.extend(review_raw)
+
+    cards = all_new + all_review
+    for c in cards:
+        c["_id"] = str(c["_id"])
+        if c.get("deck_id"):
+            c["deck_id"] = str(c["deck_id"])
+        if c.get("user_id"):
+            c["user_id"] = str(c["user_id"])
+
+    return {
+        "cards": cards,
+        "total": len(cards),
+        "page": 1,
+        "has_more": False,
+    }
+
+
 @router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)
 async def get_study_card(
     id: str,
@@ -459,20 +601,25 @@ async def list_study_cards(
     # review cards (reviewed before, now past due) are capped at max_reviews_per_day.
     if deck_id is not None and due_only:
         deck_doc = await decks_collection.find_one(
-            {"_id": ObjectId(deck_id) if ObjectId.is_valid(deck_id) else None, "deleted_at": None}
+            {"_id": ObjectId(deck_id) if (deck_id and ObjectId.is_valid(deck_id)) else None, "deleted_at": None}
         )
         new_cap, review_cap = _get_deck_budget(deck_doc) if deck_doc else (20, 100)
         now_dt = datetime.utcnow()
+        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Base filter shared by both sub-queries
-        base: dict = {"user_id": user_id, "deleted_at": None,
-                      "$or": [{"deck_id": ObjectId(deck_id)}, {"deck_id": deck_id}]}
-
-        new_query = {**base, "last_reviewed": None}
-        review_query = {**base, "last_reviewed": {"$ne": None}, "next_review": {"$lte": now_dt}}
-
-        new_cards_raw = await collection.find(new_query).sort("created_at", 1).limit(new_cap).to_list(length=new_cap)
-        review_cards_raw = await collection.find(review_query).sort("next_review", 1).limit(review_cap).to_list(length=review_cap)
+        deck_obj_id = ObjectId(deck_id) if (deck_id and ObjectId.is_valid(deck_id)) else None
+        deck_or = [{"deck_id": deck_obj_id}]
+        if deck_id:
+            deck_or.append({"deck_id": deck_id})
+        new_cards_raw, review_cards_raw = await _select_session_cards(
+            collection=collection,
+            user_id=user_id,
+            deck_or=deck_or,
+            new_cap=new_cap,
+            review_cap=review_cap,
+            now_dt=now_dt,
+            today_start=today_start,
+        )
 
         cards = new_cards_raw + review_cards_raw
         for c in cards:
