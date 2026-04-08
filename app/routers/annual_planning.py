@@ -154,10 +154,12 @@ async def get_full_annual_plan(
 
     plan_id = str(plan["_id"])
 
-    # Level 2: focus areas + priorities in parallel
+    # Level 2: focus areas, priorities, and quarter reports in parallel
     areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id}).to_list(length=10)
     priorities_coro = priorities_collection.find({"annual_plan_id": plan_id}).to_list(length=50)
-    areas, priorities = await asyncio.gather(areas_coro, priorities_coro)
+    reports_coro = quarter_reports_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
+    
+    areas, priorities, reports = await asyncio.gather(areas_coro, priorities_coro, reports_coro)
 
     # Level 3: goals for every area — all in parallel
     goal_lists = await asyncio.gather(
@@ -195,12 +197,36 @@ async def get_full_annual_plan(
                 result[k] = v
         return result
 
+    # Calculate Overdue Quarter Logic purely on the backend
+    now = datetime.now()
+    current_q_year = now.year
+    current_q = (now.month - 1) // 3 + 1
+    
+    overdue_q = None
+    overdue_year = None
+    
+    plan_year = plan.get("year", current_q_year)
+    past_quarters = [q for q in [1, 2, 3, 4] if current_q_year > plan_year or (current_q_year == plan_year and current_q > q)]
+    
+    for pq in past_quarters:
+        has_report = any(r.get("quarter") == pq and r.get("year") == plan_year for r in reports)
+        has_goals = any(g.get("quarter") == pq and g.get("year") == plan_year for g in all_goals)
+        if not has_report and has_goals:
+            overdue_q = pq
+            overdue_year = plan_year
+            break
+            
+    plan_serialized = serialize(plan)
+    if overdue_q:
+        plan_serialized["overdue_quarter"] = {"quarter": overdue_q, "year": overdue_year}
+
     return {
-        "plan": serialize(plan),
+        "plan": plan_serialized,
         "focus_areas": [serialize(a) for a in areas],
         "priorities": [serialize(p) for p in priorities],
         "goals": [serialize(g) for g in all_goals],
         "activities": [serialize(act) for act in all_activities],
+        "quarter_reports": [serialize(r) for r in reports],
     }
 
 @router.post("", response_model=AnnualPlan, status_code=201)
