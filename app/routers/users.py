@@ -11,6 +11,7 @@ from typing import Optional, List
 import bcrypt
 import base64
 import secrets
+import asyncio
 from pydantic import BaseModel, EmailStr, validator
 
 from app.models.User import User
@@ -119,58 +120,47 @@ async def get_user_stats(user_id: str) -> dict:
         except Exception:
             user_oid = user_id  # Fallback if not a valid ObjectId
 
-        # Get total cards (Cards use ObjectId)
-        total_cards = await study_cards_collection.count_documents(
-            {"user_id": user_oid}
+        # Parallelize independent count queries
+        (
+            total_cards,
+            flashcards_count,
+            reviewed_cards,
+            books_created,
+            quiz_questions,
+            visual_diagrams
+        ) = await asyncio.gather(
+            study_cards_collection.count_documents({"user_id": user_oid}),
+            study_cards_collection.count_documents({"user_id": user_oid, "card_type": {"$in": [None, "flashcard"]}}),
+            study_cards_collection.count_documents({"user_id": user_oid, "last_reviewed": {"$exists": True}}),
+            books_collection.count_documents({"user_id": user_id}),
+            study_cards_collection.count_documents({"user_id": user_oid, "card_type": "quiz"}),
+            study_cards_collection.count_documents({"user_id": user_oid, "card_type": "visual"})
         )
 
-        # Get flashcards only (for subscription limits)
-        flashcards_count = await study_cards_collection.count_documents(
-            {"user_id": user_oid, "card_type": {"$in": [None, "flashcard"]}}
+        # Calculate study streak efficiently (fetch last 365 days of reviews at once)
+        one_year_ago = datetime.utcnow() - timedelta(days=365)
+        reviewed_cards_cursor = study_cards_collection.find(
+            {
+                "user_id": user_oid,
+                "last_reviewed": {"$gt": one_year_ago}
+            },
+            {"last_reviewed": 1}
         )
-
-        # Get reviewed cards (Cards use ObjectId)
-        reviewed_cards = await study_cards_collection.count_documents(
-            {"user_id": user_oid, "last_reviewed": {"$exists": True}}
-        )
-
-        # Get books created (Books use String)
-        books_created = await books_collection.count_documents({"user_id": user_id})
-
-        # Calculate study streak (uses cards, so ObjectId)
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Collect unique dates locally
+        reviewed_dates = set()
+        async for card in reviewed_cards_cursor:
+            if "last_reviewed" in card and card["last_reviewed"]:
+                reviewed_dates.add(card["last_reviewed"].date())
+                
+        # Calculate streak
+        today = datetime.utcnow().date()
         streak = 0
         check_date = today
-
-        while True:
-            day_start = check_date
-            day_end = check_date + timedelta(days=1)
-
-            reviewed_today = (
-                await study_cards_collection.count_documents(
-                    {
-                        "user_id": user_oid,
-                        "last_reviewed": {"$gte": day_start, "$lt": day_end},
-                    }
-                )
-                > 0
-            )
-
-            if reviewed_today:
-                streak += 1
-                check_date -= timedelta(days=1)
-            else:
-                break
-
-        # Get quiz questions
-        quiz_questions = await study_cards_collection.count_documents(
-            {"user_id": user_oid, "card_type": "quiz"}
-        )
-
-        # Get visual diagrams
-        visual_diagrams = await study_cards_collection.count_documents(
-            {"user_id": user_oid, "card_type": "visual"}
-        )
+        
+        while check_date in reviewed_dates:
+            streak += 1
+            check_date -= timedelta(days=1)
 
         return {
             "total_cards": total_cards,

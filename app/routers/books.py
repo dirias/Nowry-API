@@ -3,7 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
-from app.models.Book import Book
+from app.models.Book import Book, BookSummary
 from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
 
@@ -189,17 +189,20 @@ async def delete_book(
     raise HTTPException(status_code=404, detail="Book not found")
 
 
-@router.get("/search", summary="Search books by title", response_model=List[Book])
+@router.get("/search", summary="Search books by title", response_model=List[BookSummary])
 async def search_books(
     title: str, books_collection: Collection = Depends(get_books_collection)
 ):
-    # Search books by title (case-insensitive)
-    cursor = books_collection.find({"title": {"$regex": title, "$options": "i"}})
+    # Search books by title (case-insensitive), excluding full_content for performance
+    cursor = books_collection.find(
+        {"title": {"$regex": title, "$options": "i"}},
+        {"full_content": 0}
+    )
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
     return books
 
 
-@router.get("/all", summary="Get all books", response_model=List[Book])
+@router.get("/all", summary="Get all books", response_model=List[BookSummary])
 async def get_all_books(
     books_collection: Collection = Depends(get_books_collection),
     current_user: dict = Depends(get_firebase_user),
@@ -211,11 +214,14 @@ async def get_all_books(
     print(f"[DEBUG GET_ALL] Total books for user {user_id}: {total_count}")
     
     # Retrieve all books for the current user that are NOT soft-deleted
-    # Use deleted_at: None instead of $exists: False (matches SoftDeleteMixin pattern)
-    cursor = books_collection.find({
-        "user_id": user_id,
-        "deleted_at": None  # Only books where deleted_at is None
-    })
+    # Exclude full_content significantly improves performance for large documents
+    cursor = books_collection.find(
+        {
+            "user_id": user_id,
+            "deleted_at": None  # Only books where deleted_at is None
+        },
+        {"full_content": 0}
+    )
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
     
     print(f"[DEBUG GET_ALL] Non-deleted books: {len(books)}")

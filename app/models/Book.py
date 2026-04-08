@@ -35,3 +35,10 @@ class Book(BaseModel, SoftDeleteMixin):
         populate_by_name = True
         json_encoders = {ObjectId: str}
         arbitrary_types_allowed = True
+
+class BookSummary(Book):
+    """
+    A lightweight version of the Book model used for lists and previews.
+    It deliberately excludes the heavy `full_content` payload.
+    """
+    full_content: Optional[str] = Field(default=None, exclude=True)
