@@ -12,7 +12,7 @@ import bcrypt
 import base64
 import secrets
 import asyncio
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, ConfigDict, EmailStr, validator
 
 from app.models.User import User
 from app.config.database import (
@@ -30,17 +30,31 @@ router = APIRouter(
 )
 
 
-@router.get("/me")
+class UserMeResponse(BaseModel):
+    id: str
+    firebase_uid: str
+    username: str
+    email: str
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    role: str
+    subscription: dict
+    preferences: dict
+    created_at: Optional[datetime] = None
+    wizard_completed: bool
+
+
+@router.get("/me", response_model=UserMeResponse)
 async def get_current_user_profile(
     current_user: dict = Depends(get_firebase_user),
-):
+) -> UserMeResponse:
     """Get current user profile"""
     # With Firebase auth, we get firebase_uid from the token
     firebase_uid = current_user.get("firebase_uid")
-    
+
     if not firebase_uid:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
-    
+
     # Find user by firebase_uid
     user = await users_collection.find_one({"firebase_uid": firebase_uid})
 
@@ -48,23 +62,54 @@ async def get_current_user_profile(
         raise HTTPException(status_code=404, detail="User not found")
 
     # Return safe user data
-    return {
-        "id": str(user["_id"]),
-        "firebase_uid": user.get("firebase_uid"),
-        "username": user.get("username"),
-        "email": user.get("email"),
-        "role": user.get("role", "user"),
-        "subscription": user.get("subscription", {}),
-        "preferences": user.get("preferences", {}),
-        "created_at": user.get("created_at"),
-        "wizard_completed": user.get("wizard_completed", False),
-    }
+    return UserMeResponse(
+        id=str(user["_id"]),
+        firebase_uid=user.get("firebase_uid"),
+        username=user.get("username"),
+        email=user.get("email"),
+        full_name=user.get("full_name"),
+        avatar_url=user.get("avatar_url"),
+        role=user.get("role", "user"),
+        subscription=user.get("subscription", {}),
+        preferences=user.get("preferences", {}),
+        created_at=user.get("created_at"),
+        wizard_completed=user.get("wizard_completed", False),
+    )
 
 
 # Pydantic Models
 class ProfileUpdate(BaseModel):
     full_name: Optional[str] = None
     bio: Optional[str] = None
+
+
+class ProfileResponse(BaseModel):
+    id: str
+    username: str
+    email: str
+    full_name: Optional[str] = None
+    bio: Optional[str] = None
+    avatar_url: Optional[str] = None
+    created_at: datetime
+    subscription: dict
+    stats: dict
+    notification_preferences: dict
+    preferences: dict
+    two_factor_enabled: bool = False
+
+
+class ProfilePatchRequest(BaseModel):
+    full_name: Optional[str] = None
+    bio: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProfilePatchResponse(BaseModel):
+    message: str
+    full_name: Optional[str] = None
+    bio: Optional[str] = None
+    updated_at: datetime
 
 
 class PasswordChange(BaseModel):
@@ -188,8 +233,8 @@ async def get_user_stats(user_id: str) -> dict:
 
 
 # Routes
-@router.get("/profile")
-async def get_profile(current_user: dict = Depends(get_firebase_user)):
+@router.get("/profile", response_model=ProfileResponse)
+async def get_profile(current_user: dict = Depends(get_firebase_user)) -> ProfileResponse:
     """Get current user's profile"""
     user_id = current_user.get("user_id")
 
@@ -250,19 +295,20 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)):
         },
     )
 
-    return {
-        "id": str(user["_id"]),
-        "username": user.get("username", ""),
-        "email": user.get("email", ""),
-        "full_name": user.get("full_name"),
-        "bio": user.get("bio"),
-        "avatar_url": user.get("avatar_url"),
-        "created_at": user.get("created_at", datetime.utcnow()),
-        "subscription": subscription,
-        "stats": stats,
-        "notification_preferences": notification_preferences,
-        "preferences": preferences,
-    }
+    return ProfileResponse(
+        id=str(user["_id"]),
+        username=user.get("username", ""),
+        email=user.get("email", ""),
+        full_name=user.get("full_name"),
+        bio=user.get("bio"),
+        avatar_url=user.get("avatar_url"),
+        created_at=user.get("created_at", datetime.utcnow()),
+        subscription=subscription,
+        stats=stats,
+        notification_preferences=notification_preferences,
+        preferences=preferences,
+        two_factor_enabled=user.get("two_factor_enabled", False),
+    )
 
 
 @router.put("/profile")
@@ -288,6 +334,44 @@ async def update_profile(
 
     # Even if modified_count is 0 (same data), we return success
     return {"message": "Profile updated successfully"}
+
+
+@router.patch("/profile", response_model=ProfilePatchResponse)
+async def patch_user_profile(
+    body: ProfilePatchRequest,
+    current_user: dict = Depends(get_firebase_user),
+) -> ProfilePatchResponse:
+    """Partially update user profile (display name, bio)"""
+    if body.full_name is None and body.bio is None:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one field (full_name, bio) must be provided.",
+        )
+
+    user_id = current_user.get("user_id")
+
+    update_dict: dict = {}
+    if body.full_name is not None:
+        update_dict["full_name"] = body.full_name
+    if body.bio is not None:
+        update_dict["bio"] = body.bio
+
+    updated_at = datetime.utcnow()
+    update_dict["updated_at"] = updated_at
+
+    result = await users_collection.update_one(
+        {"_id": ObjectId(user_id)}, {"$set": update_dict}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return ProfilePatchResponse(
+        message="Profile updated successfully",
+        full_name=body.full_name,
+        bio=body.bio,
+        updated_at=updated_at,
+    )
 
 
 @router.post("/avatar")
@@ -333,6 +417,13 @@ async def change_password(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Guard: Firebase-authenticated users have no local password
+    if not user.get("password"):
+        raise HTTPException(
+            status_code=400,
+            detail="Password is managed by your authentication provider. Use the client-side flow to update it.",
+        )
+
     # Verify current password
     stored_password = user.get("password")
     if not bcrypt.checkpw(
@@ -373,6 +464,12 @@ async def update_notification_preferences(
         update_data["notification_preferences.news_updates"] = preferences.news_updates
     if preferences.marketing is not None:
         update_data["notification_preferences.marketing"] = preferences.marketing
+
+    if not update_data:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one notification preference must be provided.",
+        )
 
     update_data["updated_at"] = datetime.utcnow()
 

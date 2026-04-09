@@ -16,26 +16,35 @@ class PublicMetadata(BaseModel):
     likes: int = 0
     forks: int = 0  # Number of times content was cloned/forked
     downloads: int = 0
-    
+
     # Discovery & Categorization
     category: Optional[str] = None  # "Science", "Math", "Languages", etc.
     tags: List[str] = Field(default_factory=list)
     language: str = "en"  # Content language (en, es, fr, de, ja)
     difficulty_level: Optional[Literal["beginner", "intermediate", "advanced"]] = None
-    
+
     # Quality Indicators
     average_rating: float = 0.0  # 0-5 stars
     rating_count: int = 0
-    
+
     # Legal & Attribution
     license_type: str = "all_rights_reserved"  # CC-BY, CC-BY-SA, CC0, all_rights_reserved
     is_original_content: bool = True
     original_source: Optional[str] = None  # If adapted from elsewhere
     attribution: Optional[str] = None
-    
+
+    # Fork Attribution (immutable)
+    forked_from: Optional[dict] = Field(
+        default=None,
+        description="Attribution to the original forked content. Contains original_id, original_title, original_author."
+    )
+
+    # Description
+    description: Optional[str] = Field(default=None, max_length=280)
+
     # Access Control
     restricted_to: Optional[Literal["dev", "beta", "premium"]] = None  # Restrict visibility to specific user groups
-    
+
     class Config:
         from_attributes = True
 

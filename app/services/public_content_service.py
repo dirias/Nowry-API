@@ -3,7 +3,7 @@ Service layer for public content operations.
 Handles publishing, forking, tracking, and discovery of public Books and Decks.
 """
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
 from fastapi import HTTPException
 
@@ -20,15 +20,20 @@ class PublicContentService:
         """Convert ObjectId fields to strings for JSON serialization"""
         if not doc:
             return None
-        
+
         doc["_id"] = str(doc["_id"])
         if doc.get("user_id") and isinstance(doc["user_id"], ObjectId):
             doc["user_id"] = str(doc["user_id"])
-            
+
+        # Serialize any list fields that may contain ObjectId references (e.g. Deck.cards)
+        for key, value in doc.items():
+            if isinstance(value, list):
+                doc[key] = [str(item) if isinstance(item, ObjectId) else item for item in value]
+
         # Handle author/author_name consistency
         if "author" in doc and "author_name" not in doc:
             doc["author_name"] = doc["author"]
-            
+
         return doc
     
     # ========== Publishing ==========
@@ -70,19 +75,26 @@ class PublicContentService:
         # Create public metadata
         metadata = PublicMetadata(**public_metadata)
         
+        # Build public_metadata dict; inject fork attribution if the document
+        # carries a forked_from field — this ensures attribution is always
+        # present in the published record even if the user never set it manually.
+        metadata_dict: dict = metadata.dict()
+        if content.get("forked_from"):
+            metadata_dict["forked_from"] = content["forked_from"]
+
         # Update content
-        result = await collection.update_one(
+        await collection.update_one(
             {"_id": ObjectId(content_id)},
             {
                 "$set": {
                     "is_public": True,
                     "published_at": datetime.utcnow(),
-                    "public_metadata": metadata.dict(),
+                    "public_metadata": metadata_dict,
                     "updated_at": datetime.utcnow()
                 }
             }
         )
-        
+
         # Return updated content
         updated_content = await collection.find_one({"_id": ObjectId(content_id)})
         return self._serialize_doc(updated_content)
@@ -276,17 +288,33 @@ class PublicContentService:
         if not content:
             raise HTTPException(status_code=404, detail="Public content not found")
         
-        # Track view
+        # Track view — deduplicated within a 60-second window to prevent
+        # double-counting from React StrictMode double-mounts in development
+        # and from accidental rapid refreshes in production.
         if track_view:
-            await self.track_view(content_type, content_id, viewer_user_id)
-            
-            # Increment view count
-            await collection.update_one(
-                {"_id": ObjectId(content_id)},
-                {"$inc": {"public_metadata.views": 1}}
+            already_tracked = await self._recent_view_exists(
+                content_type, content_id, viewer_user_id
             )
-        
-        return self._serialize_doc(content)
+            if not already_tracked:
+                await self.track_view(content_type, content_id, viewer_user_id)
+                await collection.update_one(
+                    {"_id": ObjectId(content_id)},
+                    {"$inc": {"public_metadata.views": 1}}
+                )
+
+        # Populate user_liked for the viewer
+        user_liked: bool = False
+        if viewer_user_id:
+            existing_like = await self.db["content_likes"].find_one({
+                "content_type": content_type,
+                "content_id": content_id,
+                "user_id": viewer_user_id
+            })
+            user_liked = existing_like is not None
+
+        serialized = self._serialize_doc(content)
+        serialized["user_liked"] = user_liked
+        return serialized
     
     # ========== Engagement ==========
     
@@ -350,6 +378,34 @@ class PublicContentService:
         
         return {"message": "Like removed successfully"}
     
+    async def _recent_view_exists(
+        self,
+        content_type: str,
+        content_id: str,
+        viewer_user_id: Optional[str] = None,
+        window_seconds: int = 60
+    ) -> bool:
+        """
+        Return True if a view record already exists for this content + viewer
+        within the last `window_seconds` seconds.
+
+        For anonymous viewers (no user_id) this always returns False — we cannot
+        deduplicate without a stable identifier, so anonymous rapid-refreshes are
+        accepted as a known limitation.
+        """
+        if not viewer_user_id:
+            return False
+
+        cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
+
+        existing = await self.db["content_views"].find_one({
+            "content_type": content_type,
+            "content_id": content_id,
+            "viewer_user_id": viewer_user_id,
+            "viewed_at": {"$gte": cutoff}
+        })
+        return existing is not None
+
     async def track_view(
         self,
         content_type: str,
@@ -392,7 +448,29 @@ class PublicContentService:
         
         if not original:
             raise HTTPException(status_code=404, detail="Public content not found")
-        
+
+        # FIX 1 — Prevent self-fork
+        if str(original.get("user_id")) == str(forking_user_id):
+            raise HTTPException(
+                status_code=400,
+                detail="cannot_fork_own_content"
+            )
+
+        # FIX 2 — Prevent duplicate fork
+        existing_fork = await self.db["content_forks"].find_one({
+            "original_content_id": str(original_content_id),
+            "forked_by_user_id": str(forking_user_id)
+        })
+
+        if existing_fork:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "already_forked",
+                    "forked_content_id": str(existing_fork["forked_content_id"])
+                }
+            )
+
         # Create a copy
         forked_content = dict(original)
         forked_content.pop("_id")  # Remove original ID
@@ -406,13 +484,42 @@ class PublicContentService:
         # Add attribution
         title_field = "title" if content_type == "book" else "name"
         forked_content[title_field] = f"{forked_content[title_field]} (Forked)"
-        
-        # For decks, we need to also copy cards
-        if content_type == "deck" and "cards" in original:
-            # TODO: Implement card cloning
-            forked_content["cards"] = []  # Empty for now, implement card copying later
+
+        # Look up the original author's display name from the users collection
+        author_name: Optional[str] = None
+        original_user_id = original.get("user_id")
+        if original_user_id:
+            try:
+                user_oid = (
+                    ObjectId(str(original_user_id))
+                    if not isinstance(original_user_id, ObjectId)
+                    else original_user_id
+                )
+                user_doc = await self.db["users"].find_one({"_id": user_oid})
+            except Exception:
+                user_doc = None
+            if user_doc:
+                author_name = (
+                    user_doc.get("full_name")
+                    or user_doc.get("display_name")
+                    or user_doc.get("username")
+                    or user_doc.get("displayName")
+                    or (user_doc.get("email", "").split("@")[0] or None)
+                )
+
+        # Record immutable fork attribution before insert
+        forked_content["forked_from"] = {
+            "id": str(original["_id"]),
+            "title": original.get("title") or original.get("name"),
+            "author_name": author_name,
+            "author_id": str(original_user_id) if original_user_id else None,
+        }
+
+        # For decks, reset card refs — they will be repopulated after insert
+        if content_type == "deck":
+            forked_content["cards"] = []
             forked_content["total_cards"] = 0
-        
+
         # Insert forked content
         result = await collection.insert_one(forked_content)
         
@@ -432,7 +539,44 @@ class PublicContentService:
             {"_id": ObjectId(original_content_id)},
             {"$inc": {"public_metadata.forks": 1}}
         )
-        
+
+        # Copy cards for deck forks
+        if content_type == "deck":
+            forked_deck_id = str(result.inserted_id)
+            original_cards = await self.db["cards"].find(
+                {"deck_id": {"$in": [ObjectId(original_content_id), original_content_id]}}
+            ).to_list(length=500)
+
+            if original_cards:
+                now = datetime.utcnow()
+                new_cards: List[dict] = []
+                for card in original_cards:
+                    new_card = dict(card)
+                    new_card.pop("_id")
+                    new_card["deck_id"] = forked_deck_id
+                    new_card["user_id"] = forking_user_id
+                    new_card["created_at"] = now
+                    new_card["updated_at"] = now
+                    # Reset SRS state for the new owner
+                    new_card["next_review"] = None
+                    new_card["last_reviewed"] = None
+                    new_card["introduced_at"] = None
+                    new_card["interval"] = 1
+                    new_card["ease_factor"] = 2.5
+                    new_card["repetitions"] = 0
+                    new_cards.append(new_card)
+
+                insert_result = await self.db["cards"].insert_many(new_cards)
+                new_card_ids = [str(oid) for oid in insert_result.inserted_ids]
+
+                await collection.update_one(
+                    {"_id": result.inserted_id},
+                    {"$set": {
+                        "total_cards": len(new_cards),
+                        "cards": new_card_ids
+                    }}
+                )
+
         # Return the forked content
         forked = await collection.find_one({"_id": result.inserted_id})
         return self._serialize_doc(forked)

@@ -109,8 +109,9 @@ async def edit_book(
     # Update the book data using partial update (exclude_unset=True)
     update_data = book_data.dict(exclude_unset=True)
     
-    # Remove immutable/system fields that shouldn't be updated by user
-    fields_to_remove = ["id", "_id", "user_id", "created_at"]
+    # Remove immutable/system fields that shouldn't be updated by user.
+    # forked_from is permanently set at fork time and must never be overwritten.
+    fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from"]
     for field in fields_to_remove:
         update_data.pop(field, None)
     

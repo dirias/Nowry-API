@@ -1,4 +1,4 @@
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Any, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 from .types import PyObjectId
@@ -56,6 +56,12 @@ class Deck(BaseModel, SoftDeleteMixin):
     is_public: bool = False
     published_at: Optional[datetime] = None
     public_metadata: Optional[PublicMetadata] = None
+
+    # Fork Attribution (immutable — set when forked and preserved on publish)
+    forked_from: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Attribution to the original forked deck. Contains original_id, original_title, original_author_id."
+    )
 
     class Config:
         from_attributes = True

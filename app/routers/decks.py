@@ -311,8 +311,9 @@ async def update_deck(
 
     updates["updated_at"] = datetime.utcnow()
 
-    # Do not allow updating internal fields
-    for field in ["_id", "id", "user_id", "created_at"]:
+    # Do not allow updating internal or immutable fields.
+    # forked_from is permanently set at fork time and must never be overwritten.
+    for field in ["_id", "id", "user_id", "created_at", "forked_from"]:
         updates.pop(field, None)
 
     try:
@@ -605,7 +606,17 @@ async def update_deck_settings(
             set_doc["published_at"] = datetime.utcnow()
 
     if body.public_metadata is not None:
-        set_doc["public_metadata"] = body.public_metadata.model_dump(exclude_none=True)
+        # Build the incoming payload, stripping any forked_from key the caller
+        # may have included — that field is immutable and set only at fork time.
+        incoming_meta: dict = body.public_metadata.model_dump(exclude_none=True)
+        incoming_meta.pop("forked_from", None)
+
+        # Merge on top of whatever is already stored so that forked_from (and any
+        # other keys not in PublicMetadataInput) are preserved.
+        existing_meta: dict = deck.get("public_metadata") or {}
+        merged_meta: dict = {**existing_meta, **incoming_meta}
+
+        set_doc["public_metadata"] = merged_meta
 
     updated = await collection.find_one_and_update(
         {"_id": obj_id},

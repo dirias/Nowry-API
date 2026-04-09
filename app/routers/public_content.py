@@ -4,11 +4,13 @@ Handles browse, publish, fork, and engagement for public Books and Decks
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import Optional, List, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from bson import ObjectId
 
 from app.config.database import db
 from app.services.public_content_service import PublicContentService
 from app.auth.firebase_auth import get_current_user, optional_auth
+from app.config.database import cards_collection, decks_collection
 
 router = APIRouter(prefix="/public", tags=["Public Content"])
 
@@ -28,6 +30,7 @@ class PublishRequest(BaseModel):
     is_original_content: bool = True
     original_source: Optional[str] = None
     attribution: Optional[str] = None
+    description: Optional[str] = Field(default=None, max_length=280)
 
 
 class BrowseFilters(BaseModel):
@@ -37,6 +40,21 @@ class BrowseFilters(BaseModel):
     difficulty: Optional[Literal["beginner", "intermediate", "advanced"]] = None
     search: Optional[str] = None
     sort_by: Literal["recent", "popular", "top_rated"] = "recent"
+
+
+class PublicCardPreview(BaseModel):
+    id: str = Field(alias="_id")
+    title: Optional[str] = None
+    content: Optional[str] = None
+    card_type: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PublicDeckCardsResponse(BaseModel):
+    cards: List[PublicCardPreview]
+    total: int
 
 
 # ========== Browse & Discovery (No Auth Required) ==========
@@ -229,8 +247,62 @@ async def get_public_deck(
         viewer_is_beta=viewer_is_beta,
         track_view=True
     )
-    
+
     return deck
+
+
+@router.get(
+    "/decks/{deck_id}/cards",
+    response_model=PublicDeckCardsResponse,
+    summary="Get a preview of cards from a public deck",
+)
+async def get_public_deck_cards(
+    deck_id: str,
+    limit: int = Query(default=6, ge=1, le=10),
+    current_user: Optional[dict] = Depends(optional_auth),
+) -> PublicDeckCardsResponse:
+    """
+    Return a limited card preview for a public deck.
+    No authentication required.
+    Only decks with is_public=True are accessible.
+    SRS fields (interval, ease_factor, next_review, etc.) are never exposed.
+    """
+    # Resolve deck ObjectId
+    try:
+        deck_oid = ObjectId(deck_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Deck not found")
+
+    deck = await decks_collection.find_one({
+        "_id": deck_oid,
+        "is_public": True,
+        "deleted_at": None,
+    })
+
+    if not deck:
+        raise HTTPException(status_code=404, detail="Deck not found or not public")
+
+    # Fetch cards — tolerate ObjectId or string deck_id (mixed legacy data)
+    raw_cards = await cards_collection.find(
+        {
+            "deck_id": {"$in": [deck_oid, deck_id]},
+            "deleted_at": None,
+        }
+    ).to_list(length=limit)
+
+    previews: List[PublicCardPreview] = []
+    for card in raw_cards:
+        previews.append(
+            PublicCardPreview(
+                _id=str(card["_id"]),
+                title=card.get("title"),
+                content=card.get("content"),
+                card_type=card.get("card_type"),
+                tags=card.get("tags") or [],
+            )
+        )
+
+    return PublicDeckCardsResponse(cards=previews, total=len(previews))
 
 
 # ========== Publishing (Auth Required) ==========
