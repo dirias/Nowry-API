@@ -22,6 +22,47 @@ from app.models.Activity import Activity
 from app.models.DailyRoutine import DailyRoutineTemplate
 from app.models.QuarterReport import QuarterReport
 
+async def verify_annual_plan_ownership(plan_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(plan_id)
+    except InvalidId:
+        obj_id = plan_id
+    plan = await annual_plans_collection.find_one({"_id": obj_id})
+    if not plan or str(plan.get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to access this plan data")
+
+async def verify_focus_area_ownership(fa_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(fa_id)
+    except InvalidId:
+        obj_id = fa_id
+    fa = await focus_areas_collection.find_one({"_id": obj_id})
+    if not fa: raise HTTPException(status_code=404, detail="Focus area not found")
+    await verify_annual_plan_ownership(fa["annual_plan_id"], user_id)
+
+async def verify_goal_ownership(goal_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(goal_id)
+    except InvalidId:
+        obj_id = goal_id
+    goal = await goals_collection.find_one({"_id": obj_id})
+    if not goal: raise HTTPException(status_code=404, detail="Goal not found")
+    await verify_focus_area_ownership(goal["focus_area_id"], user_id)
+
+async def verify_priority_ownership(priority_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(priority_id)
+    except InvalidId:
+        obj_id = priority_id
+    p = await priorities_collection.find_one({"_id": obj_id})
+    if not p: raise HTTPException(status_code=404, detail="Priority not found")
+    await verify_annual_plan_ownership(p["annual_plan_id"], user_id)
+
+
 router = APIRouter(
     prefix="/annual-plan",
     tags=["annual-planning"],
@@ -518,6 +559,8 @@ async def get_focus_areas(
     annual_plan_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(annual_plan_id, user_id)
     areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=10)
     return areas
 
@@ -526,6 +569,9 @@ async def create_focus_area(
     focus_area: FocusArea,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(focus_area.annual_plan_id, user_id)
+    
     # Check limit (max 3)
     count = await focus_areas_collection.count_documents({"annual_plan_id": focus_area.annual_plan_id})
     if count >= 3:
@@ -541,6 +587,9 @@ async def update_focus_area(
     focus_area: FocusArea,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_focus_area_ownership(id, user_id)
+    
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -628,6 +677,8 @@ async def get_priorities(
     annual_plan_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(annual_plan_id, user_id)
     priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=50)
     return priorities
 
@@ -636,6 +687,8 @@ async def create_priority(
     priority: Priority,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(priority.annual_plan_id, user_id)
     result = await priorities_collection.insert_one(priority.dict(by_alias=True))
     return await priorities_collection.find_one({"_id": result.inserted_id})
 
@@ -645,6 +698,8 @@ async def update_priority(
     priority_update: dict,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_priority_ownership(id, user_id)
     try:
         obj_id = ObjectId(id)
     except Exception as e:
@@ -725,15 +780,13 @@ async def get_goals(
     focus_area_id: Optional[str] = None,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
     query = {}
     if focus_area_id:
+        await verify_focus_area_ownership(focus_area_id, user_id)
         query["focus_area_id"] = focus_area_id
     
-    # We might want to filter by user ownership via join or just trust focus_area_id logic if we validated it.
-    # Strictly speaking we should validate focus_area belongs to a plan owned by user. 
-    # Skipping detailed ownership validation for brevity but keeping it secure by design implies focus_area IDs are hard to guess? 
-    # No, we should rely on user_id. But Goal doesn't have user_id directly. 
-    # For MVP we filter by focus_area_id.
+    # We filter by focus_area_id which is strictly ownership validated
     
     goals = await goals_collection.find(query).to_list(length=100)
     return goals
@@ -743,6 +796,8 @@ async def create_goal(
     goal: Goal,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_focus_area_ownership(goal.focus_area_id, user_id)
     result = await goals_collection.insert_one(goal.dict(by_alias=True))
     return await goals_collection.find_one({"_id": result.inserted_id})
 
@@ -752,6 +807,8 @@ async def update_goal(
     goal_update: dict,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(id, user_id)
     # Try validating/converting to ObjectId
     try:
         obj_id = ObjectId(id)

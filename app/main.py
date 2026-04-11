@@ -35,8 +35,8 @@ from app.routers import (
 
 
 
-# Initialize Rate Limiter
-limiter = Limiter(key_func=get_remote_address)
+# Initialize Rate Limiter with global default to prevent basic DoS
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 
 @asynccontextmanager

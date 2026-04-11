@@ -8,9 +8,12 @@ from app.config.database import db
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
 
+from app.auth.dependencies import require_ownership
+
 router = APIRouter(
     prefix="/tasks",
     tags=["tasks"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -75,19 +78,9 @@ async def list_tasks(
 @router.get("/{id}", summary="Get a task by ID", response_model=Task)
 async def get_task(
     id: str,
-    collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_firebase_user),
+    task: dict = Depends(require_ownership(get_tasks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} fetching task with ID: {id}")
-
-    task = await collection.find_one({"_id": ObjectId(id)})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Authorization check
-    if str(task.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Not authorized to view this task")
+    logger.info(f"Fetching task with ID: {id}")
 
     task["_id"] = str(task["_id"])
     if task.get("user_id"):
@@ -101,24 +94,15 @@ async def update_task(
     id: str,
     updates: dict,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_firebase_user),
+    task: dict = Depends(require_ownership(get_tasks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} updating task {id}")
+    logger.info(f"Updating task {id}")
 
-    # Fetch the task
-    task = await collection.find_one({"_id": ObjectId(id)})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Authorization check
-    if str(task.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this task"
-        )
-
-    # Add updated timestamp
     updates["updated_at"] = datetime.utcnow()
+
+    # Prevent Mass Assignment of internal fields
+    for field in ["_id", "id", "user_id", "created_at"]:
+        updates.pop(field, None)
 
     # Update the task
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
@@ -136,21 +120,9 @@ async def update_task(
 async def delete_task(
     id: str,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_firebase_user),
+    task: dict = Depends(require_ownership(get_tasks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} deleting task {id}")
-
-    # Fetch the task
-    task = await collection.find_one({"_id": ObjectId(id)})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Authorization check
-    if str(task.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to delete this task"
-        )
+    logger.info(f"Deleting task {id}")
 
     await collection.delete_one({"_id": ObjectId(id)})
     return {"message": "Task deleted successfully"}

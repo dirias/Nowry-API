@@ -6,10 +6,12 @@ from bson import ObjectId
 from app.models.Book import Book, BookSummary
 from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
+from app.auth.dependencies import require_ownership
 
 router = APIRouter(
     prefix="/book",
     tags=["books"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -93,19 +95,8 @@ async def edit_book(
     book_id: str,
     book_data: Book,
     books_collection: Collection = Depends(get_books_collection),
+    existing_book: dict = Depends(require_ownership(get_books_collection, "book_id")),
 ):
-    # Check if the book exists (Try both ObjectId and String ID)
-    query = {"_id": ObjectId(book_id)}
-    existing_book = await books_collection.find_one(query)
-    
-    if existing_book is None:
-        # Fallback to string ID
-        query = {"_id": book_id}
-        existing_book = await books_collection.find_one(query)
-        
-    if existing_book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-
     # Update the book data using partial update (exclude_unset=True)
     update_data = book_data.dict(exclude_unset=True)
     
@@ -122,7 +113,7 @@ async def edit_book(
     update_data["updated_at"] = datetime.now()
 
     res = await books_collection.update_one(
-        query, # Use the query that successfully found the book
+        {"_id": ObjectId(existing_book["_id"]) if len(existing_book["_id"]) == 24 else existing_book["_id"]},
         {"$set": update_data},
     )
 
@@ -130,8 +121,7 @@ async def edit_book(
         raise HTTPException(status_code=404, detail="Book not found")
 
     # Fetch and return the updated book
-    # Fetch and return the updated book
-    updated_book = await books_collection.find_one(query)
+    updated_book = await books_collection.find_one({"_id": ObjectId(existing_book["_id"]) if len(existing_book["_id"]) == 24 else existing_book["_id"]})
     if updated_book:
         updated_book["_id"] = str(updated_book["_id"])
         return updated_book
@@ -143,7 +133,7 @@ async def edit_book(
 async def delete_book(
     book_id: str,
     books_collection: Collection = Depends(get_books_collection),
-    current_user: dict = Depends(get_firebase_user),
+    book: dict = Depends(require_ownership(get_books_collection, "book_id")),
 ):
     """
     Soft delete a book (sets deleted_at timestamp).
@@ -151,28 +141,14 @@ async def delete_book(
     """
     from datetime import datetime
     
-    user_id = current_user.get("user_id")
-    
-    # Try ObjectId first
     try:
-        obj_id = ObjectId(book_id)
-        
-        # Check ownership and existence
-        book = await books_collection.find_one({
-            "_id": obj_id,
-            "user_id": user_id
-        })
-        
-        if not book:
-            raise HTTPException(status_code=404, detail="Book not found or not authorized")
-        
         # Soft delete + auto-unpublish
         result = await books_collection.update_one(
-            {"_id": obj_id},
+            {"_id": ObjectId(book["_id"]) if len(book["_id"]) == 24 else book["_id"]},
             {
                 "$set": {
                     "deleted_at": datetime.utcnow(),
-                    "deleted_by": user_id,
+                    "deleted_by": book.get("user_id"),
                     "is_public": False,  # Auto-unpublish
                     "updated_at": datetime.utcnow()
                 }
@@ -192,11 +168,17 @@ async def delete_book(
 
 @router.get("/search", summary="Search books by title", response_model=List[BookSummary])
 async def search_books(
-    title: str, books_collection: Collection = Depends(get_books_collection)
+    title: str,
+    books_collection: Collection = Depends(get_books_collection),
+    current_user: dict = Depends(get_firebase_user),
 ):
-    # Search books by title (case-insensitive), excluding full_content for performance
+    user_id = current_user.get("user_id")
+    import re
+    safe_title = re.escape(title)
+    
+    # Search books by title (case-insensitive), excluding full_content for performance, and locked to the user
     cursor = books_collection.find(
-        {"title": {"$regex": title, "$options": "i"}},
+        {"title": {"$regex": safe_title, "$options": "i"}, "user_id": user_id, "deleted_at": None},
         {"full_content": 0}
     )
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
@@ -235,47 +217,9 @@ async def get_all_books(
 
 @router.get("/{book_id}", response_model=Book)
 async def get_book_by_id(
-    book_id: str,
-    books_collection: Collection = Depends(get_books_collection),
+    book: dict = Depends(require_ownership(get_books_collection, "book_id")),
 ):
-    # Find the book by its ID in the MongoDB collection
-    # Find the book by its ID in the MongoDB collection
-    print(f"[DEBUG] Searching for book with ID: {book_id} (Code Version: Fallback-Enabled)")
-    object_id = None
-    try:
-        object_id = ObjectId(book_id)
-        print(f"[DEBUG] Converted to ObjectId: {object_id}")
-    except Exception as e:
-        print(f"[DEBUG] '{book_id}' is not a valid ObjectId: {e}")
-    
-    book = None
-    if object_id:
-        book = await books_collection.find_one({"_id": object_id})
-    
-    if not book:
-        print(f"[DEBUG] Book not found by ObjectId. Trying String ID: {book_id}")
-        book = await books_collection.find_one({"_id": book_id})
-
-    print(f"[DEBUG] Book found: {book is not None}")
-    
-    if not book:
-        # DB Dump for debugging
-        print(f"[DEBUG] --- START DB DUMP (First 20) ---")
-        try:
-            all_books_cursor = books_collection.find({}, {"_id": 1, "title": 1})
-            all_books = await all_books_cursor.to_list(length=20)
-            for b in all_books:
-                # Print repr to see types clearly (ObjectId(...) vs 'string')
-                print(f" - ID: {repr(b['_id'])} | Title: {b.get('title', 'No Title')}")
-        except Exception as ex:
-            print(f"[DEBUG] Error dumping DB: {ex}")
-        print(f"[DEBUG] --- END DB DUMP ---")
-        
-        raise HTTPException(status_code=404, detail="Book not found")
-
-    if book:
-        book["_id"] = str(book["_id"])
-        return book
+    return book
 
 
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")

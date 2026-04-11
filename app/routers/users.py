@@ -26,6 +26,7 @@ from app.auth.firebase_auth import get_firebase_user
 router = APIRouter(
     prefix="/users",
     tags=["users"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -37,6 +38,7 @@ class UserMeResponse(BaseModel):
     email: str
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    photo_url: Optional[str] = None
     role: str
     subscription: dict
     preferences: dict
@@ -69,6 +71,7 @@ async def get_current_user_profile(
         email=user.get("email"),
         full_name=user.get("full_name"),
         avatar_url=user.get("avatar_url"),
+        photo_url=user.get("photo_url"),
         role=user.get("role", "user"),
         subscription=user.get("subscription", {}),
         preferences=user.get("preferences", {}),
@@ -90,6 +93,7 @@ class ProfileResponse(BaseModel):
     full_name: Optional[str] = None
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
+    photo_url: Optional[str] = None
     created_at: datetime
     subscription: dict
     stats: dict
@@ -302,6 +306,7 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
         full_name=user.get("full_name"),
         bio=user.get("bio"),
         avatar_url=user.get("avatar_url"),
+        photo_url=user.get("photo_url"),
         created_at=user.get("created_at", datetime.utcnow()),
         subscription=subscription,
         stats=stats,
@@ -634,34 +639,49 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     )
     
     # Annual Plans
+    plans_cursor = annual_plans_collection.find({"user_id": user_id, "deleted_at": None})
+    plans = await plans_cursor.to_list(length=100)
+    plan_ids = [str(p["_id"]) for p in plans]
+    
     await annual_plans_collection.update_many(
         {"user_id": user_id, "deleted_at": None},
         soft_delete_update
     )
     
-    # Focus Areas
-    await focus_areas_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-    
-    # Goals
-    await goals_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-    
-    # Priorities
-    await priorities_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-    
-    # Activities
-    await activities_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
+    if plan_ids:
+        # Focus Areas
+        areas_cursor = focus_areas_collection.find({"annual_plan_id": {"$in": plan_ids}, "deleted_at": None})
+        areas = await areas_cursor.to_list(length=300)
+        area_ids = [str(a["_id"]) for a in areas]
+        
+        await focus_areas_collection.update_many(
+            {"annual_plan_id": {"$in": plan_ids}, "deleted_at": None},
+            soft_delete_update
+        )
+        
+        if area_ids:
+            # Goals
+            goals_cursor = goals_collection.find({"focus_area_id": {"$in": area_ids}, "deleted_at": None})
+            goals = await goals_cursor.to_list(length=1000)
+            goal_ids = [str(g["_id"]) for g in goals]
+            
+            await goals_collection.update_many(
+                {"focus_area_id": {"$in": area_ids}, "deleted_at": None},
+                soft_delete_update
+            )
+            
+            # Priorities
+            await priorities_collection.update_many(
+                {"focus_area_id": {"$in": area_ids}, "deleted_at": None},
+                soft_delete_update
+            )
+            
+            if goal_ids:
+                # Activities
+                await activities_collection.update_many(
+                    {"goal_id": {"$in": goal_ids}, "deleted_at": None},
+                    soft_delete_update
+                )
     
     # Daily Routines
     await daily_routines_collection.update_many(
@@ -675,37 +695,7 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     }
 
 
-# Legacy endpoint for backward compatibility
-@router.post("/create_user", response_model=User)
-async def create_user(user: User):
+@router.post("/create_user")
+async def create_user():
     """Create a new user (legacy endpoint)"""
-    # Check if the user already exists
-    existing_user = await users_collection.find_one({"email": user.email})
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User already exists")
-
-    # Hash the password
-    hashed_password = bcrypt.hashpw(
-        user.password.encode("utf-8"), bcrypt.gensalt()
-    ).decode("utf-8")
-
-    user_dict = user.dict()
-    user_dict["password"] = hashed_password
-    user_dict["created_at"] = datetime.utcnow()
-
-    # Explicitly set default subscription to Free Tier
-    user_dict["subscription"] = {"tier": SubscriptionTier.FREE, "status": "active"}
-
-    # Set default role to 'user'
-    user_dict["role"] = "user"
-    
-    # Initialize wizard status
-    user_dict["wizard_completed"] = False
-
-    # Insert the new user into the database
-    insert_result = await users_collection.insert_one(user_dict)
-
-    # Store ID properly
-    user_dict["_id"] = str(insert_result.inserted_id)
-
-    return user_dict
+    raise HTTPException(status_code=410, detail="This endpoint is completely deprecated. Account creation is securely handled by Firebase.")

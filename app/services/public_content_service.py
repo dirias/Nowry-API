@@ -203,11 +203,13 @@ class PublicContentService:
             query["public_metadata.difficulty_level"] = difficulty
         
         if search_query:
+            import re
+            safe_query = re.escape(search_query)
             # Text search on title and description
             query["$or"] = [
-                {"title" if content_type == "book" else "name": {"$regex": search_query, "$options": "i"}},
-                {"summary" if content_type == "book" else "description": {"$regex": search_query, "$options": "i"}},
-                {"public_metadata.tags": {"$regex": search_query, "$options": "i"}}
+                {"title" if content_type == "book" else "name": {"$regex": safe_query, "$options": "i"}},
+                {"summary" if content_type == "book" else "description": {"$regex": safe_query, "$options": "i"}},
+                {"public_metadata.tags": {"$regex": safe_query, "$options": "i"}}
             ]
         
         # Determine sort
@@ -504,7 +506,7 @@ class PublicContentService:
                     or user_doc.get("display_name")
                     or user_doc.get("username")
                     or user_doc.get("displayName")
-                    or (user_doc.get("email", "").split("@")[0] or None)
+                    or "Anonymous User"
                 )
 
         # Record immutable fork attribution before insert

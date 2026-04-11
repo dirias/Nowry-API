@@ -220,10 +220,15 @@ async def get_news(language: str = "en", category: str = "general", user: dict =
 
 
 @router.delete("/news/cache/clear")
-async def clear_news_cache():
+async def clear_news_cache(current_user: dict = Depends(get_firebase_user)):
     """
     Clear the news cache (for testing/debugging)
+    Restricted to admin or dev roles.
     """
+    role = current_user.get("role", "user")
+    if role not in ["admin", "dev"]:
+        raise HTTPException(status_code=403, detail="Insufficient admin privileges to flush cache.")
+
     global news_cache
     news_cache.clear()
     return {"status": "success", "message": "News cache cleared"}

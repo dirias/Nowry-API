@@ -1,0 +1,82 @@
+from fastapi import Request, HTTPException, Depends
+from bson import ObjectId
+from typing import Callable
+from pymongo.collection import Collection
+
+from app.auth.firebase_auth import get_firebase_user
+
+def require_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
+    """
+    Returns a FastAPI dependency that verifies resource ownership.
+    Ensures the document exists and its user_id matches the authenticated user.
+    Uses the injected collection to query the DB dynamically.
+    """
+    async def _dependency(
+        request: Request,
+        collection: Collection = Depends(get_collection_dependency),
+        current_user: dict = Depends(get_firebase_user)
+    ) -> dict:
+        resource_id = request.path_params.get(id_param_name)
+        if not resource_id:
+            raise HTTPException(status_code=400, detail=f"Missing {id_param_name} parameter in path")
+            
+        try:
+            obj_id = ObjectId(resource_id)
+        except Exception:
+            obj_id = resource_id
+            
+        doc = await collection.find_one({"_id": obj_id})
+        
+        if not doc:
+            raise HTTPException(status_code=404, detail="Resource not found")
+            
+        user_id = current_user.get("user_id")
+        if doc.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this resource")
+            
+        # Format MongoDB IDs for Pydantic
+        doc["_id"] = str(doc["_id"])
+        if "id" not in doc:
+            doc["id"] = doc["_id"]
+            
+        return doc
+        
+    return _dependency
+
+def require_public_or_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
+    """
+    Returns a FastAPI dependency that allows access if resource is public
+    or belongs to the authenticated user.
+    """
+    async def _dependency(
+        request: Request,
+        collection: Collection = Depends(get_collection_dependency),
+        current_user: dict = Depends(get_firebase_user) # Can be optional auth? If it's pure public, we would use optional_auth
+    ) -> dict:
+        resource_id = request.path_params.get(id_param_name)
+        if not resource_id:
+            raise HTTPException(status_code=400, detail=f"Missing {id_param_name} parameter in path")
+            
+        try:
+            obj_id = ObjectId(resource_id)
+        except Exception:
+            obj_id = resource_id
+            
+        doc = await collection.find_one({"_id": obj_id})
+        
+        if not doc:
+            raise HTTPException(status_code=404, detail="Resource not found")
+            
+        user_id = current_user.get("user_id") if current_user else None
+        
+        is_public = doc.get("is_public", False)
+        if doc.get("user_id") != user_id and not is_public:
+            raise HTTPException(status_code=403, detail="Not authorized to access this resource")
+            
+        doc["_id"] = str(doc["_id"])
+        if "id" not in doc:
+            doc["id"] = doc["_id"]
+            
+        return doc
+        
+    return _dependency

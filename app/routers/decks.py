@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pymongo.collection import Collection
 
 from app.auth.firebase_auth import get_firebase_user, optional_auth
+from app.auth.dependencies import require_ownership, require_public_or_ownership
 from app.config.database import cards_collection, decks_collection
 from app.models.Deck import Deck, DeckWithStats
 from app.models.deck_settings import (
@@ -207,24 +208,9 @@ async def list_decks(
 
 @router.get("/{id}", summary="Get deck by ID", response_model=Deck)
 async def get_deck(
-    id: str,
-    collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    deck: dict = Depends(require_ownership(get_decks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} fetching deck ID: {id}")
-
-    try:
-        deck = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        deck = await collection.find_one({"id": id})
-
-    if not deck:
-        raise HTTPException(status_code=404, detail="Deck not found")
-
-    # Security check: ensure the deck belongs to the user
-    if str(deck.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Not authorized to view this deck")
+    # deck is already verified for ownership and existence
 
     deck["_id"] = str(deck["_id"])
     if deck.get("user_id"):
@@ -240,27 +226,10 @@ async def get_deck_cards(
     id: str,
     limit: int = 100,
     skip: int = 0,
-    current_user: Optional[dict] = Depends(optional_auth),
+    deck: dict = Depends(require_public_or_ownership(get_decks_collection, "id")),
 ):
     """Get all cards belonging to a specific deck (supports optional auth for public decks)"""
     logger.info(f"Fetching cards for deck ID: {id}")
-    
-    # Verify deck exists
-    try:
-        deck = await decks_collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        deck = await decks_collection.find_one({"id": id})
-    
-    if not deck:
-        raise HTTPException(status_code=404, detail="Deck not found")
-    
-    # Security check: only allow if deck is public OR user owns it
-    user_id = current_user.get("user_id") if current_user else None
-    is_owner = user_id and str(deck.get("user_id")) == str(user_id)
-    is_public = deck.get("is_public", False)  # Check root-level is_public
-    
-    if not is_owner and not is_public:
-        raise HTTPException(status_code=403, detail="Not authorized to view this deck")
     
     # Fetch cards for this deck
     try:
@@ -288,26 +257,10 @@ async def get_deck_cards(
 
 @router.patch("/{id}", summary="Update a deck", response_model=Deck)
 async def update_deck(
-    id: str,
     updates: dict,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    existing_deck: dict = Depends(require_ownership(get_decks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} updating deck ID: {id}")
-
-    try:
-        existing_deck = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        existing_deck = await collection.find_one({"id": id})
-
-    if not existing_deck:
-        raise HTTPException(status_code=404, detail="Deck not found")
-
-    if str(existing_deck.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this deck"
-        )
 
     updates["updated_at"] = datetime.utcnow()
 
@@ -317,7 +270,7 @@ async def update_deck(
         updates.pop(field, None)
 
     try:
-        await collection.update_one({"_id": existing_deck["_id"]}, {"$set": updates})
+        await collection.update_one({"_id": ObjectId(existing_deck["_id"])}, {"$set": updates})
     except Exception as e:
         logger.error(f"Error updating deck: {e}")
         raise HTTPException(status_code=400, detail="Update failed")
@@ -334,27 +287,11 @@ async def update_deck(
 
 @router.delete("/{id}", summary="Delete a deck", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_deck(
-    id: str,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    existing_deck: dict = Depends(require_ownership(get_decks_collection, "id")),
 ):
     from bson import ObjectId
-
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} deleting deck ID: {id}")
-
-    try:
-        existing_deck = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        existing_deck = await collection.find_one({"id": id})
-
-    if not existing_deck:
-        raise HTTPException(status_code=404, detail="Deck not found")
-
-    if str(existing_deck.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to delete this deck"
-        )
+    user_id = existing_deck.get("user_id")
 
     now = datetime.utcnow()
     
@@ -369,13 +306,13 @@ async def delete_deck(
     
     # 1. Soft delete the deck
     await collection.update_one(
-        {"_id": existing_deck["_id"]},
+        {"_id": ObjectId(existing_deck["_id"])},
         soft_delete_update
     )
     
     # 2. CASCADE: Soft delete all cards in this deck
     from app.config.database import cards_collection
-    deck_oid = existing_deck["_id"]
+    deck_oid = ObjectId(existing_deck["_id"])
     await cards_collection.update_many(
         {
             "$or": [
@@ -412,7 +349,9 @@ async def _fetch_owned_deck(deck_id: str, user_id: str) -> dict:
     if not deck:
         raise HTTPException(status_code=404, detail="Deck not found")
     if str(deck.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=404, detail="Deck not found")
+        raise HTTPException(status_code=403, detail="Deck not found")
+    
+    deck["_id"] = str(deck["_id"])
     return deck
 
 
@@ -462,11 +401,9 @@ async def _compute_daily_counts(
 async def update_deck_config(
     deck_id: str,
     body: DeckConfigUpdate,
-    user: dict = Depends(get_firebase_user),
+    deck: dict = Depends(require_ownership(get_decks_collection, "deck_id")),
 ) -> DeckConfigResponse:
-    user_id: str = user.get("user_id")
-    deck = await _fetch_owned_deck(deck_id, user_id)
-    deck_oid: ObjectId = deck["_id"]
+    deck_oid: ObjectId = ObjectId(deck["_id"])
 
     # Resolve final values — explicit body fields override pace defaults
     defaults = PACE_DEFAULTS[body.pace_mode.value]
@@ -527,9 +464,8 @@ async def update_deck_config(
 async def get_daily_budget(
     deck_id: str,
     tz: str = Query("UTC", description="IANA timezone name, e.g. America/New_York"),
-    user: dict = Depends(get_firebase_user),
+    deck: dict = Depends(require_ownership(get_decks_collection, "deck_id")),
 ) -> DailyBudgetResponse:
-    user_id: str = user.get("user_id")
 
     # Validate timezone
     try:
@@ -537,8 +473,7 @@ async def get_daily_budget(
     except (ZoneInfoNotFoundError, KeyError):
         raise HTTPException(status_code=400, detail=f"Invalid timezone: {tz!r}")
 
-    deck = await _fetch_owned_deck(deck_id, user_id)
-    deck_oid: ObjectId = deck["_id"]
+    deck_oid: ObjectId = ObjectId(deck["_id"])
 
     _, new_per_day, max_reviews = _resolve_deck_config(deck)
 
@@ -577,20 +512,9 @@ async def update_deck_settings(
     deck_id: str,
     body: DeckSettingsUpdate,
     collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    deck: dict = Depends(require_ownership(get_decks_collection, "deck_id")),
 ) -> DeckSettingsResponse:
-    user_id = user.get("user_id")
-
-    try:
-        obj_id = ObjectId(deck_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Deck not found")
-
-    deck = await collection.find_one({"_id": obj_id, "deleted_at": None})
-    if not deck:
-        raise HTTPException(status_code=404, detail="Deck not found")
-    if str(deck.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Not authorized")
+    obj_id = ObjectId(deck["_id"])
 
     set_doc: dict = {"updated_at": datetime.utcnow()}
 

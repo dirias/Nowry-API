@@ -85,6 +85,13 @@ def _parse_apkg(file_bytes: bytes, filename: str) -> tuple[str, List[ParsedCard]
             if not db_name:
                 raise ValueError("No Anki collection database found inside the .apkg file.")
 
+            # --- Zip Bomb Mitigation ---
+            info = z.getinfo(db_name)
+            # Limit the uncompressed SQLite DB to 150MB
+            if info.file_size > 150 * 1024 * 1024:
+                raise ValueError("Database file is dangerously large. Import aborted.")
+            # ---------------------------
+
             z.extract(db_name, tmp)
 
         db_path = os.path.join(tmp, db_name)

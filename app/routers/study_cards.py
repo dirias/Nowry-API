@@ -9,9 +9,12 @@ from app.config.database import cards_collection, decks_collection
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
 
+from app.auth.dependencies import require_ownership
+
 router = APIRouter(
     prefix="/study-cards",
     tags=["study cards"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -24,6 +27,24 @@ def get_cards_collection() -> Collection:
 
 def get_decks_collection() -> Collection:
     return decks_collection
+
+
+async def _verify_deck_ownership(deck_id: str, user_id: str):
+    """Verify that a deck exists and belongs to the user."""
+    if not deck_id:
+        return
+    try:
+        obj_id = ObjectId(deck_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid deck ID format")
+
+    deck = await decks_collection.find_one({"_id": obj_id, "deleted_at": None})
+    if not deck:
+        raise HTTPException(status_code=404, detail="Deck not found")
+    if str(deck.get("user_id")) != str(user_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this deck"
+        )
 
 
 async def _select_session_cards(
@@ -196,6 +217,7 @@ async def create_study_card(
 
     # Sync with Deck if deck_id is provided
     if card.deck_id:
+        await _verify_deck_ownership(card.deck_id, user_id)
         await d_collection.update_one(
             {"_id": ObjectId(card.deck_id)},
             {"$inc": {"total_cards": 1}, "$push": {"cards": card_id}},
@@ -502,30 +524,8 @@ async def get_daily_review_cards(
 
 @router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)
 async def get_study_card(
-    id: str,
-    collection: Collection = Depends(get_cards_collection),
-    user: dict = Depends(get_firebase_user),
+    card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} fetching study card with ID: {id}")
-
-    try:
-        card = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid card ID")
-
-    if not card:
-        raise HTTPException(status_code=404, detail="Study card not found")
-
-    if str(card.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Not authorized to view this card")
-
-    card["_id"] = str(card["_id"])
-    if card.get("deck_id"):
-        card["deck_id"] = str(card["deck_id"])
-    if card.get("user_id"):
-        card["user_id"] = str(card["user_id"])
-
     return card
 
 
@@ -584,9 +584,11 @@ async def list_study_cards(
         ]}
 
     if search:
+        import re
+        safe_search = re.escape(search)
         search_or = {"$or": [
-            {"title": {"$regex": search, "$options": "i"}},
-            {"content": {"$regex": search, "$options": "i"}},
+            {"title": {"$regex": safe_search, "$options": "i"}},
+            {"content": {"$regex": safe_search, "$options": "i"}},
         ]}
         and_clauses: list = [{"$or": query.pop("$or")}, search_or]
         if due_clause is not None:
@@ -663,23 +665,8 @@ async def update_study_card(
     updates: dict,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} updating study card with ID: {id}")
-
-    try:
-        existing_card = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid card ID")
-
-    if not existing_card:
-        raise HTTPException(status_code=404, detail="Study card not found")
-
-    if str(existing_card.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this card"
-        )
 
     # Handle deck_id change
     new_deck_id = updates.get("deck_id")
@@ -688,12 +675,14 @@ async def update_study_card(
     if "deck_id" in updates and str(new_deck_id) != str(old_deck_id):
         # Remove from old deck
         if old_deck_id:
+            await _verify_deck_ownership(old_deck_id, existing_card.get("user_id"))
             await d_collection.update_one(
                 {"_id": ObjectId(old_deck_id)},
                 {"$inc": {"total_cards": -1}, "$pull": {"cards": ObjectId(id)}},
             )
         # Add to new deck
         if new_deck_id:
+            await _verify_deck_ownership(new_deck_id, existing_card.get("user_id"))
             updates["deck_id"] = ObjectId(new_deck_id)
             await d_collection.update_one(
                 {"_id": ObjectId(new_deck_id)},
@@ -730,27 +719,13 @@ async def delete_study_card(
     id: str,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} deleting study card with ID: {id}")
-
-    try:
-        existing_card = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid card ID")
-
-    if not existing_card:
-        raise HTTPException(status_code=404, detail="Study card not found")
-
-    if str(existing_card.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to delete this card"
-        )
 
     # Sync with Deck if needed
     deck_id = existing_card.get("deck_id")
     if deck_id:
+        await _verify_deck_ownership(deck_id, existing_card.get("user_id"))
         await d_collection.update_one(
             {"_id": ObjectId(deck_id)},
             {"$inc": {"total_cards": -1}, "$pull": {"cards": ObjectId(id)}},
@@ -760,13 +735,12 @@ async def delete_study_card(
     return None
 
 
-# Review endpoint for SM-2 algorithm
 @router.post("/{id}/review", summary="Review a card with SM-2 grading")
 async def review_card(
     id: str,
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
     collection: Collection = Depends(get_cards_collection),
-    current_user: dict = Depends(get_firebase_user),
+    card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
     """
     Review a card and update its SM-2 spaced repetition parameters.
@@ -775,20 +749,6 @@ async def review_card(
     """
     try:
         from app.utils.sm2 import calculate_next_review
-
-        user_id = current_user.get("user_id")
-        logger.info(f"Reviewing card {id} with grade {grade} for user {user_id}")
-
-        # Fetch the card
-        card = await collection.find_one({"_id": ObjectId(id)})
-        if not card:
-            raise HTTPException(status_code=404, detail="Card not found")
-
-        # Authorization check
-        if str(card.get("user_id")) != str(user_id):
-            raise HTTPException(
-                status_code=403, detail="Not authorized to review this card"
-            )
 
         # Get current SM-2 parameters
         ease_factor = card.get("ease_factor", 2.5)

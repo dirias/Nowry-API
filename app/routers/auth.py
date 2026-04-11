@@ -24,6 +24,7 @@ class RegisterRequest(BaseModel):
     firebase_uid: str
     email: EmailStr
     username: str
+    photo_url: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -69,6 +70,7 @@ async def register_user(
             "firebase_uid": existing_user.get("firebase_uid"),
             "email": existing_user.get("email"),
             "username": existing_user.get("username"),
+            "photo_url": existing_user.get("photo_url"),
             "wizard_completed": existing_user.get("wizard_completed", False)
         }
     
@@ -77,6 +79,7 @@ async def register_user(
         "firebase_uid": request.firebase_uid,
         "email": request.email,
         "username": request.username,
+        "photo_url": request.photo_url,
         "role": "user",
         "subscription": {
             "tier": SubscriptionTier.FREE,
