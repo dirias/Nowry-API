@@ -79,6 +79,9 @@ async def register_user(
         "firebase_uid": request.firebase_uid,
         "email": request.email,
         "username": request.username,
+        # Seed full_name from username so the Settings field is never blank.
+        # Users can update it to their real name at any time.
+        "full_name": request.username,
         "photo_url": request.photo_url,
         "role": "user",
         "subscription": {

@@ -12,7 +12,7 @@ import bcrypt
 import base64
 import secrets
 import asyncio
-from pydantic import BaseModel, ConfigDict, EmailStr, validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, validator
 
 from app.models.User import User
 from app.config.database import (
@@ -152,6 +152,50 @@ class UserPreferences(BaseModel):
     pomodoro_auto_start: Optional[bool] = None
     pomodoro_enabled: Optional[bool] = None
     favorite_news: Optional[List[FavoriteArticle]] = None
+
+
+class GeneralPreferencesUpdate(BaseModel):
+    """
+    All fields are optional — only fields present in the request payload are written.
+    Pydantic v2's model_fields_set is used in the handler to build a partial $set,
+    so sending { language: 'es' } never touches theme_color, interests, etc.
+    """
+    model_config = ConfigDict(extra='ignore')  # Silently discard unknown legacy fields
+
+    language: str | None = Field(
+        default=None,
+        pattern='^(en|es|fr|de|ja)$'
+    )
+    theme_color: str | None = Field(
+        default=None,
+        pattern='^#[0-9a-fA-F]{6}$'
+    )
+    primary_topic: str | None = Field(
+        default=None,
+        description="Single primary learning topic (the single study focus)"
+    )
+    interests: list[str] | None = Field(
+        default=None,
+        description="Multi-select interest topics used to personalize the home news feed"
+    )
+    study_goal: str | None = Field(
+        default=None,
+        pattern='^(general|academic|career|language|hobby)$'
+    )
+    favorite_news: list[dict] | None = Field(
+        default=None,
+        description="User's saved/favorited news articles"
+    )
+
+
+class GeneralPreferencesResponse(BaseModel):
+    language: str
+    theme_color: str
+    primary_topic: str | None = None
+    interests: list[str] = Field(default_factory=list)
+    study_goal: str | None = None
+    favorite_news: list[dict] = Field(default_factory=list)
+    updated_at: datetime
 
 
 
@@ -483,42 +527,50 @@ async def update_notification_preferences(
     return {"message": "Notification preferences updated successfully"}
 
 
-@router.put("/preferences/general")
+@router.put("/preferences/general", response_model=GeneralPreferencesResponse)
 async def update_general_preferences(
-    prefs: UserPreferences,
+    data: GeneralPreferencesUpdate,
     current_user: dict = Depends(get_firebase_user),
-):
-    """Update general user preferences (Interests, Theme, Language)"""
+) -> GeneralPreferencesResponse:
+    """Update general user preferences from the onboarding wizard."""
     user_id = current_user.get("user_id")
+    updated_at = datetime.utcnow()
 
-    update_data = {}
-    if prefs.interests is not None:
-        update_data["preferences.interests"] = prefs.interests
-    if prefs.theme_color is not None:
-        update_data["preferences.theme_color"] = prefs.theme_color
-    if prefs.language is not None:
-        update_data["preferences.language"] = prefs.language
-    if prefs.pomodoro_work_minutes is not None:
-        update_data["preferences.pomodoro_work_minutes"] = prefs.pomodoro_work_minutes
-    if prefs.pomodoro_short_break_minutes is not None:
-        update_data["preferences.pomodoro_short_break_minutes"] = prefs.pomodoro_short_break_minutes
-    if prefs.pomodoro_long_break_minutes is not None:
-        update_data["preferences.pomodoro_long_break_minutes"] = prefs.pomodoro_long_break_minutes
-    if prefs.pomodoro_auto_start is not None:
-        update_data["preferences.pomodoro_auto_start"] = prefs.pomodoro_auto_start
-    if prefs.pomodoro_enabled is not None:
-        update_data["preferences.pomodoro_enabled"] = prefs.pomodoro_enabled
-    if prefs.favorite_news is not None:
-        # Convert Pydantic models to dicts for MongoDB
-        update_data["preferences.favorite_news"] = [article.dict() for article in prefs.favorite_news]
-        print(f"📰 Updating favorite_news for user {user_id}: {len(prefs.favorite_news)} articles")
+    # Only write fields that were explicitly included in the request payload.
+    # model_fields_set contains the names of fields the client actually sent.
+    field_map: dict = {
+        "language":     "preferences.general.language",
+        "theme_color":  "preferences.general.theme_color",
+        "primary_topic":"preferences.general.primary_topic",
+        "interests":    "preferences.general.interests",
+        "study_goal":   "preferences.general.study_goal",
+        "favorite_news":"preferences.general.favorite_news",
+    }
+    set_doc: dict = {"preferences.general.updated_at": updated_at}
+    for field_name, db_path in field_map.items():
+        if field_name in data.model_fields_set:
+            set_doc[db_path] = getattr(data, field_name)
 
-    update_data["updated_at"] = datetime.utcnow()
+    result = await users_collection.find_one_and_update(
+        {"_id": ObjectId(user_id)},
+        {"$set": set_doc},
+        return_document=True,
+    )
 
-    result = await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
-    print(f"✅ Update result: matched={result.matched_count}, modified={result.modified_count}")
+    if result is None:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    return {"message": "Preferences updated successfully"}
+    general_prefs: dict = result.get("preferences", {}).get("general", {})
+
+    return GeneralPreferencesResponse(
+        language=general_prefs.get("language", "en"),
+        theme_color=general_prefs.get("theme_color", "#2a6971"),
+        primary_topic=general_prefs.get("primary_topic"),
+        interests=general_prefs.get("interests", []),
+        study_goal=general_prefs.get("study_goal"),
+        favorite_news=general_prefs.get("favorite_news", []),
+        updated_at=general_prefs.get("updated_at", updated_at),
+    )
 
 
 @router.post("/complete-wizard")
