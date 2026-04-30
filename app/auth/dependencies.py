@@ -43,6 +43,26 @@ def require_ownership(get_collection_dependency: Callable, id_param_name: str = 
         
     return _dependency
 
+async def require_admin(
+    current_user: dict = Depends(get_firebase_user)
+) -> dict:
+    """
+    Verifies that the current user has is_admin=true in their MongoDB user document.
+    Raises HTTPException(403) if is_admin is missing or False.
+
+    Usage in route:
+      @router.get("/admin/reports")
+      async def list_reports(current_user: dict = Depends(require_admin)):
+          # current_user is guaranteed to have is_admin=true
+    """
+    if not current_user.get("is_admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
+    return current_user
+
+
 def require_public_or_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
     """
     Returns a FastAPI dependency that allows access if resource is public
