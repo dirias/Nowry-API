@@ -1,5 +1,8 @@
+import logging
 import os
 from motor.motor_asyncio import AsyncIOMotorClient
+
+logger = logging.getLogger(__name__)
 
 # --- Load MongoDB URI and DB name from environment ---
 MONGO_DB = os.getenv("MONGO_DB", "mydb")
@@ -37,15 +40,24 @@ study_sessions_collection = db["study_sessions"]
 
 async def create_indexes():
     # User indexes
+    await users_collection.create_index("firebase_uid", unique=True)
     await users_collection.create_index("email", unique=True)
     await users_collection.create_index("username", unique=True)
 
     # Data indexes for performance
     await books_collection.create_index("user_id")
+    await books_collection.create_index("created_at")
     await decks_collection.create_index("user_id")
+    await decks_collection.create_index("created_at")
     await cards_collection.create_index("deck_id")
+    await cards_collection.create_index("user_id")
+    await cards_collection.create_index("next_review_date")
     await tasks_collection.create_index("user_id")
     await tasks_collection.create_index("status")
+
+    # Content reports (moderation): status, created_at
+    await db["content_reports"].create_index("status")
+    await db["content_reports"].create_index("created_at")
 
     # Annual Planning indexes
     await annual_plans_collection.create_index("user_id")
@@ -117,4 +129,4 @@ async def create_indexes():
     )
     await study_sessions_collection.create_index("session_type")
 
-    print("Database indexes created successfully.")
+    logger.info("Database indexes created successfully.")
