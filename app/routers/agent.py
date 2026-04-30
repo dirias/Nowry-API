@@ -1965,9 +1965,9 @@ async def generate_avatar(
     """Generate a personalized AI avatar for the user's Study Pet using fal.ai FLUX Pro."""
     import uuid as _uuid_mod
 
-    user_id: str = current_user["uid"]
+    user_id: str = current_user.get("user_id")
 
-    user_doc = await users_collection.find_one({"firebase_uid": user_id})
+    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)}) if user_id else None
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -2059,9 +2059,9 @@ async def generate_animation(
     current_user: dict = Depends(get_firebase_user),
 ) -> GenerateAnimationResponse:
     """Generate a looping animation for the user's Study Pet using Luma Ray 2 Flash via fal.ai."""
-    user_id: str = current_user["uid"]
+    user_id: str = current_user.get("user_id")
 
-    user_doc = await users_collection.find_one({"firebase_uid": user_id})
+    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)}) if user_id else None
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
 

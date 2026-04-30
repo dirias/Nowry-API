@@ -63,24 +63,25 @@ async def report_content(
         raise HTTPException(status_code=404, detail="Public content not found")
     
     # Check if user already reported this content
+    reporter_user_id = current_user.get("user_id")
     existing_report = await db["content_reports"].find_one({
         "content_type": content_type,
         "content_id": content_id,
-        "reporter_user_id": current_user["uid"]
+        "reporter_user_id": reporter_user_id
     })
-    
+
     if existing_report:
         raise HTTPException(status_code=400, detail="You have already reported this content")
-    
+
     # Create report
     title_field = "title" if content_type == "book" else "name"
     content_title = content.get(title_field, "Untitled")
-    
+
     report = ContentReport(
         content_type=content_type,
         content_id=content_id,
         content_title=content_title,
-        reporter_user_id=current_user["uid"],
+        reporter_user_id=reporter_user_id,
         reporter_email=current_user.get("email"),
         reason=report_data.reason,
         description=report_data.description,
@@ -113,7 +114,7 @@ async def get_my_reports(
         - page: Page number
         - page_size: Items per page
     """
-    query = {"reporter_user_id": current_user["uid"]}
+    query = {"reporter_user_id": current_user.get("user_id")}
     
     if status:
         query["status"] = status
@@ -192,7 +193,7 @@ async def review_report(
     # Update report
     update_data = {
         "status": "resolved",
-        "reviewed_by": current_user["uid"],
+        "reviewed_by": current_user.get("user_id"),
         "reviewed_at": datetime.now(timezone.utc),
         "action_taken": review_data.action_taken,
         "resolution_notes": review_data.resolution_notes,
