@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book, BookSummary
@@ -64,7 +64,7 @@ async def create_book(
     
     print(f"[DEBUG CREATE] Attempting to insert book: {book.title}")
     # Exclude _id to let MongoDB generate it as ObjectId
-    book_dict = book.dict(by_alias=True, exclude={'id'})
+    book_dict = book.model_dump(by_alias=True, exclude={'id'})
     print(f"[DEBUG CREATE] Book dict keys: {book_dict.keys()}")
     
     new_book = await books_collection.insert_one(book_dict)
@@ -94,11 +94,13 @@ async def create_book(
 async def edit_book(
     book_id: str,
     book_data: Book,
+    background_tasks: BackgroundTasks,
     books_collection: Collection = Depends(get_books_collection),
     existing_book: dict = Depends(require_ownership(get_books_collection, "book_id")),
+    current_user: dict = Depends(get_firebase_user),
 ):
     # Update the book data using partial update (exclude_unset=True)
-    update_data = book_data.dict(exclude_unset=True)
+    update_data = book_data.model_dump(exclude_unset=True)
     
     # Remove immutable/system fields that shouldn't be updated by user.
     # forked_from is permanently set at fork time and must never be overwritten.
@@ -124,6 +126,18 @@ async def edit_book(
     updated_book = await books_collection.find_one({"_id": ObjectId(existing_book["_id"]) if len(existing_book["_id"]) == 24 else existing_book["_id"]})
     if updated_book:
         updated_book["_id"] = str(updated_book["_id"])
+
+        # Trigger background RAG indexing if content changed
+        if "full_content" in update_data and update_data["full_content"]:
+            from app.utils.book_rag import index_book
+            user_id: str = current_user["uid"]
+            background_tasks.add_task(
+                index_book,
+                book_id=str(existing_book["_id"]),
+                user_id=user_id,
+                raw_content=update_data["full_content"],
+            )
+
         return updated_book
     
     raise HTTPException(status_code=500, detail="Error fetching updated book")
@@ -139,7 +153,7 @@ async def delete_book(
     Soft delete a book (sets deleted_at timestamp).
     Also auto-unpublishes if the book was public.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
     
     try:
         # Soft delete + auto-unpublish
@@ -147,10 +161,10 @@ async def delete_book(
             {"_id": ObjectId(book["_id"]) if len(book["_id"]) == 24 else book["_id"]},
             {
                 "$set": {
-                    "deleted_at": datetime.utcnow(),
+                    "deleted_at": datetime.now(timezone.utc),
                     "deleted_by": book.get("user_id"),
                     "is_public": False,  # Auto-unpublish
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now(timezone.utc)
                 }
             }
         )
@@ -348,7 +362,7 @@ async def import_book_from_file(
     )
 
     # Exclude 'id' so MongoDB generates a proper ObjectId, identifying this as a new document
-    book_dict = new_book.dict(by_alias=True, exclude={'id'})
+    book_dict = new_book.model_dump(by_alias=True, exclude={'id'})
     result = await books_collection.insert_one(book_dict)
     book_id = str(result.inserted_id)
 

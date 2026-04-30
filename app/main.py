@@ -7,11 +7,11 @@ load_dotenv()
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from app.config.database import create_indexes
+from app.core.limiter import limiter
 from app.routers import (
     books,
     users,
@@ -31,12 +31,13 @@ from app.routers import (
     moderation,
     blackboards,
     import_apkg,
+    agent,
+    quiz,
+    quiz_ai,
+    study_sessions,
 )
 
 
-
-# Initialize Rate Limiter with global default to prevent basic DoS
-limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 
 @asynccontextmanager
@@ -86,6 +87,10 @@ app.include_router(public_content.router)  # Public content sharing
 app.include_router(moderation.router)  # Content moderation
 app.include_router(blackboards.router)  # Blackboard brainstorm canvas
 app.include_router(import_apkg.router)  # Anki .apkg import
+app.include_router(agent.router)         # Study Buddy AI companion
+app.include_router(quiz.router, prefix="/v1/assistant/quiz", tags=["quiz"])      # Active Study Partner (deck)
+app.include_router(quiz_ai.router, prefix="/v1/assistant/quiz", tags=["quiz"])   # Active Study Partner (AI)
+app.include_router(study_sessions.router, prefix="/v1/study-sessions", tags=["study-sessions"])  # Session history
 
 
 @app.get("/")

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import db
 from app.models.Blackboard import BlackboardUpdate
+from app.models.common import BlackboardResponse, OkResponse
 from bson import ObjectId
 from datetime import datetime, timezone
 
@@ -13,7 +14,7 @@ def _serialize(doc: dict) -> dict:
     return doc
 
 
-@router.get("/{board_id}")
+@router.get("/{board_id}", response_model=BlackboardResponse)
 async def get_blackboard(board_id: str, current_user: dict = Depends(get_firebase_user)):
     uid = current_user["uid"]
 
@@ -47,7 +48,7 @@ async def get_blackboard(board_id: str, current_user: dict = Depends(get_firebas
     return _serialize(doc)
 
 
-@router.put("/{board_id}")
+@router.put("/{board_id}", response_model=BlackboardResponse)
 async def save_blackboard(
     board_id: str,
     update: BlackboardUpdate,
@@ -75,7 +76,7 @@ async def save_blackboard(
     return _serialize(result)
 
 
-@router.delete("/{board_id}")
+@router.delete("/{board_id}", response_model=OkResponse)
 async def clear_blackboard(board_id: str, current_user: dict = Depends(get_firebase_user)):
     uid = current_user["uid"]
     now = datetime.now(timezone.utc)

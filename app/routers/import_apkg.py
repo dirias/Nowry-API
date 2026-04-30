@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel
 from bson import ObjectId
 import zipfile
@@ -278,7 +278,7 @@ async def confirm_import(
             detail=f"Importing {len(payload.cards)} cards would exceed your plan limit. You have {cards_allowed} slots remaining.",
         )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # 1. Create the deck
     deck_doc = {

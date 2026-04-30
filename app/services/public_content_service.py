@@ -3,7 +3,7 @@ Service layer for public content operations.
 Handles publishing, forking, tracking, and discovery of public Books and Decks.
 """
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from fastapi import HTTPException
 
@@ -78,7 +78,7 @@ class PublicContentService:
         # Build public_metadata dict; inject fork attribution if the document
         # carries a forked_from field — this ensures attribution is always
         # present in the published record even if the user never set it manually.
-        metadata_dict: dict = metadata.dict()
+        metadata_dict: dict = metadata.model_dump()
         if content.get("forked_from"):
             metadata_dict["forked_from"] = content["forked_from"]
 
@@ -88,9 +88,9 @@ class PublicContentService:
             {
                 "$set": {
                     "is_public": True,
-                    "published_at": datetime.utcnow(),
+                    "published_at": datetime.now(timezone.utc),
                     "public_metadata": metadata_dict,
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now(timezone.utc)
                 }
             }
         )
@@ -127,7 +127,7 @@ class PublicContentService:
             {
                 "$set": {
                     "is_public": False,
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now(timezone.utc)
                 }
             }
         )
@@ -344,7 +344,7 @@ class PublicContentService:
             user_id=user_id
         )
         
-        await self.db["content_likes"].insert_one(like.dict(by_alias=True))
+        await self.db["content_likes"].insert_one(like.model_dump(by_alias=True))
         
         # Increment like count
         collection = self.db[f"{content_type}s"]
@@ -398,7 +398,7 @@ class PublicContentService:
         if not viewer_user_id:
             return False
 
-        cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
 
         existing = await self.db["content_views"].find_one({
             "content_type": content_type,
@@ -425,7 +425,7 @@ class PublicContentService:
             user_agent=user_agent
         )
         
-        await self.db["content_views"].insert_one(view.dict(by_alias=True))
+        await self.db["content_views"].insert_one(view.model_dump(by_alias=True))
     
     # ========== Forking/Cloning ==========
     
@@ -458,20 +458,35 @@ class PublicContentService:
                 detail="cannot_fork_own_content"
             )
 
-        # FIX 2 — Prevent duplicate fork
+        # FIX 2 — Prevent duplicate fork (unless the previous fork was deleted)
         existing_fork = await self.db["content_forks"].find_one({
             "original_content_id": str(original_content_id),
             "forked_by_user_id": str(forking_user_id)
         })
 
         if existing_fork:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "already_forked",
-                    "forked_content_id": str(existing_fork["forked_content_id"])
-                }
-            )
+            # Verify if the forked content actually still exists and isn't deleted
+            forked_id = existing_fork.get("forked_content_id")
+            if forked_id:
+                forked_doc = await collection.find_one({
+                    "_id": ObjectId(forked_id),
+                    "deleted_at": None
+                })
+                
+                if forked_doc:
+                    # Previous fork is still active - block duplicate
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "already_forked",
+                            "forked_content_id": str(forked_id)
+                        }
+                    )
+                else:
+                    # Stale fork - forked content was deleted or is missing.
+                    # Clean up the stale record to allow a fresh fork.
+                    await self.db["content_forks"].delete_one({"_id": existing_fork["_id"]})
+
 
         # Create a copy
         forked_content = dict(original)
@@ -480,8 +495,8 @@ class PublicContentService:
         forked_content["is_public"] = False  # Forked content is private by default
         forked_content["published_at"] = None
         forked_content["public_metadata"] = None
-        forked_content["created_at"] = datetime.utcnow()
-        forked_content["updated_at"] = datetime.utcnow()
+        forked_content["created_at"] = datetime.now(timezone.utc)
+        forked_content["updated_at"] = datetime.now(timezone.utc)
         
         # Add attribution
         title_field = "title" if content_type == "book" else "name"
@@ -534,7 +549,7 @@ class PublicContentService:
             forked_by_user_id=forking_user_id
         )
         
-        await self.db["content_forks"].insert_one(fork_record.dict(by_alias=True))
+        await self.db["content_forks"].insert_one(fork_record.model_dump(by_alias=True))
         
         # Increment fork count
         await collection.update_one(
@@ -550,7 +565,7 @@ class PublicContentService:
             ).to_list(length=500)
 
             if original_cards:
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 new_cards: List[dict] = []
                 for card in original_cards:
                     new_card = dict(card)

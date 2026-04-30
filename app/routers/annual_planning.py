@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 
 from app.auth.firebase_auth import get_firebase_user
+from app.models.common import MessageResponse, OkResponse, FullAnnualPlanResponse
 from app.config.database import (
     annual_plans_collection,
     focus_areas_collection,
@@ -81,7 +82,7 @@ async def get_daily_routine(
     
     if not routine:
         new_routine = DailyRoutineTemplate(user_id=user_id)
-        result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
+        result = await daily_routines_collection.insert_one(new_routine.model_dump(by_alias=True))
         routine = await daily_routines_collection.find_one({"_id": result.inserted_id})
         
     return routine
@@ -123,13 +124,13 @@ async def update_daily_routine(
             afternoon_routine=routine.afternoon_routine,
             evening_routine=routine.evening_routine
         )
-        insert_result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
+        insert_result = await daily_routines_collection.insert_one(new_routine.model_dump(by_alias=True))
         return await daily_routines_collection.find_one({"_id": insert_result.inserted_id})
 
     return await daily_routines_collection.find_one({"user_id": user_id})
 
 
-@router.patch("/daily-routine/completions")
+@router.patch("/daily-routine/completions", response_model=OkResponse)
 async def update_routine_completions(
     payload: dict = Body(...),
     current_user: dict = Depends(get_firebase_user),
@@ -170,7 +171,7 @@ async def get_annual_plan(
     return plan
 
 
-@router.get("/full")
+@router.get("/full", response_model=FullAnnualPlanResponse)
 async def get_full_annual_plan(
     current_user: dict = Depends(get_firebase_user),
     year: int = datetime.now().year
@@ -289,7 +290,7 @@ async def create_annual_plan(
         year=year,
         title=plan_data.get("title", f"My {year} Plan")
     )
-    result = await annual_plans_collection.insert_one(new_plan.dict(by_alias=True))
+    result = await annual_plans_collection.insert_one(new_plan.model_dump(by_alias=True))
     plan = await annual_plans_collection.find_one({"_id": result.inserted_id})
     
     return plan
@@ -534,7 +535,7 @@ async def close_quarter(
         knowledge_summary=knowledge_summary
     )
     
-    result = await quarter_reports_collection.insert_one(report.dict(by_alias=True))
+    result = await quarter_reports_collection.insert_one(report.model_dump(by_alias=True))
     created_report = await quarter_reports_collection.find_one({"_id": result.inserted_id})
     return created_report
 
@@ -577,7 +578,7 @@ async def create_focus_area(
     if count >= 3:
         raise HTTPException(status_code=400, detail="Maximum 3 focus areas allowed")
         
-    result = await focus_areas_collection.insert_one(focus_area.dict(by_alias=True))
+    result = await focus_areas_collection.insert_one(focus_area.model_dump(by_alias=True))
     created = await focus_areas_collection.find_one({"_id": result.inserted_id})
     return created
 
@@ -611,7 +612,7 @@ async def update_focus_area(
         
     return await focus_areas_collection.find_one({"_id": obj_id})
 
-@router.delete("/focus-areas/{id}")
+@router.delete("/focus-areas/{id}", response_model=MessageResponse)
 async def delete_focus_area(
     id: str,
     current_user: dict = Depends(get_firebase_user),
@@ -620,11 +621,11 @@ async def delete_focus_area(
     Soft delete a focus area and cascade to related goals, activities, and priorities.
     All related data will be soft-deleted and can be recovered within 30 days.
     """
-    from datetime import datetime
-    
+    from datetime import datetime, timezone
+
     user_id = current_user.get("user_id")
-    now = datetime.utcnow()
-    
+    now = datetime.now(timezone.utc)
+
     # 1. Verify ownership
     focus_area = await focus_areas_collection.find_one({
         "_id": ObjectId(id),
@@ -689,7 +690,7 @@ async def create_priority(
 ):
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(priority.annual_plan_id, user_id)
-    result = await priorities_collection.insert_one(priority.dict(by_alias=True))
+    result = await priorities_collection.insert_one(priority.model_dump(by_alias=True))
     return await priorities_collection.find_one({"_id": result.inserted_id})
 
 @router.put("/priorities/{id}", response_model=Priority)
@@ -755,7 +756,7 @@ async def update_priority(
     print(f"[DEBUG] Successfully updated priority")
     return await priorities_collection.find_one({"_id": obj_id})
 
-@router.delete("/priorities/{id}")
+@router.delete("/priorities/{id}", response_model=MessageResponse)
 async def delete_priority(id: str, current_user: dict = Depends(get_firebase_user)):
     try:
         obj_id = ObjectId(id)
@@ -798,7 +799,7 @@ async def create_goal(
 ):
     user_id = current_user.get("user_id")
     await verify_focus_area_ownership(goal.focus_area_id, user_id)
-    result = await goals_collection.insert_one(goal.dict(by_alias=True))
+    result = await goals_collection.insert_one(goal.model_dump(by_alias=True))
     return await goals_collection.find_one({"_id": result.inserted_id})
 
 @router.put("/goals/{id}", response_model=Goal)
@@ -896,17 +897,17 @@ async def update_goal(
     updated_goal = await goals_collection.find_one({"_id": obj_id})
     return updated_goal
 
-@router.delete("/goals/{id}")
+@router.delete("/goals/{id}", response_model=MessageResponse)
 async def delete_goal(id: str, current_user: dict = Depends(get_firebase_user)):
     """
     Soft delete a goal and cascade to related activities.
     All related data will be soft-deleted and can be recovered within 30 days.
     """
-    from datetime import datetime
-    
+    from datetime import datetime, timezone
+
     user_id = current_user.get("user_id")
-    now = datetime.utcnow()
-    
+    now = datetime.now(timezone.utc)
+
     # 1. Verify ownership
     goal = await goals_collection.find_one({
         "_id": ObjectId(id),
@@ -957,7 +958,7 @@ async def create_activity(
     current_user: dict = Depends(get_firebase_user),
 ):
     activity.goal_id = goal_id
-    result = await activities_collection.insert_one(activity.dict(by_alias=True))
+    result = await activities_collection.insert_one(activity.model_dump(by_alias=True))
     return await activities_collection.find_one({"_id": result.inserted_id})
 
 @router.put("/activities/{id}", response_model=Activity)
@@ -988,7 +989,7 @@ async def update_activity(
 
     return await activities_collection.find_one({"_id": obj_id})
 
-@router.delete("/activities/{id}")
+@router.delete("/activities/{id}", response_model=MessageResponse)
 async def delete_activity(id: str, current_user: dict = Depends(get_firebase_user)):
     await activities_collection.delete_one({"_id": ObjectId(id)})
     return {"message": "Activity deleted"}

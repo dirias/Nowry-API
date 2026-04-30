@@ -6,15 +6,21 @@ Handles user profile management, settings, and preferences
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pymongo.collection import Collection
 from bson import ObjectId
-from datetime import datetime, timedelta
-from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+from typing import Literal, Optional, List
 import bcrypt
 import base64
 import secrets
 import asyncio
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, validator
 
 from app.models.User import User
+from app.models.common import (
+    MessageResponse,
+    AvatarUploadResponse,
+    TwoFactorEnableResponse,
+    AccountDeleteResponse,
+)
 from app.config.database import (
     users_collection,
     study_cards_collection,
@@ -186,6 +192,49 @@ class GeneralPreferencesUpdate(BaseModel):
         default=None,
         description="User's saved/favorited news articles"
     )
+    # Study Buddy / Agent settings
+    agent_knowledge_access: bool | None = Field(
+        default=None,
+        description="Allow the Study Buddy to read the user's library, decks, and goals"
+    )
+    agent_proactive_nudging: bool | None = Field(
+        default=None,
+        description="Allow the Study Buddy to proactively remind the user of due cards on dashboard load"
+    )
+    agent_conciseness: str | None = Field(
+        default=None,
+        pattern='^(concise|balanced|detailed)$',
+        description="Controls reply length: concise (1-2 sentences), balanced (default), detailed (thorough explanations)"
+    )
+    agent_tone: str | None = Field(
+        default=None,
+        pattern='^(friendly|professional|strict|socratic)$',
+        description="Controls the pet's personality style"
+    )
+    agent_roaming_enabled: bool | None = Field(
+        default=None,
+        description="Allow the Study Buddy to navigate autonomously between app sections"
+    )
+    agent_intervention_frequency: Optional[Literal['conservative', 'balanced', 'frequent']] = Field(
+        default=None,
+        description="Per-session intervention cap tier"
+    )
+    agent_focus_mode: Optional[bool] = Field(
+        default=None,
+        description="When True, wrong_answer interventions are silenced during study sessions"
+    )
+    agent_intervention_wrong_answer: Optional[bool] = Field(default=None)
+    agent_intervention_session_summary: Optional[bool] = Field(default=None)
+    agent_intervention_pre_session: Optional[bool] = Field(default=None)
+    agent_intervention_re_engagement: Optional[bool] = Field(default=None)
+    agent_intervention_streak_milestone: Optional[bool] = Field(default=None)
+    # AI Quiz question count — Plus/Pro only; free tier is always capped at 10.
+    agent_ai_quiz_question_count: int | None = Field(
+        default=None,
+        ge=5,
+        le=20,
+        description="Number of questions per AI quiz session (5–20). Ignored for free-tier users.",
+    )
 
 
 class GeneralPreferencesResponse(BaseModel):
@@ -195,6 +244,20 @@ class GeneralPreferencesResponse(BaseModel):
     interests: list[str] = Field(default_factory=list)
     study_goal: str | None = None
     favorite_news: list[dict] = Field(default_factory=list)
+    agent_knowledge_access: bool = False
+    agent_proactive_nudging: bool = False
+    agent_conciseness: str = 'balanced'
+    agent_tone: str = 'friendly'
+    agent_roaming_enabled: bool = True
+    agent_intervention_frequency: str = 'balanced'
+    agent_focus_mode: bool = False
+    agent_intervention_wrong_answer: bool = True
+    agent_intervention_session_summary: bool = True
+    agent_intervention_pre_session: bool = True
+    agent_intervention_re_engagement: bool = True
+    agent_intervention_streak_milestone: bool = True
+    # AI Quiz question count — always returned; effective value depends on tier (free=10 fixed).
+    agent_ai_quiz_question_count: int = 10
     updated_at: datetime
 
 
@@ -231,7 +294,7 @@ async def get_user_stats(user_id: str) -> dict:
         )
 
         # Calculate study streak efficiently (fetch last 365 days of reviews at once)
-        one_year_ago = datetime.utcnow() - timedelta(days=365)
+        one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
         reviewed_cards_cursor = study_cards_collection.find(
             {
                 "user_id": user_oid,
@@ -247,7 +310,7 @@ async def get_user_stats(user_id: str) -> dict:
                 reviewed_dates.add(card["last_reviewed"].date())
                 
         # Calculate streak
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         streak = 0
         check_date = today
         
@@ -351,7 +414,7 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
         bio=user.get("bio"),
         avatar_url=user.get("avatar_url"),
         photo_url=user.get("photo_url"),
-        created_at=user.get("created_at", datetime.utcnow()),
+        created_at=user.get("created_at", datetime.now(timezone.utc)),
         subscription=subscription,
         stats=stats,
         notification_preferences=notification_preferences,
@@ -360,7 +423,7 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
     )
 
 
-@router.put("/profile")
+@router.put("/profile", response_model=MessageResponse)
 async def update_profile(
     profile_update: ProfileUpdate,
     current_user: dict = Depends(get_firebase_user),
@@ -377,7 +440,7 @@ async def update_profile(
     if not update_data:
         return {"message": "No changes requested"}
 
-    update_data["updated_at"] = datetime.utcnow()
+    update_data["updated_at"] = datetime.now(timezone.utc)
 
     await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
 
@@ -405,7 +468,7 @@ async def patch_user_profile(
     if body.bio is not None:
         update_dict["bio"] = body.bio
 
-    updated_at = datetime.utcnow()
+    updated_at = datetime.now(timezone.utc)
     update_dict["updated_at"] = updated_at
 
     result = await users_collection.update_one(
@@ -423,7 +486,7 @@ async def patch_user_profile(
     )
 
 
-@router.post("/avatar")
+@router.post("/avatar", response_model=AvatarUploadResponse)
 async def upload_avatar(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_firebase_user),
@@ -447,13 +510,13 @@ async def upload_avatar(
     # Update user
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
-        {"$set": {"avatar_url": avatar_url, "updated_at": datetime.utcnow()}},
+        {"$set": {"avatar_url": avatar_url, "updated_at": datetime.now(timezone.utc)}},
     )
 
     return {"message": "Avatar uploaded successfully", "avatar_url": avatar_url}
 
 
-@router.put("/password")
+@router.put("/password", response_model=MessageResponse)
 async def change_password(
     password_data: PasswordChange,
     current_user: dict = Depends(get_firebase_user),
@@ -488,13 +551,13 @@ async def change_password(
     # Update password
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
-        {"$set": {"password": hashed_password, "updated_at": datetime.utcnow()}},
+        {"$set": {"password": hashed_password, "updated_at": datetime.now(timezone.utc)}},
     )
 
     return {"message": "Password changed successfully"}
 
 
-@router.put("/notifications")
+@router.put("/notifications", response_model=MessageResponse)
 async def update_notification_preferences(
     preferences: NotificationPreferences,
     current_user: dict = Depends(get_firebase_user),
@@ -520,31 +583,84 @@ async def update_notification_preferences(
             detail="At least one notification preference must be provided.",
         )
 
-    update_data["updated_at"] = datetime.utcnow()
+    update_data["updated_at"] = datetime.now(timezone.utc)
 
     await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
 
     return {"message": "Notification preferences updated successfully"}
 
 
+@router.get("/preferences/general", response_model=GeneralPreferencesResponse)
+async def get_general_preferences(
+    current_user: dict = Depends(get_firebase_user),
+) -> GeneralPreferencesResponse:
+    """Fetch the current user's general and agent preferences."""
+    user_id = current_user.get("user_id")
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    general_prefs: dict = user.get("preferences", {}).get("general", {})
+    agent_prefs: dict = user.get("preferences", {}).get("agent", {})
+    updated_at = general_prefs.get("updated_at", datetime.now(timezone.utc))
+
+    return GeneralPreferencesResponse(
+        language=general_prefs.get("language", "en"),
+        theme_color=general_prefs.get("theme_color", "#2a6971"),
+        primary_topic=general_prefs.get("primary_topic"),
+        interests=general_prefs.get("interests", []),
+        study_goal=general_prefs.get("study_goal"),
+        favorite_news=general_prefs.get("favorite_news", []),
+        agent_knowledge_access=agent_prefs.get("knowledge_access", False),
+        agent_proactive_nudging=agent_prefs.get("proactive_nudging", False),
+        agent_conciseness=agent_prefs.get("conciseness", "balanced"),
+        agent_tone=agent_prefs.get("tone", "friendly"),
+        agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", True)),
+        agent_intervention_frequency=agent_prefs.get("intervention_frequency", "balanced"),
+        agent_focus_mode=bool(agent_prefs.get("focus_mode", False)),
+        agent_intervention_wrong_answer=bool(agent_prefs.get("intervention_wrong_answer", True)),
+        agent_intervention_session_summary=bool(agent_prefs.get("intervention_session_summary", True)),
+        agent_intervention_pre_session=bool(agent_prefs.get("intervention_pre_session", True)),
+        agent_intervention_re_engagement=bool(agent_prefs.get("intervention_re_engagement", True)),
+        agent_intervention_streak_milestone=bool(agent_prefs.get("intervention_streak_milestone", True)),
+        agent_ai_quiz_question_count=int(agent_prefs.get("ai_quiz_question_count", 10)),
+        updated_at=updated_at,
+    )
+
+
 @router.put("/preferences/general", response_model=GeneralPreferencesResponse)
+
 async def update_general_preferences(
     data: GeneralPreferencesUpdate,
     current_user: dict = Depends(get_firebase_user),
 ) -> GeneralPreferencesResponse:
     """Update general user preferences from the onboarding wizard."""
     user_id = current_user.get("user_id")
-    updated_at = datetime.utcnow()
+    updated_at = datetime.now(timezone.utc)
 
     # Only write fields that were explicitly included in the request payload.
     # model_fields_set contains the names of fields the client actually sent.
     field_map: dict = {
-        "language":     "preferences.general.language",
-        "theme_color":  "preferences.general.theme_color",
-        "primary_topic":"preferences.general.primary_topic",
-        "interests":    "preferences.general.interests",
-        "study_goal":   "preferences.general.study_goal",
-        "favorite_news":"preferences.general.favorite_news",
+        "language":                 "preferences.general.language",
+        "theme_color":              "preferences.general.theme_color",
+        "primary_topic":            "preferences.general.primary_topic",
+        "interests":                "preferences.general.interests",
+        "study_goal":               "preferences.general.study_goal",
+        "favorite_news":            "preferences.general.favorite_news",
+        # Agent settings are stored under a separate 'agent' sub-key for clean separation
+        "agent_knowledge_access":              "preferences.agent.knowledge_access",
+        "agent_proactive_nudging":             "preferences.agent.proactive_nudging",
+        "agent_conciseness":                   "preferences.agent.conciseness",
+        "agent_tone":                          "preferences.agent.tone",
+        "agent_roaming_enabled":               "preferences.agent.roaming_enabled",
+        "agent_intervention_frequency":        "preferences.agent.intervention_frequency",
+        "agent_focus_mode":                    "preferences.agent.focus_mode",
+        "agent_intervention_wrong_answer":     "preferences.agent.intervention_wrong_answer",
+        "agent_intervention_session_summary":  "preferences.agent.intervention_session_summary",
+        "agent_intervention_pre_session":      "preferences.agent.intervention_pre_session",
+        "agent_intervention_re_engagement":    "preferences.agent.intervention_re_engagement",
+        "agent_intervention_streak_milestone": "preferences.agent.intervention_streak_milestone",
+        "agent_ai_quiz_question_count":        "preferences.agent.ai_quiz_question_count",
     }
     set_doc: dict = {"preferences.general.updated_at": updated_at}
     for field_name, db_path in field_map.items():
@@ -561,6 +677,7 @@ async def update_general_preferences(
         raise HTTPException(status_code=404, detail="User not found")
 
     general_prefs: dict = result.get("preferences", {}).get("general", {})
+    agent_prefs: dict = result.get("preferences", {}).get("agent", {})
 
     return GeneralPreferencesResponse(
         language=general_prefs.get("language", "en"),
@@ -569,24 +686,37 @@ async def update_general_preferences(
         interests=general_prefs.get("interests", []),
         study_goal=general_prefs.get("study_goal"),
         favorite_news=general_prefs.get("favorite_news", []),
+        agent_knowledge_access=agent_prefs.get("knowledge_access", False),
+        agent_proactive_nudging=agent_prefs.get("proactive_nudging", False),
+        agent_conciseness=agent_prefs.get("conciseness", "balanced"),
+        agent_tone=agent_prefs.get("tone", "friendly"),
+        agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", True)),
+        agent_intervention_frequency=agent_prefs.get("intervention_frequency", "balanced"),
+        agent_focus_mode=bool(agent_prefs.get("focus_mode", False)),
+        agent_intervention_wrong_answer=bool(agent_prefs.get("intervention_wrong_answer", True)),
+        agent_intervention_session_summary=bool(agent_prefs.get("intervention_session_summary", True)),
+        agent_intervention_pre_session=bool(agent_prefs.get("intervention_pre_session", True)),
+        agent_intervention_re_engagement=bool(agent_prefs.get("intervention_re_engagement", True)),
+        agent_intervention_streak_milestone=bool(agent_prefs.get("intervention_streak_milestone", True)),
+        agent_ai_quiz_question_count=int(agent_prefs.get("ai_quiz_question_count", 10)),
         updated_at=general_prefs.get("updated_at", updated_at),
     )
 
 
-@router.post("/complete-wizard")
+@router.post("/complete-wizard", response_model=MessageResponse)
 async def complete_wizard(current_user: dict = Depends(get_firebase_user)):
     """Mark the onboarding wizard as completed"""
     user_id = current_user.get("user_id")
     
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
-        {"$set": {"wizard_completed": True, "updated_at": datetime.utcnow()}}
+        {"$set": {"wizard_completed": True, "updated_at": datetime.now(timezone.utc)}}
     )
     
     return {"message": "Wizard completed successfully"}
 
 
-@router.post("/2fa/enable")
+@router.post("/2fa/enable", response_model=TwoFactorEnableResponse)
 async def enable_2fa(current_user: dict = Depends(get_firebase_user)):
     """Enable two-factor authentication"""
     user_id = current_user.get("user_id")
@@ -600,7 +730,7 @@ async def enable_2fa(current_user: dict = Depends(get_firebase_user)):
             "$set": {
                 "two_factor_enabled": True,
                 "two_factor_backup_codes": backup_codes,
-                "updated_at": datetime.utcnow(),
+                "updated_at": datetime.now(timezone.utc),
             }
         },
     )
@@ -608,7 +738,7 @@ async def enable_2fa(current_user: dict = Depends(get_firebase_user)):
     return {"message": "2FA enabled successfully", "backup_codes": backup_codes}
 
 
-@router.post("/2fa/disable")
+@router.post("/2fa/disable", response_model=MessageResponse)
 async def disable_2fa(current_user: dict = Depends(get_firebase_user)):
     """Disable two-factor authentication"""
     user_id = current_user.get("user_id")
@@ -621,20 +751,20 @@ async def disable_2fa(current_user: dict = Depends(get_firebase_user)):
                 "two_factor_secret": "",
                 "two_factor_backup_codes": "",
             },
-            "$set": {"updated_at": datetime.utcnow()},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
         },
     )
 
     return {"message": "2FA disabled successfully"}
 
 
-@router.delete("/account")
+@router.delete("/account", response_model=AccountDeleteResponse)
 async def delete_account(current_user: dict = Depends(get_firebase_user)):
     """
     Soft delete user account and all associated data.
     Data can be recovered within 30 days before permanent deletion.
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from app.config.database import (
         annual_plans_collection,
         focus_areas_collection,
@@ -645,7 +775,7 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     )
     
     user_id = current_user.get("user_id")
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     
     # 1. Soft delete user account
     user_update = await users_collection.update_one(
@@ -743,7 +873,7 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     
     return {
         "message": "Account deleted successfully. Data can be recovered within 30 days by contacting support.",
-        "recovery_deadline": (datetime.utcnow() + timedelta(days=30)).isoformat()
+        "recovery_deadline": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
     }
 
 
@@ -751,3 +881,105 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
 async def create_user():
     """Create a new user (legacy endpoint)"""
     raise HTTPException(status_code=410, detail="This endpoint is completely deprecated. Account creation is securely handled by Firebase.")
+
+
+# ---------------------------------------------------------------------------
+# Pet preferences
+# ---------------------------------------------------------------------------
+
+VALID_SPECIES: frozenset[str] = frozenset({
+    "owl", "fox", "cat", "dragon", "robot",
+    "star", "phoenix", "crystal", "leaf", "music",
+})
+
+VALID_COLORS: frozenset[str] = frozenset({
+    "ocean", "violet", "mint", "gold", "rose", "coral", "sky", "ember",
+})
+
+
+class PetPreferencesUpdate(BaseModel):
+    pet_name: str | None = None
+    pet_species: str | None = None
+    pet_color: str | None = None
+
+    @field_validator("pet_name")
+    @classmethod
+    def validate_pet_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if len(v) == 0:
+            return None
+        if len(v) > 20:
+            raise ValueError("pet_name must be 20 characters or fewer")
+        return v
+
+    @field_validator("pet_species")
+    @classmethod
+    def validate_pet_species(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_SPECIES:
+            raise ValueError(f"pet_species must be one of {sorted(VALID_SPECIES)}")
+        return v
+
+    @field_validator("pet_color")
+    @classmethod
+    def validate_pet_color(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_COLORS:
+            raise ValueError(f"pet_color must be one of {sorted(VALID_COLORS)}")
+        return v
+
+
+class PetPreferencesResponse(BaseModel):
+    pet_name: str | None = None
+    pet_species: str | None = None
+    pet_color: str | None = None
+
+
+@router.get("/preferences/pet", response_model=PetPreferencesResponse)
+async def get_pet_preferences(
+    current_user: dict = Depends(get_firebase_user),
+) -> PetPreferencesResponse:
+    """Fetch the current user's pet customization preferences."""
+    user_id: str = current_user.get("user_id")
+    user_doc = await users_collection.find_one(
+        {"_id": ObjectId(user_id)},
+        {"preferences.pet": 1},
+    )
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+    pet: dict = user_doc.get("preferences", {}).get("pet", {})
+    return PetPreferencesResponse(
+        pet_name=pet.get("pet_name"),
+        pet_species=pet.get("pet_species"),
+        pet_color=pet.get("pet_color"),
+    )
+
+
+@router.put("/preferences/pet", response_model=PetPreferencesResponse)
+async def update_pet_preferences(
+    body: PetPreferencesUpdate,
+    current_user: dict = Depends(get_firebase_user),
+) -> PetPreferencesResponse:
+    """
+    Partially update the current user's pet preferences.
+
+    Only fields explicitly included in the request body are written to the
+    database — omitting a field never nulls an existing stored value.
+    """
+    user_id: str = current_user.get("user_id")
+
+    update_fields: dict[str, object] = {}
+    for field in body.model_fields_set:
+        update_fields[f"preferences.pet.{field}"] = getattr(body, field)
+
+    if not update_fields:
+        return await get_pet_preferences(current_user=current_user)
+
+    result = await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return await get_pet_preferences(current_user=current_user)

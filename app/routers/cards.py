@@ -53,7 +53,7 @@ async def create_card(
 ):
     logger.info(f"Creating card: {card.title}")
     
-    card_dict = card.dict()
+    card_dict = card.model_dump()
     # Security: Force user_id to be the authenticated user to prevent IDOR
     card_dict["user_id"] = current_user.get("user_id")
     

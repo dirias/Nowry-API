@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.StudyCard import StudyCard
@@ -206,12 +206,12 @@ async def create_study_card(
     logger.info(f"User {user_id} creating study card: {card.title}")
 
     card.user_id = user_id
-    card.created_at = datetime.utcnow()
+    card.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
     card.ease_factor = 2.5
     card.interval = 1
     card.repetitions = 0
 
-    card_dict = card.dict(by_alias=True, exclude={"id"})
+    card_dict = card.model_dump(by_alias=True, exclude={"id"})
     result = await collection.insert_one(card_dict)
     card_id = result.inserted_id
 
@@ -250,9 +250,9 @@ async def get_statistics(
 
         # Only fetch reviewed cards needed for streak, weekly progress, and recent performance.
         # Bounded to last 90 days to avoid loading the full card corpus into memory.
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
 
-        ninety_days_ago = datetime.utcnow() - timedelta(days=90)
+        ninety_days_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
         all_cards = await collection.find(
             {
                 "user_id": user_id,
@@ -264,10 +264,10 @@ async def get_statistics(
         # Get books collection for book stats
         from app.config.database import books_collection
 
-        all_books = await books_collection.find({"user_id": user_id}).to_list(None)
+        all_books = await books_collection.find({"user_id": user_id}).to_list(length=500)
 
         # Calculate weekly progress (last 7 days) - separated by type
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(timezone.utc).replace(tzinfo=None).replace(hour=0, minute=0, second=0, microsecond=0)
         weekly_data = []
 
         for i in range(6, -1, -1):  # Last 7 days (6 days ago to today)
@@ -382,7 +382,7 @@ async def get_statistics(
         new_cards = total_cards - reviewed_count
 
         # Get GLOBAL due cards count (accurate across all cards)
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
         due_today_count = await collection.count_documents({
             "user_id": user_id,
             "deleted_at": None,
@@ -410,6 +410,25 @@ async def get_statistics(
             else:
                 break
 
+        # last_session_struggle: front of the card most recently reviewed
+        # yesterday or today AND with repetitions <= 1 (wrong answer resets
+        # repetitions to 1 in SM-2).  Truncated to 60 chars.
+        yesterday_start = today - timedelta(days=1)
+        struggle_cards = await collection.find(
+            {
+                "user_id": user_id,
+                "deleted_at": None,
+                "last_reviewed": {"$gte": yesterday_start},
+                "repetitions": {"$lte": 1},
+            }
+        ).sort("last_reviewed", -1).to_list(length=50)
+
+        last_session_struggle: Optional[str] = None
+        if struggle_cards:
+            front: str = (struggle_cards[0].get("front") or "").strip()
+            if front:
+                last_session_struggle = front[:60] if len(front) <= 60 else front[:60]
+
         return {
             "weekly_progress": weekly_data,
             "recent_performance": recent_performance,
@@ -419,6 +438,7 @@ async def get_statistics(
                 "new_cards": new_cards,
                 "due_today": due_today_count,
                 "current_streak": streak,
+                "last_session_struggle": last_session_struggle,
             },
         }
 
@@ -479,7 +499,7 @@ async def get_daily_review_cards(
     until they are graded.
     """
     user_id = user.get("user_id")
-    now_dt = datetime.utcnow()
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
     active_decks = await decks_collection.find(
@@ -576,7 +596,7 @@ async def list_study_cards(
 
     due_clause: Optional[dict] = None
     if due_only:
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
         due_clause = {"$or": [
             {"next_review": {"$exists": False}},
             {"next_review": None},
@@ -606,7 +626,7 @@ async def list_study_cards(
             {"_id": ObjectId(deck_id) if (deck_id and ObjectId.is_valid(deck_id)) else None, "deleted_at": None}
         )
         new_cap, review_cap = _get_deck_budget(deck_doc) if deck_doc else (20, 100)
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
         today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
         deck_obj_id = ObjectId(deck_id) if (deck_id and ObjectId.is_valid(deck_id)) else None
@@ -696,7 +716,7 @@ async def update_study_card(
         updates.pop(field, None)
 
     if "last_reviewed" in updates:
-        updates["next_review"] = datetime.utcnow() + timedelta(
+        updates["next_review"] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
             days=existing_card.get("interval", 1)
         )
 
@@ -741,6 +761,7 @@ async def review_card(
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
     collection: Collection = Depends(get_cards_collection),
     card: dict = Depends(require_ownership(get_cards_collection, "id")),
+    user: dict = Depends(get_firebase_user),
 ):
     """
     Review a card and update its SM-2 spaced repetition parameters.
@@ -749,6 +770,7 @@ async def review_card(
     """
     try:
         from app.utils.sm2 import calculate_next_review
+        from app.routers.agent import grant_xp
 
         # Get current SM-2 parameters
         ease_factor = card.get("ease_factor", 2.5)
@@ -783,6 +805,10 @@ async def review_card(
             },
         )
 
+        # Award XP for reviewing a card (fire-and-forget)
+        user_id = user.get("user_id")
+        await grant_xp(user_id, 2)
+
         logger.info(f"Successfully updated card {id}")
 
         return {"message": "Card reviewed successfully", "sm2_data": sm2_result}
@@ -791,3 +817,4 @@ async def review_card(
     except Exception as e:
         logger.error(f"Error reviewing card: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error reviewing card: {str(e)}")
+

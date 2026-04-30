@@ -7,11 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config.database import users_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.config.subscription_plans import SubscriptionTier
+from app.models.common import UserAuthResponse
 
 router = APIRouter(
     prefix="/auth",
@@ -32,7 +33,7 @@ class LoginRequest(BaseModel):
     email: EmailStr
 
 
-@router.post("/register")
+@router.post("/register", response_model=UserAuthResponse)
 async def register_user(
     request: RegisterRequest,
     firebase_user: dict = Depends(get_firebase_user)
@@ -89,8 +90,8 @@ async def register_user(
             "status": "active"
         },
         "wizard_completed": False,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc)
     }
     
     result = await users_collection.insert_one(user_doc)
@@ -106,7 +107,7 @@ async def register_user(
     }
 
 
-@router.post("/login")
+@router.post("/login", response_model=UserAuthResponse)
 async def login_user(
     request: LoginRequest,
     firebase_user: dict = Depends(get_firebase_user)

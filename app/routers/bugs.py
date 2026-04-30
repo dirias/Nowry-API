@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 
 from app.models.Bug import (
@@ -9,6 +9,7 @@ from app.models.Bug import (
     BugReportResponse,
     BugStatusUpdate,
 )
+from app.models.common import BugStatsResponse, BugStatusUpdateResponse, MessageResponse
 from app.config.database import bugs_collection, users_collection
 from app.auth.firebase_auth import get_firebase_user
 
@@ -56,13 +57,13 @@ async def submit_bug_report(
         "severity": bug_data.severity,
         "category": bug_data.category,
         "url": bug_data.url,
-        "browser_info": bug_data.browser_info.dict(),
-        "screenshots": [s.dict() for s in bug_data.screenshots],
+        "browser_info": bug_data.browser_info.model_dump(),
+        "screenshots": [s.model_dump() for s in bug_data.screenshots],
         "status": "open",
         "priority": None,
         "tags": [],
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
         "resolved_at": None,
     }
 
@@ -146,7 +147,7 @@ async def get_all_bugs(
     return bugs
 
 
-@router.get("/stats", response_model=dict)
+@router.get("/stats", response_model=BugStatsResponse)
 async def get_bug_stats(current_user=Depends(get_firebase_user)):
     """
     Get bug statistics (Dev only).
@@ -226,7 +227,7 @@ async def get_bug_by_id(
     return bug
 
 
-@router.delete("/{bug_id}")
+@router.delete("/{bug_id}", response_model=MessageResponse)
 async def delete_bug_report(
     bug_id: str, current_user=Depends(get_firebase_user)
 ):
@@ -263,7 +264,7 @@ async def delete_bug_report(
     return {"message": "Bug report deleted successfully"}
 
 
-@router.patch("/{bug_id}/status", response_model=dict)
+@router.patch("/{bug_id}/status", response_model=BugStatusUpdateResponse)
 async def update_bug_status(
     bug_id: str,
     status_update: BugStatusUpdate,
@@ -298,7 +299,7 @@ async def update_bug_status(
         )
 
     # Prepare update data
-    update_data = {"status": status_update.status, "updated_at": datetime.utcnow()}
+    update_data = {"status": status_update.status, "updated_at": datetime.now(timezone.utc)}
 
     if status_update.priority:
         update_data["priority"] = status_update.priority
@@ -307,7 +308,7 @@ async def update_bug_status(
         update_data["dev_notes"] = status_update.notes
 
     if status_update.status == "resolved":
-        update_data["resolved_at"] = datetime.utcnow()
+        update_data["resolved_at"] = datetime.now(timezone.utc)
 
     # Update bug
     await bugs_collection.update_one({"_id": ObjectId(bug_id)}, {"$set": update_data})

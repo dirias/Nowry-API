@@ -322,9 +322,9 @@ async def publish_book(
         content_type="book",
         content_id=book_id,
         user_id=current_user["user_id"],
-        public_metadata=publish_data.dict()
+        public_metadata=publish_data.model_dump()
     )
-    
+
     return {
         "message": "Book published successfully",
         "book": result
@@ -346,9 +346,9 @@ async def publish_deck(
         content_type="deck",
         content_id=deck_id,
         user_id=current_user["user_id"],
-        public_metadata=publish_data.dict()
+        public_metadata=publish_data.model_dump()
     )
-    
+
     return {
         "message": "Deck published successfully",
         "deck": result

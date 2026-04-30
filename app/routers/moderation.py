@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional, Literal
 from pydantic import BaseModel
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config.database import db
 from app.models.PublicContent import ContentReport
@@ -86,7 +86,7 @@ async def report_content(
         status="pending"
     )
     
-    result = await db["content_reports"].insert_one(report.dict(by_alias=True))
+    result = await db["content_reports"].insert_one(report.model_dump(by_alias=True))
     
     # TODO: Send notification to moderators/admin
     # await notify_moderators(report_id=str(result.inserted_id))
@@ -202,10 +202,10 @@ async def review_report(
     update_data = {
         "status": "resolved",
         "reviewed_by": current_user["uid"],
-        "reviewed_at": datetime.utcnow(),
+        "reviewed_at": datetime.now(timezone.utc),
         "action_taken": review_data.action_taken,
         "resolution_notes": review_data.resolution_notes,
-        "updated_at": datetime.utcnow()
+        "updated_at": datetime.now(timezone.utc)
     }
     
     await db["content_reports"].update_one(
@@ -221,7 +221,7 @@ async def review_report(
             {
                 "$set": {
                     "is_public": False,
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now(timezone.utc)
                 }
             }
         )
@@ -268,7 +268,7 @@ async def remove_public_content(
         {
             "$set": {
                 "is_public": False,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.now(timezone.utc)
             }
         }
     )

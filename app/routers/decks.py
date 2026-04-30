@@ -57,10 +57,10 @@ async def create_deck(
     logger.info(f"User {user.get('user_id')} is creating new deck: {deck.name}")
 
     deck.user_id = user.get("user_id")
-    deck.created_at = datetime.utcnow()
-    deck.updated_at = datetime.utcnow()
+    deck.created_at = datetime.now(timezone.utc)
+    deck.updated_at = datetime.now(timezone.utc)
 
-    deck_dict = deck.dict(by_alias=True, exclude={"id"})
+    deck_dict = deck.model_dump(by_alias=True, exclude={"id"})
     result = await collection.insert_one(deck_dict)
 
     if not result.inserted_id:
@@ -90,7 +90,7 @@ async def list_decks(
     cursor = collection.find({"user_id": user_id, "deleted_at": None})
     decks = await cursor.to_list(length=100)
 
-    now_dt = datetime.utcnow()
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
 
     for d in decks:
         d["_id"] = str(d["_id"])
@@ -109,7 +109,8 @@ async def list_decks(
         mastery = 0
         last_studied = None
         is_due_soon = False
-        
+        hours_until_due = None
+
         try:
             deck_oid = ObjectId(deck_id_str)
             # $in matches both ObjectId and string-stored deck_ids (mixed legacy data)
@@ -262,7 +263,7 @@ async def update_deck(
     existing_deck: dict = Depends(require_ownership(get_decks_collection, "id")),
 ):
 
-    updates["updated_at"] = datetime.utcnow()
+    updates["updated_at"] = datetime.now(timezone.utc)
 
     # Do not allow updating internal or immutable fields.
     # forked_from is permanently set at fork time and must never be overwritten.
@@ -293,7 +294,7 @@ async def delete_deck(
     from bson import ObjectId
     user_id = existing_deck.get("user_id")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     
     soft_delete_update = {
         "$set": {
@@ -422,7 +423,7 @@ async def update_deck_config(
 
     await decks_collection.update_one(
         {"_id": deck_oid},
-        {"$set": {"config": config_doc, "updated_at": datetime.utcnow()}},
+        {"$set": {"config": config_doc, "updated_at": datetime.now(timezone.utc)}},
     )
 
     deck_filter = {"deck_id": {"$in": [deck_oid, str(deck_oid)]}, "deleted_at": None}
@@ -516,7 +517,7 @@ async def update_deck_settings(
 ) -> DeckSettingsResponse:
     obj_id = ObjectId(deck["_id"])
 
-    set_doc: dict = {"updated_at": datetime.utcnow()}
+    set_doc: dict = {"updated_at": datetime.now(timezone.utc)}
 
     if body.voice_settings is not None:
         set_doc["voice_settings"] = body.voice_settings.model_dump()
@@ -527,7 +528,7 @@ async def update_deck_settings(
     if body.is_public is not None:
         set_doc["is_public"] = body.is_public
         if body.is_public and not deck.get("published_at"):
-            set_doc["published_at"] = datetime.utcnow()
+            set_doc["published_at"] = datetime.now(timezone.utc)
 
     if body.public_metadata is not None:
         # Build the incoming payload, stripping any forked_from key the caller

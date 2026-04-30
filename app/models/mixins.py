@@ -2,7 +2,7 @@
 Mixins for model functionality
 """
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import Field
 
 
@@ -42,9 +42,9 @@ class SoftDeleteMixin:
         """
         return {
             "$set": {
-                "deleted_at": datetime.utcnow(),
+                "deleted_at": datetime.now(timezone.utc),
                 "deleted_by": user_id,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.now(timezone.utc)
             }
         }
     
@@ -59,7 +59,7 @@ class SoftDeleteMixin:
             "$set": {
                 "deleted_at": None,
                 "deleted_by": None,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.now(timezone.utc)
             }
         }
     
