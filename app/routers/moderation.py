@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from app.config.database import db
 from app.models.PublicContent import ContentReport
 from app.auth.firebase_auth import get_current_user
+from app.auth.dependencies import require_admin
 
 router = APIRouter(prefix="/moderation", tags=["Content Moderation"])
 
@@ -141,16 +142,11 @@ async def get_all_reports(
     content_type: Optional[Literal["book", "deck", "card"]] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """
     Get all content reports (Admin only).
-    
-    TODO: Add admin role check
     """
-    # TODO: Verify user is admin/moderator
-    # if not current_user.get("is_admin"):
-    #     raise HTTPException(status_code=403, detail="Admin access required")
     
     query = {}
     
@@ -181,16 +177,11 @@ async def get_all_reports(
 async def review_report(
     report_id: str,
     review_data: ReviewReportRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """
     Review and resolve a content report (Admin only).
-    
-    TODO: Add admin role check
     """
-    # TODO: Verify user is admin/moderator
-    # if not current_user.get("is_admin"):
-    #     raise HTTPException(status_code=403, detail="Admin access required")
     
     # Get report
     report = await db["content_reports"].find_one({"_id": ObjectId(report_id)})
@@ -240,17 +231,12 @@ async def remove_public_content(
     content_type: Literal["book", "deck"],
     content_id: str,
     reason: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """
     Remove content from public access (Admin only).
     Makes content private and notifies creator.
-    
-    TODO: Add admin role check
     """
-    # TODO: Verify user is admin/moderator
-    # if not current_user.get("is_admin"):
-    #     raise HTTPException(status_code=403, detail="Admin access required")
     
     collection = db[f"{content_type}s"]
     
