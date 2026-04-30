@@ -294,8 +294,10 @@ def _build_context_injection(
             text_block = f"\n\nRelevant book content:\n{book_text}"
         return (
             f"\n\nCURRENT SCREEN CONTEXT:\n"
-            f"The user is reading '{ctx.book_title or 'a book'}'{chapter}.{text_block}\n"
-            f"Answer questions based on the provided book content when relevant.\n"
+            f"The user is reading '{ctx.book_title or 'a book'}' (book_id: {ctx.book_id}){chapter}.{text_block}\n"
+            f"Use the book content above as your primary context for questions about this topic. "
+            f"If the answer is not fully covered in the excerpt, supplement with your general knowledge — never say 'it's not in the book'. "
+            f"Always be helpful and educational.\n"
         )
 
     elif ctx.page == 'annual_planning':
@@ -1173,13 +1175,22 @@ KNOWLEDGE_TOOLS = [
             ),
             genai.protos.FunctionDeclaration(
                 name="read_book_section",
-                description="Read a section of a specific book from the user's library. Call this when the user wants to discuss content, get a summary, or ask questions about a specific book.",
+                description=(
+                    "Read a section of a specific book from the user's library. "
+                    "PREREQUISITE: book_id is REQUIRED and must be a MongoDB ObjectId hex string — NEVER the book title. "
+                    "If CURRENT SCREEN CONTEXT contains an 'Active book ID', use that value directly. "
+                    "If no book_id is available in context, call list_books first to obtain the correct ID, then retry."
+                ),
                 parameters=genai.protos.Schema(
                     type=genai.protos.Type.OBJECT,
                     properties={
                         "book_id": genai.protos.Schema(
                             type=genai.protos.Type.STRING,
-                            description="The ID of the book to read from."
+                            description=(
+                                "The MongoDB ObjectId of the book (a 24-character hex string). "
+                                "REQUIRED — use the 'Active book ID' from CURRENT SCREEN CONTEXT when available. "
+                                "NEVER use the book title as the book_id."
+                            )
                         ),
                         "query": genai.protos.Schema(
                             type=genai.protos.Type.STRING,
@@ -1232,11 +1243,16 @@ async def _dispatch_tool_call(fn_name: str, fn_args: dict, user_id: str) -> str:
         elif fn_name == "list_books":
             result = await list_books(user_id)
         elif fn_name == "read_book_section":
-            result = await read_book_section(
-                user_id,
-                fn_args.get("book_id", ""),
-                fn_args.get("query", ""),
-            )
+            book_id_arg = fn_args.get("book_id", "").strip()
+            if not book_id_arg or len(book_id_arg) != 24 or not all(c in "0123456789abcdefABCDEF" for c in book_id_arg):
+                logger.warning(f"[Tool] read_book_section called with invalid book_id='{book_id_arg}' — likely a title, not an ObjectId")
+                result = json.dumps({"error": "book_id must be a 24-character MongoDB ObjectId hex string, not a book title. Call list_books first to get the correct book_id, then retry read_book_section."})
+            else:
+                result = await read_book_section(
+                    user_id,
+                    book_id_arg,
+                    fn_args.get("query", ""),
+                )
         elif fn_name == "get_annual_plan_context":
             result = await get_annual_plan_context(user_id)
         elif fn_name == "get_user_interests":
