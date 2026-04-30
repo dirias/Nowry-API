@@ -7,7 +7,6 @@ load_dotenv()
 # Initialize Sentry BEFORE FastAPI app creation — gated on env var presence
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
-from sentry_sdk.integrations.asgi import AsgiIntegration
 
 _SENTRY_DSN = os.getenv("SENTRY_DSN")
 if _SENTRY_DSN:
@@ -15,7 +14,6 @@ if _SENTRY_DSN:
         dsn=_SENTRY_DSN,
         integrations=[
             FastApiIntegration(),
-            AsgiIntegration(),
         ],
         traces_sample_rate=0.1 if os.getenv("ENVIRONMENT") == "production" else 1.0,
         environment=os.getenv("ENVIRONMENT", "development"),
