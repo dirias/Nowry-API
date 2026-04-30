@@ -1,0 +1,73 @@
+# Backend Deploy — Nowry FastAPI
+#
+# Triggers on push to main. Runs validation (pip install, lint, type check) before
+# Railway's GitHub integration automatically deploys to production.
+#
+# Required GitHub Secrets (Settings → Secrets and Variables → Actions):
+#   RAILWAY_TOKEN  — Railway API token (only needed if NOT using Railway GitHub integration)
+#
+# Runtime environment variables (set in Railway dashboard → Variables, NOT here):
+#   SENTRY_DSN        — Sentry backend DSN (from Sentry project settings)
+#   MONGODB_URI       — MongoDB connection string
+#   FIREBASE_*        — Firebase Admin SDK credentials
+#
+# Deployment note: If Railway GitHub integration is configured (recommended),
+# Railway auto-deploys when code is pushed to main — no additional step needed.
+# If not configured, uncomment the deploy job below and set RAILWAY_TOKEN secret.
+
+name: Backend Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (flake8 — critical errors only)
+        run: |
+          pip install flake8
+          # E9: Runtime errors (syntax, indentation)
+          # F63: Invalid star imports
+          # F7: Syntax errors in function signatures
+          # F82: Undefined names
+          flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        continue-on-error: true  # Lint warnings do not block deployment
+
+      - name: Type check (mypy)
+        run: |
+          pip install mypy
+          mypy app/ --ignore-missing-imports
+        continue-on-error: true  # Type check warnings are advisory in Phase 1
+
+  # Railway deployment is automatic via GitHub integration.
+  # Uncomment this job only if Railway GitHub integration is NOT configured:
+  # deploy:
+  #   name: Deploy to Railway
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   environment: production
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Deploy to Railway (production)
+  #       run: npx --yes @railway/cli@latest up --service nowry-api --detach
+  #       env:
+  #         RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
