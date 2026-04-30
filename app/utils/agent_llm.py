@@ -216,12 +216,14 @@ class AgentLLM:
         while rounds < MAX_ROUNDS:
             try:
                 # Groq completion
-                completion = self.groq_client.chat.completions.create(
-                    model=self.groq_model,
-                    messages=messages,
-                    tools=openai_tools,
-                    tool_choice="auto" if openai_tools else None
-                )
+                completion_kwargs = {
+                    "model": self.groq_model,
+                    "messages": messages,
+                }
+                if openai_tools:
+                    completion_kwargs["tools"] = openai_tools
+                    completion_kwargs["tool_choice"] = "auto"
+                completion = self.groq_client.chat.completions.create(**completion_kwargs)
             except Exception as e:
                 logger.error(f"Groq API Error: {e}")
                 # Optional: try fallback to Gemini here?
