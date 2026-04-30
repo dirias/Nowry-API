@@ -13,6 +13,9 @@ import base64
 import secrets
 import asyncio
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, validator
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 from app.models.User import User
 from app.models.common import (
@@ -329,7 +332,7 @@ async def get_user_stats(user_id: str) -> dict:
             "ai_generations_month": 0,  # TODO: Track monthly AI usage
         }
     except Exception as e:
-        print(f"Error calculating user stats: {e}")
+        logger.error(f"Error calculating user stats: {e}", exc_info=True)
         # Return default zero stats on error
         return {
             "total_cards": 0,

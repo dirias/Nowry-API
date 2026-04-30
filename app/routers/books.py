@@ -7,6 +7,9 @@ from app.models.Book import Book, BookSummary
 from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 router = APIRouter(
     prefix="/book",
@@ -62,31 +65,24 @@ async def create_book(
             )
     # --------------------------------
     
-    print(f"[DEBUG CREATE] Attempting to insert book: {book.title}")
+    logger.info(f"Creating book: {book.title}")
     # Exclude _id to let MongoDB generate it as ObjectId
     book_dict = book.model_dump(by_alias=True, exclude={'id'})
-    print(f"[DEBUG CREATE] Book dict keys: {book_dict.keys()}")
-    
+
     new_book = await books_collection.insert_one(book_dict)
     book_id = str(new_book.inserted_id)
-    print(f"[DEBUG CREATE] Book inserted with ID: {book_id}")
-    print(f"[DEBUG CREATE] Insert result acknowledged: {new_book.acknowledged}")
-    
-    print(f"[DEBUG CREATE] Insert result acknowledged: {new_book.acknowledged}")
-    
+    logger.info(f"Book inserted with ID: {book_id}")
+
     # We no longer create a "first page" as the book uses full_content now.
-    
+
     # Fetch and return the created book
-    print(f"[DEBUG CREATE] Fetching created book from database...")
     created_book = await books_collection.find_one({"_id": new_book.inserted_id})
-    print(f"[DEBUG CREATE] Created book found in DB: {created_book is not None}")
-    
+
     if created_book:
         created_book["_id"] = str(created_book["_id"])
-        print(f"[DEBUG CREATE] Returning book: {created_book['_id']}")
         return created_book
-    
-    print(f"[DEBUG CREATE] ERROR: Book was inserted but not found in database!")
+
+    logger.error(f"Book was inserted (ID: {book_id}) but not found in database after insert")
     raise HTTPException(status_code=500, detail="Failed to create book")
 
 
@@ -170,11 +166,11 @@ async def delete_book(
         )
         
         if result.modified_count > 0:
-            print(f"[DEBUG DELETE] Book soft-deleted successfully: {book_id}")
+            logger.info(f"Book soft-deleted successfully: {book_id}")
             return {"message": "Book deleted successfully"}
-        
+
     except Exception as e:
-        print(f"[DEBUG DELETE] Error: {e}")
+        logger.error(f"Error soft-deleting book {book_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error deleting book")
     
     raise HTTPException(status_code=404, detail="Book not found")
@@ -208,8 +204,8 @@ async def get_all_books(
     
     # Debug: Check total books for this user (including deleted)
     total_count = await books_collection.count_documents({"user_id": user_id})
-    print(f"[DEBUG GET_ALL] Total books for user {user_id}: {total_count}")
-    
+    logger.debug(f"Total books for user {user_id}: {total_count}")
+
     # Retrieve all books for the current user that are NOT soft-deleted
     # Exclude full_content significantly improves performance for large documents
     cursor = books_collection.find(
@@ -220,10 +216,8 @@ async def get_all_books(
         {"full_content": 0}
     )
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
-    
-    print(f"[DEBUG GET_ALL] Non-deleted books: {len(books)}")
+
     for book in books:
-        print(f"[DEBUG GET_ALL] - Book: {book.get('_id')} | Title: {book.get('title')} | deleted_at: {book.get('deleted_at')}")
         book["_id"] = str(book["_id"])
     
     return books
@@ -342,9 +336,9 @@ async def import_book_from_file(
     try:
         lexical_json = html_to_lexical_json(combined_html)
         full_content = json.dumps(lexical_json)
-        print(f"✓ Converted import to JSON format: {len(lexical_json['root']['children'])} blocks")
+        logger.info(f"Converted import to JSON format: {len(lexical_json['root']['children'])} blocks")
     except Exception as e:
-        print(f"⚠ HTML conversion failed, using simple fallback: {e}")
+        logger.warning(f"HTML conversion failed, using simple fallback: {e}")
         from app.utils.html_to_lexical import simple_html_to_lexical
         lexical_json = simple_html_to_lexical(combined_html)
         full_content = json.dumps(lexical_json)
