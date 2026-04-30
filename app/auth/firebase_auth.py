@@ -100,11 +100,14 @@ async def get_firebase_user(request: Request) -> dict:
         if user:
             token_data["user_id"] = str(user["_id"])
         else:
-            # Should not happen for registered users, but handle gracefully
-            token_data["user_id"] = None
-        
-        # Add uid alias for compatibility
-        token_data["uid"] = token_data.get("firebase_uid") or token_data.get("user_id")
+            raise HTTPException(
+                status_code=401,
+                detail="User profile not found"
+            )
+
+        # uid is an alias for firebase_uid (Firebase authentication identifier only)
+        # NEVER use uid for MongoDB storage — always use user_id (MongoDB ObjectId string)
+        token_data["uid"] = token_data.get("firebase_uid")
             
         # Cache the validated token AFTER MongoDB data is fully joined
         _cache_token(token, token_data)
