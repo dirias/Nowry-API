@@ -129,4 +129,35 @@ async def create_indexes():
     )
     await study_sessions_collection.create_index("session_type")
 
+    # ── Soft-delete TTL indexes (30-day retention) ──────────────────────────
+    _RETENTION_SECONDS = 2592000  # 30 days: 60 * 60 * 24 * 30
+
+    _collection_ttl_map = [
+        ("books",         books_collection),
+        ("decks",         decks_collection),
+        ("cards",         cards_collection),
+        ("tasks",         tasks_collection),
+        ("annual_plans",  annual_plans_collection),
+        ("goals",         goals_collection),
+    ]
+
+    for collection_name, collection in _collection_ttl_map:
+        existing_indexes = await collection.index_information()
+        if "soft_delete_ttl" in existing_indexes:
+            current_ttl = existing_indexes["soft_delete_ttl"].get("expireAfterSeconds")
+            if current_ttl != _RETENTION_SECONDS:
+                await db.command(
+                    "collMod",
+                    collection_name,
+                    index={"name": "soft_delete_ttl", "expireAfterSeconds": _RETENTION_SECONDS},
+                )
+        else:
+            await collection.create_index(
+                "deleted_at",
+                expireAfterSeconds=_RETENTION_SECONDS,
+                sparse=True,   # CRITICAL: only index soft-deleted docs (deleted_at != null)
+                name="soft_delete_ttl",
+            )
+
+    logger.info("Soft-delete TTL indexes verified for all content collections.")
     logger.info("Database indexes created successfully.")
