@@ -772,18 +772,19 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     """
     Soft delete user account and all associated data.
     Data can be recovered within 30 days before permanent deletion.
+
+    Order per D-08: MongoDB soft-deletes are committed FIRST, then Firebase
+    credentials are revoked. Firebase deletion failure is caught and logged
+    (MongoDB is source of truth).
     """
-    from datetime import datetime, timedelta, timezone
     from app.config.database import (
-        annual_plans_collection,
-        focus_areas_collection,
         priorities_collection,
-        goals_collection,
         activities_collection,
         daily_routines_collection,
     )
-    
+
     user_id = current_user.get("user_id")
+    firebase_uid: str = current_user.get("firebase_uid", "")
     now = datetime.now(timezone.utc)
     
     # 1. Soft delete user account
@@ -874,16 +875,37 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
                     soft_delete_update
                 )
     
+    # Tasks
+    await tasks_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        soft_delete_update
+    )
+
     # Daily Routines
     await daily_routines_collection.update_many(
         {"user_id": user_id, "deleted_at": None},
         soft_delete_update
     )
-    
-    return {
-        "message": "Account deleted successfully. Data can be recovered within 30 days by contacting support.",
-        "recovery_deadline": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-    }
+
+    # 3. Revoke Firebase credentials AFTER all MongoDB soft-deletes (D-08)
+    if firebase_uid:
+        try:
+            from firebase_admin import auth as firebase_auth_sdk
+            firebase_auth_sdk.delete_user(firebase_uid)
+        except Exception as exc:
+            # MongoDB is source of truth — log but do not surface Firebase errors.
+            # Account is already soft-deleted; user cannot authenticate again once
+            # the token cache expires.
+            logger.error(
+                "Failed to delete Firebase user %s after MongoDB soft-delete: %s",
+                firebase_uid,
+                exc,
+            )
+
+    return AccountDeleteResponse(
+        message="Account deleted successfully. Your data will be retained for 30 days before permanent removal.",
+        recovery_deadline=(now + timedelta(days=30)).isoformat(),
+    )
 
 
 @router.post("/create_user")
