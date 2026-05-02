@@ -47,6 +47,17 @@ class AccountDeleteResponse(BaseModel):
     recovery_deadline: str
 
 
+class DataExportResponse(BaseModel):
+    """Response structure for GET /users/export.
+
+    Note: The actual export endpoint returns a JSONResponse directly
+    (for Content-Disposition header support). This model documents the structure.
+    """
+    exported_at: str
+    user_email: str
+    record_counts: Dict[str, int]
+
+
 class UserAuthResponse(BaseModel):
     """Response returned by the /register and /login auth endpoints."""
     message: str
