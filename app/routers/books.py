@@ -139,7 +139,7 @@ async def edit_book(
     raise HTTPException(status_code=500, detail="Error fetching updated book")
 
 
-@router.delete("/delete/{book_id}", summary="Soft delete a book by ID")
+@router.delete("/delete/{book_id}", summary="Soft delete a book by ID", status_code=204)
 async def delete_book(
     book_id: str,
     books_collection: Collection = Depends(get_books_collection),
@@ -149,30 +149,30 @@ async def delete_book(
     Soft delete a book (sets deleted_at timestamp).
     Also auto-unpublishes if the book was public.
     """
-    from datetime import datetime, timezone
-    
+    now = datetime.now(timezone.utc)
+
     try:
         # Soft delete + auto-unpublish
         result = await books_collection.update_one(
             {"_id": ObjectId(book["_id"]) if len(book["_id"]) == 24 else book["_id"]},
             {
                 "$set": {
-                    "deleted_at": datetime.now(timezone.utc),
+                    "deleted_at": now,
                     "deleted_by": book.get("user_id"),
                     "is_public": False,  # Auto-unpublish
-                    "updated_at": datetime.now(timezone.utc)
+                    "updated_at": now
                 }
             }
         )
-        
+
         if result.modified_count > 0:
             logger.info(f"Book soft-deleted successfully: {book_id}")
-            return {"message": "Book deleted successfully"}
+            return None
 
     except Exception as e:
         logger.error(f"Error soft-deleting book {book_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error deleting book")
-    
+
     raise HTTPException(status_code=404, detail="Book not found")
 
 
