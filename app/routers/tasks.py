@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.Task import Task
-from app.models.common import MessageResponse
 from app.config.database import db
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
@@ -60,7 +59,7 @@ async def list_tasks(
     logger.info(f"Listing tasks for user: {user_id}")
 
     # Build query
-    query = {"user_id": user_id}
+    query = {"user_id": user_id, "deleted_at": None}
     if completed is not None:
         query["is_completed"] = completed
     if category:
@@ -130,7 +129,7 @@ async def update_task(
 
 
 
-@router.delete("/{id}", summary="Delete a task", response_model=MessageResponse)
+@router.delete("/{id}", summary="Delete a task", status_code=204)
 async def delete_task(
     id: str,
     collection: Collection = Depends(get_tasks_collection),
@@ -138,5 +137,17 @@ async def delete_task(
 ):
     logger.info(f"Deleting task {id}")
 
-    await collection.delete_one({"_id": ObjectId(id)})
-    return {"message": "Task deleted successfully"}
+    user_id = task.get("user_id")
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    await collection.update_one(
+        {"_id": ObjectId(task["_id"])},
+        soft_delete_update,
+    )
+    return None
