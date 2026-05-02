@@ -4,6 +4,7 @@ Handles user profile management, settings, and preferences
 """
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
 from pymongo.collection import Collection
 from bson import ObjectId
 from datetime import datetime, timedelta, timezone
@@ -23,12 +24,17 @@ from app.models.common import (
     AvatarUploadResponse,
     TwoFactorEnableResponse,
     AccountDeleteResponse,
+    DataExportResponse,
 )
 from app.config.database import (
     users_collection,
     study_cards_collection,
     books_collection,
     decks_collection,
+    tasks_collection,
+    annual_plans_collection,
+    focus_areas_collection,
+    goals_collection,
 )
 from app.auth.firebase_auth import get_firebase_user
 
@@ -986,3 +992,110 @@ async def update_pet_preferences(
         raise HTTPException(status_code=404, detail="User not found")
 
     return await get_pet_preferences(current_user=current_user)
+
+
+# ---------------------------------------------------------------------------
+# Data export helper
+# ---------------------------------------------------------------------------
+
+def _serialize_doc(doc: dict) -> dict:
+    """Convert a MongoDB document to a JSON-serializable dict.
+
+    Handles ObjectId → str, datetime → ISO string, and nested structures.
+    """
+    result = {}
+    for key, value in doc.items():
+        if type(value).__name__ == "ObjectId":
+            result[key] = str(value)
+        elif hasattr(value, "isoformat"):  # datetime / date
+            result[key] = value.isoformat()
+        elif isinstance(value, dict):
+            result[key] = _serialize_doc(value)
+        elif isinstance(value, list):
+            result[key] = [
+                _serialize_doc(v) if isinstance(v, dict)
+                else str(v) if type(v).__name__ == "ObjectId"
+                else v
+                for v in value
+            ]
+        else:
+            result[key] = value
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GDPR export endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/export", summary="Export all user data as JSON download")
+async def export_user_data(
+    current_user: dict = Depends(get_firebase_user),
+) -> None:
+    """
+    Export all user content as a downloadable JSON file.
+
+    Includes: books, decks, cards, tasks, annual plans, goals.
+    Does NOT include session history or quiz records (out of scope per D-13).
+    All queries filter deleted_at=None (export only active content).
+    Queries run in parallel via asyncio.gather for fast response times.
+    """
+    user_id: str = current_user.get("user_id")
+    user_email: str = current_user.get("email", "")
+
+    # Parallel fetch from 5 directly user_id-indexed collections
+    books_coro = books_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=10000)
+
+    decks_coro = decks_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=10000)
+
+    cards_coro = study_cards_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=50000)
+
+    tasks_coro = tasks_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=10000)
+
+    plans_coro = annual_plans_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=100)
+
+    books, decks, cards, tasks, plans = await asyncio.gather(
+        books_coro, decks_coro, cards_coro, tasks_coro, plans_coro
+    )
+
+    # Goals are linked via focus_areas (not directly by user_id)
+    # Fetch focus areas for this user's plans, then goals for those focus areas
+    goals: list = []
+    if plans:
+        plan_ids = [str(p["_id"]) for p in plans]
+        focus_areas = await focus_areas_collection.find(
+            {"annual_plan_id": {"$in": plan_ids}, "deleted_at": None}
+        ).to_list(length=1000)
+        if focus_areas:
+            focus_area_ids = [str(fa["_id"]) for fa in focus_areas]
+            goals = await goals_collection.find(
+                {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None}
+            ).to_list(length=5000)
+
+    now = datetime.now(timezone.utc)
+    filename = f"nowry_export_{now.strftime('%Y%m%d_%H%M%S')}.json"
+
+    export_data = {
+        "exported_at": now.isoformat(),
+        "user_email": user_email,
+        "books": [_serialize_doc(d) for d in books],
+        "decks": [_serialize_doc(d) for d in decks],
+        "cards": [_serialize_doc(d) for d in cards],
+        "tasks": [_serialize_doc(d) for d in tasks],
+        "annual_plans": [_serialize_doc(d) for d in plans],
+        "goals": [_serialize_doc(d) for d in goals],
+    }
+
+    return JSONResponse(
+        content=export_data,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
