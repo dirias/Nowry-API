@@ -751,7 +751,19 @@ async def delete_study_card(
             {"$inc": {"total_cards": -1}, "$pull": {"cards": ObjectId(id)}},
         )
 
-    await collection.delete_one({"_id": ObjectId(id)})
+    now = datetime.now(timezone.utc)
+    user_id = existing_card.get("user_id")
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    await collection.update_one(
+        {"_id": ObjectId(existing_card["_id"])},
+        soft_delete_update,
+    )
     return None
 
 
