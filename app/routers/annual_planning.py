@@ -163,11 +163,11 @@ async def get_annual_plan(
     year: int = datetime.now().year
 ):
     user_id = current_user.get("user_id")
-    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year})
-    
+    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
+
     if not plan:
         raise HTTPException(status_code=404, detail="No annual plan found for this year")
-    
+
     return plan
 
 
@@ -189,7 +189,7 @@ async def get_full_annual_plan(
     import asyncio
 
     user_id = current_user.get("user_id")
-    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year})
+    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
 
     if not plan:
         raise HTTPException(status_code=404, detail="No annual plan found for this year")
@@ -197,15 +197,15 @@ async def get_full_annual_plan(
     plan_id = str(plan["_id"])
 
     # Level 2: focus areas, priorities, and quarter reports in parallel
-    areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id}).to_list(length=10)
-    priorities_coro = priorities_collection.find({"annual_plan_id": plan_id}).to_list(length=50)
+    areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
+    priorities_coro = priorities_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=50)
     reports_coro = quarter_reports_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
-    
+
     areas, priorities, reports = await asyncio.gather(areas_coro, priorities_coro, reports_coro)
 
     # Level 3: goals for every area — all in parallel
     goal_lists = await asyncio.gather(
-        *[goals_collection.find({"focus_area_id": str(area["_id"])}).to_list(length=100) for area in areas]
+        *[goals_collection.find({"focus_area_id": str(area["_id"]), "deleted_at": None}).to_list(length=100) for area in areas]
     )
 
     # Attach goals to each area and build flat goals list
@@ -221,7 +221,7 @@ async def get_full_annual_plan(
     # Level 4: activities for all goals
     all_activities = []
     if goal_ids:
-        all_activities = await activities_collection.find({"goal_id": {"$in": goal_ids}}).to_list(length=500)
+        all_activities = await activities_collection.find({"goal_id": {"$in": goal_ids}, "deleted_at": None}).to_list(length=500)
 
     def serialize(doc):
         """Convert ObjectId and other non-serializable types to strings."""
@@ -366,6 +366,69 @@ async def update_annual_plan_by_id(
     )
     
     return await annual_plans_collection.find_one({"_id": id})
+
+
+@router.delete("/{id}", response_model=MessageResponse)
+async def delete_annual_plan(
+    id: str,
+    current_user: dict = Depends(get_firebase_user),
+):
+    """
+    Soft delete an annual plan and cascade to all related focus areas, goals,
+    activities, and priorities. All data will be recoverable within 30 days.
+    """
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(id, user_id)
+
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+
+    # 1. Soft-delete the plan itself
+    await annual_plans_collection.update_one({"_id": obj_id}, soft_delete_update)
+
+    # 2. CASCADE: Soft-delete all focus areas belonging to this plan
+    await focus_areas_collection.update_many(
+        {"annual_plan_id": id, "deleted_at": None},
+        soft_delete_update,
+    )
+
+    # 3. Get focus_area IDs to cascade further (include already-deleted ones for completeness)
+    focus_area_ids = [
+        str(fa["_id"])
+        for fa in await focus_areas_collection.find(
+            {"annual_plan_id": id}
+        ).to_list(length=1000)
+    ]
+
+    if focus_area_ids:
+        # 4. CASCADE: Soft-delete all goals linked to these focus areas
+        await goals_collection.update_many(
+            {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None},
+            soft_delete_update,
+        )
+        # 5. CASCADE: Soft-delete all activities linked to these focus areas
+        await activities_collection.update_many(
+            {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None},
+            soft_delete_update,
+        )
+        # 6. CASCADE: Soft-delete all priorities linked to these focus areas
+        await priorities_collection.update_many(
+            {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None},
+            soft_delete_update,
+        )
+
+    return {"message": "Annual plan and all related data deleted successfully"}
 
 
 # --- Quarter Reports ---
@@ -562,7 +625,7 @@ async def get_focus_areas(
 ):
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(annual_plan_id, user_id)
-    areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=10)
+    areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id, "deleted_at": None}).to_list(length=10)
     return areas
 
 @router.post("/focus-areas", response_model=FocusArea)
@@ -680,7 +743,7 @@ async def get_priorities(
 ):
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(annual_plan_id, user_id)
-    priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=50)
+    priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id, "deleted_at": None}).to_list(length=50)
     return priorities
 
 @router.post("/priorities", response_model=Priority)
@@ -758,19 +821,30 @@ async def update_priority(
 
 @router.delete("/priorities/{id}", response_model=MessageResponse)
 async def delete_priority(id: str, current_user: dict = Depends(get_firebase_user)):
+    user_id = current_user.get("user_id")
+    await verify_priority_ownership(id, user_id)
+
     try:
         obj_id = ObjectId(id)
-        result = await priorities_collection.delete_one({"_id": obj_id})
-        if result.deleted_count == 0:
-            # Try as string if ObjectId deletion failed (no match)
-            result = await priorities_collection.delete_one({"_id": id})
     except Exception:
-        # Invalid ObjectId format, try as string
-        result = await priorities_collection.delete_one({"_id": id})
-        
-    if result.deleted_count == 0:
+        obj_id = id
+
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    result = await priorities_collection.update_one({"_id": obj_id}, soft_delete_update)
+    if result.matched_count == 0:
+        # Try string ID as fallback
+        result = await priorities_collection.update_one({"_id": id}, soft_delete_update)
+
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Priority not found")
-        
+
     return {"message": "Priority deleted"}
 
 
@@ -788,7 +862,7 @@ async def get_goals(
         query["focus_area_id"] = focus_area_id
     
     # We filter by focus_area_id which is strictly ownership validated
-    
+    query["deleted_at"] = None
     goals = await goals_collection.find(query).to_list(length=100)
     return goals
 
@@ -948,7 +1022,7 @@ async def get_activities(
     goal_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    activities = await activities_collection.find({"goal_id": goal_id}).to_list(length=50)
+    activities = await activities_collection.find({"goal_id": goal_id, "deleted_at": None}).to_list(length=50)
     return activities
 
 @router.post("/goals/{goal_id}/activities", response_model=Activity)
@@ -991,7 +1065,18 @@ async def update_activity(
 
 @router.delete("/activities/{id}", response_model=MessageResponse)
 async def delete_activity(id: str, current_user: dict = Depends(get_firebase_user)):
-    await activities_collection.delete_one({"_id": ObjectId(id)})
+    user_id = current_user.get("user_id")
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    result = await activities_collection.update_one({"_id": ObjectId(id)}, soft_delete_update)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Activity not found")
     return {"message": "Activity deleted"}
 
 
