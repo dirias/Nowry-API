@@ -8,6 +8,7 @@ Endpoints:
   GET  /stripe/subscription-status      — SUB-08: read current subscription state
 """
 
+import asyncio
 import os
 import stripe
 from fastapi import APIRouter, HTTPException, Depends
@@ -95,7 +96,8 @@ async def create_checkout_session(
     # Existing user fallback (Pitfall 5): create Stripe customer on-demand if missing
     stripe_customer_id = user.get("stripe_customer_id")
     if not stripe_customer_id:
-        customer = await stripe.Customer.create_async(
+        customer = await asyncio.to_thread(
+            stripe.Customer.create,
             email=user.get("email"),
             metadata={
                 "firebase_uid": user.get("firebase_uid"),
@@ -108,7 +110,8 @@ async def create_checkout_session(
             {"$set": {"stripe_customer_id": stripe_customer_id}},
         )
 
-    session = await stripe.checkout.Session.create_async(
+    session = await asyncio.to_thread(
+        stripe.checkout.Session.create,
         customer=stripe_customer_id,
         mode="subscription",
         line_items=[{"price": body.price_id, "quantity": 1}],
@@ -140,7 +143,8 @@ async def create_portal_session(
             detail="No billing account found. Please upgrade first.",
         )
 
-    portal_session = await stripe.billing_portal.Session.create_async(
+    portal_session = await asyncio.to_thread(
+        stripe.billing_portal.Session.create,
         customer=stripe_customer_id,
         return_url=f"{FRONTEND_URL}/subscription",
     )

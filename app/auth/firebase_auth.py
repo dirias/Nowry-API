@@ -10,6 +10,7 @@ from app.config.subscription_plans import SubscriptionTier
 from functools import lru_cache
 from typing import Optional
 from datetime import datetime, timezone
+import asyncio
 import logging
 import os
 import time
@@ -168,7 +169,8 @@ async def get_firebase_user(request: Request) -> dict:
             # never blocks user creation (T-03-02-02 mitigation)
             stripe_customer_id = None
             try:
-                customer = await _stripe.Customer.create_async(
+                customer = await asyncio.to_thread(
+                    _stripe.Customer.create,
                     email=email,
                     metadata={"firebase_uid": token_data["firebase_uid"]},
                 )
