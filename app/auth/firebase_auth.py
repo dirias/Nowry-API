@@ -10,7 +10,24 @@ from app.config.subscription_plans import SubscriptionTier
 from functools import lru_cache
 from typing import Optional
 from datetime import datetime, timezone
+import logging
+import os
 import time
+import stripe as _stripe
+
+# Configure Stripe at module level — never inside a request handler (RESEARCH.md Pattern 1)
+_stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+logger = logging.getLogger(__name__)
+
+def _first_of_next_month(dt: datetime) -> datetime:
+    """Returns the first day of the next calendar month at 00:00:00 UTC."""
+    if dt.month == 12:
+        return dt.replace(year=dt.year + 1, month=1, day=1,
+                          hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    return dt.replace(month=dt.month + 1, day=1,
+                      hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+
 
 # Simple in-memory cache for validated tokens (UID -> {token_data, expiry})
 _token_cache = {}
@@ -146,6 +163,19 @@ async def get_firebase_user(request: Request) -> dict:
             email: str = token_data.get("email") or ""
             username: str = display_name or (email.split("@")[0] if email else "user")
             now = datetime.now(timezone.utc)
+
+            # Create Stripe customer — wrapped in try/except so a Stripe failure
+            # never blocks user creation (T-03-02-02 mitigation)
+            stripe_customer_id = None
+            try:
+                customer = await _stripe.Customer.create_async(
+                    email=email,
+                    metadata={"firebase_uid": token_data["firebase_uid"]},
+                )
+                stripe_customer_id = customer.id
+            except Exception as _stripe_err:
+                logger.warning("Stripe customer creation failed for new user: %s", _stripe_err)
+
             new_user_doc = {
                 "firebase_uid": token_data["firebase_uid"],
                 "email": email,
@@ -153,9 +183,16 @@ async def get_firebase_user(request: Request) -> dict:
                 "full_name": display_name or username,
                 "photo_url": token_data.get("picture"),
                 "role": "user",
+                "stripe_customer_id": stripe_customer_id,  # None if Stripe call failed
                 "subscription": {
                     "tier": SubscriptionTier.FREE.value,
                     "status": "active",
+                    "ai_usage_count": 0,
+                    "ai_usage_reset_date": _first_of_next_month(now),
+                    "next_billing_date": None,
+                    "stripe_subscription_id": None,
+                    "billing_interval": None,
+                    "subscription_status_updated_at": now,
                 },
                 "wizard_completed": False,
                 "created_at": now,

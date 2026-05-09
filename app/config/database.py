@@ -37,6 +37,8 @@ quiz_sessions_collection = db["quiz_sessions"]
 ai_quiz_sessions_collection = db["ai_quiz_sessions"]
 # Permanent session history — never expires, indexed for analytics
 study_sessions_collection = db["study_sessions"]
+# Stripe webhook idempotency — deduplicates events, TTL 30 days
+stripe_processed_events_collection = db["stripe_processed_events"]
 
 async def create_indexes():
     # User indexes
@@ -160,4 +162,14 @@ async def create_indexes():
             )
 
     logger.info("Soft-delete TTL indexes verified for all content collections.")
+
+    # stripe_processed_events: unique on stripe_event_id (deduplication, T-03-02-04)
+    # and TTL on processed_at (30 days) so old events are auto-purged
+    await stripe_processed_events_collection.create_index(
+        "stripe_event_id", unique=True
+    )
+    await stripe_processed_events_collection.create_index(
+        "processed_at", expireAfterSeconds=2592000  # 30 days
+    )
+
     logger.info("Database indexes created successfully.")
