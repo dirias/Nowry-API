@@ -9,6 +9,7 @@ Tiers:
 """
 
 from enum import Enum
+import os
 
 
 class SubscriptionTier(str, Enum):
@@ -102,4 +103,21 @@ SUBSCRIPTION_PLANS = {
             "agent_messages_per_month": -1,   # Unlimited
         },
     },
+}
+
+
+# Stripe Price IDs — per D-03, never hardcode IDs in source
+STRIPE_PRICE_IDS = {
+    "plus_monthly": os.getenv("STRIPE_PLUS_MONTHLY_PRICE_ID"),
+    "plus_annual":  os.getenv("STRIPE_PLUS_ANNUAL_PRICE_ID"),
+    "pro_monthly":  os.getenv("STRIPE_PRO_MONTHLY_PRICE_ID"),
+    "pro_annual":   os.getenv("STRIPE_PRO_ANNUAL_PRICE_ID"),
+}
+
+# Monthly AI generation limits per tier (used by track_ai_usage in Phase 4 enforcement)
+# -1 means unlimited; 0 means Free tier has no AI card/quiz/visualizer generation
+AI_USAGE_LIMITS: dict = {
+    SubscriptionTier.FREE: 0,
+    SubscriptionTier.PLUS: 100,
+    SubscriptionTier.PRO: -1,
 }
