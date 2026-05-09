@@ -7,6 +7,7 @@ from app.models.CardGenerationRequest import CardGenerationRequest
 from app.config.database import cards_collection
 from app.ai_orchestrator.orchestrator import orchestrator
 from app.auth.firebase_auth import get_firebase_user
+from app.auth.dependencies import track_ai_usage
 from app.utils.logger import get_logger
 
 router = APIRouter(
@@ -24,7 +25,10 @@ def get_cards_collection() -> Collection:
 
 
 @router.post("/generate", summary="Generate a new card using AI")
-async def generate_card(payload: CardGenerationRequest):
+async def generate_card(
+    payload: CardGenerationRequest,
+    current_user: dict = Depends(track_ai_usage),
+) -> dict:
     try:
         logger.info(f"Received generation request: {payload}")
         result = orchestrator.invoke(

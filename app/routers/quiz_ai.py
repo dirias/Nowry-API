@@ -30,7 +30,7 @@ from groq import Groq
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.auth.firebase_auth import get_firebase_user
+from app.auth.dependencies import track_ai_usage
 from app.config.database import ai_quiz_sessions_collection, users_collection
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
@@ -296,7 +296,7 @@ def _to_response_question(stored: AIQuizQuestionStored) -> AIQuizQuestionRespons
 async def start_ai_quiz_session(
     request: Request,
     body: AIQuizStartRequest,
-    current_user: dict = Depends(get_firebase_user),
+    current_user: dict = Depends(track_ai_usage),
 ) -> AIQuizStartResponse:
     """
     Generate an AI quiz on any topic and return the first question.
