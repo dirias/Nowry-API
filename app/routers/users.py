@@ -399,6 +399,13 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
             "visual_diagrams": stats["visual_diagrams"],
             "ai_generations": stats["ai_generations_month"],
         },
+        # Billing fields — passed through directly from MongoDB
+        "ai_usage_count": stored_sub.get("ai_usage_count", 0),
+        "ai_usage_reset_date": stored_sub.get("ai_usage_reset_date"),
+        "next_billing_date": stored_sub.get("next_billing_date"),
+        "stripe_subscription_id": stored_sub.get("stripe_subscription_id"),
+        "billing_interval": stored_sub.get("billing_interval"),
+        "subscription_status_updated_at": stored_sub.get("subscription_status_updated_at"),
     }
 
     # Get notification preferences
