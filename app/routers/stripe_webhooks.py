@@ -43,7 +43,10 @@ async def stripe_webhook(request: Request) -> dict:
     sig_header: Optional[str] = request.headers.get("stripe-signature")
 
     try:
-        event = Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
+        stripe_event = Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
+        # Convert to plain dict so all handlers can use .get() safely.
+        # StripeObject supports to_dict() in all SDK versions >= 5.
+        event: dict = stripe_event.to_dict()
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
     except SignatureVerificationError:
