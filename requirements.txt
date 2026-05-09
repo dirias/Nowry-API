@@ -32,8 +32,12 @@ bcrypt
 feedparser
 
 # --- Testing ---
-#pytest>=8.2.0
-#pytest-asyncio>=0.23.7
+pytest>=8.2.0
+pytest-asyncio>=0.23.7
+
+# --- Stripe ---
+stripe>=11.0.0
+
 gunicorn
 slowapi
 cloudinary>=1.40.0,<2.0
