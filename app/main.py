@@ -51,6 +51,7 @@ from app.routers import (
     quiz,
     quiz_ai,
     study_sessions,
+    stripe_webhooks,
 )
 
 
@@ -67,6 +68,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Stripe webhook router MUST be registered before any middleware.
+# Stripe sends POST /stripe/webhook with a Stripe-Signature header (not a Firebase token).
+# Any auth or CORS middleware registered first would reject Stripe's requests with 401.
+app.include_router(stripe_webhooks.router)
+
 app.add_middleware(SlowAPIMiddleware)
 
 # CORS Configuration
