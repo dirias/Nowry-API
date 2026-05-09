@@ -114,11 +114,11 @@ async def list_study_sessions(
     """
     user_id: str = current_user.get("user_id", "")
 
-    total: int = await study_sessions_collection.count_documents({"user_id": user_id})
+    total: int = await study_sessions_collection.count_documents({"user_id": user_id, "deleted_at": None})
 
     raw_docs = await (
         study_sessions_collection
-        .find({"user_id": user_id})
+        .find({"user_id": user_id, "deleted_at": None})
         .sort("completed_at", -1)
         .to_list(length=limit)
     )

@@ -29,6 +29,7 @@ from app.models.common import (
 from app.config.database import (
     users_collection,
     study_cards_collection,
+    study_sessions_collection,
     books_collection,
     decks_collection,
     tasks_collection,
@@ -786,7 +787,26 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     user_id = current_user.get("user_id")
     firebase_uid: str = current_user.get("firebase_uid", "")
     now = datetime.now(timezone.utc)
-    
+
+    # 0. Guard: block deletion if user has public decks or books.
+    #    The Browse/Fork feature (Phase 6) will create community dependencies on
+    #    public content — deleting without unpublishing first would break those.
+    #    Users must unpublish manually before deleting their account.
+    public_deck_count = await decks_collection.count_documents(
+        {"user_id": user_id, "is_public": True, "deleted_at": None}
+    )
+    public_book_count = await books_collection.count_documents(
+        {"user_id": user_id, "is_public": True, "deleted_at": None}
+    )
+    if public_deck_count > 0 or public_book_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"You have {public_deck_count} public deck(s) and {public_book_count} public book(s). "
+                "Please unpublish all public content before deleting your account."
+            ),
+        )
+
     # 1. Soft delete user account
     user_update = await users_collection.update_one(
         {"_id": ObjectId(user_id)},
@@ -829,7 +849,13 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
         {"user_id": user_id, "deleted_at": None},
         soft_delete_update
     )
-    
+
+    # Study Sessions (performance history)
+    await study_sessions_collection.update_many(
+        {"user_id": user_id, "deleted_at": None},
+        {"$set": {"deleted_at": now, "deleted_by": user_id, "updated_at": now}}
+    )
+
     # Annual Plans
     plans_cursor = annual_plans_collection.find({"user_id": user_id, "deleted_at": None})
     plans = await plans_cursor.to_list(length=100)
@@ -891,13 +917,18 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     if firebase_uid:
         try:
             from firebase_admin import auth as firebase_auth_sdk
+            # Revoke all refresh tokens FIRST — this immediately invalidates all
+            # active sessions (including Google OAuth sessions) so existing ID tokens
+            # fail on the next backend request. Without this, valid tokens remain
+            # usable for up to 1 hour after deletion.
+            firebase_auth_sdk.revoke_refresh_tokens(firebase_uid)
             firebase_auth_sdk.delete_user(firebase_uid)
         except Exception as exc:
             # MongoDB is source of truth — log but do not surface Firebase errors.
             # Account is already soft-deleted; user cannot authenticate again once
             # the token cache expires.
             logger.error(
-                "Failed to delete Firebase user %s after MongoDB soft-delete: %s",
+                "Failed to revoke/delete Firebase user %s after MongoDB soft-delete: %s",
                 firebase_uid,
                 exc,
             )

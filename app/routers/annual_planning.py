@@ -192,7 +192,9 @@ async def get_full_annual_plan(
     plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
 
     if not plan:
-        raise HTTPException(status_code=404, detail="No annual plan found for this year")
+        # No plan for this year — return empty state (200), not 404.
+        # 404 would trigger browser error logging; "no plan yet" is valid for new/reactivated users.
+        return FullAnnualPlanResponse()
 
     plan_id = str(plan["_id"])
 

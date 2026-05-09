@@ -264,7 +264,7 @@ async def get_statistics(
         # Get books collection for book stats
         from app.config.database import books_collection
 
-        all_books = await books_collection.find({"user_id": user_id}).to_list(length=500)
+        all_books = await books_collection.find({"user_id": user_id, "deleted_at": None}).to_list(length=500)
 
         # Calculate weekly progress (last 7 days) - separated by type
         today = datetime.now(timezone.utc).replace(tzinfo=None).replace(hour=0, minute=0, second=0, microsecond=0)

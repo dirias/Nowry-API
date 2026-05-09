@@ -6,8 +6,10 @@ Handles Firebase token validation and user authentication with caching
 from fastapi import HTTPException, Header, Request, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config.firebase_config import verify_firebase_token
+from app.config.subscription_plans import SubscriptionTier
 from functools import lru_cache
 from typing import Optional
+from datetime import datetime, timezone
 import time
 
 # Simple in-memory cache for validated tokens (UID -> {token_data, expiry})
@@ -80,7 +82,13 @@ async def get_firebase_user(request: Request) -> dict:
     try:
         # Verify token with Firebase Admin SDK (network call - slow)
         decoded_token = verify_firebase_token(token)
-        
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid Firebase token: {str(e)}"
+        )
+
+    try:
         token_data = {
             "firebase_uid": decoded_token.get("uid"),
             "email": decoded_token.get("email"),
@@ -88,35 +96,88 @@ async def get_firebase_user(request: Request) -> dict:
             "name": decoded_token.get("name"),
             "picture": decoded_token.get("picture"),
         }
-        
-        # --- NEW: Fetch MongoDB User ID ---
-        # Many endpoints expect "user_id" (MongoDB _id) to be present
+
+        # --- Resolve MongoDB user_id ---
+        # Many endpoints expect "user_id" (MongoDB _id) to be present.
         from app.config.database import users_collection
-        
-        # We use a simple in-memory cache for user lookups to avoid DB hit every request
-        # In production, use Redis or similar
+
+        # Search without filtering on deleted_at so soft-deleted docs are found too.
+        # Try by firebase_uid first, then fall back to email (covers the case where
+        # Firebase deleted the user and re-issued a new UID on re-registration with
+        # the same Google account — same email, different UID).
         user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"]})
-        
-        if user:
+        if not user and token_data.get("email"):
+            user = await users_collection.find_one({"email": token_data["email"]})
+
+        if user and not user.get("deleted_at"):
+            # Normal path: active user doc found.
+            token_data["user_id"] = str(user["_id"])
+        elif user and user.get("deleted_at"):
+            # Soft-deleted account: the user deleted their account but is signing
+            # back in with the same Google identity (same or new Firebase UID but
+            # same email).  Reactivate the existing document and update the
+            # firebase_uid to the current one — do NOT insert a new doc, which
+            # would hit the unique index on firebase_uid/email and raise a
+            # DuplicateKeyError (causing a 500).
+            now = datetime.now(timezone.utc)
+            display_name: str = token_data.get("name") or ""
+            await users_collection.update_one(
+                {"_id": user["_id"]},
+                {
+                    "$unset": {"deleted_at": "", "deleted_by": ""},
+                    "$set": {
+                        # Always sync firebase_uid in case it changed (new Firebase
+                        # account after hard-delete on the Firebase side).
+                        "firebase_uid": token_data["firebase_uid"],
+                        "photo_url": token_data.get("picture") or user.get("photo_url"),
+                        "full_name": display_name or user.get("full_name", ""),
+                        "wizard_completed": False,
+                        "updated_at": now,
+                    },
+                },
+            )
             token_data["user_id"] = str(user["_id"])
         else:
-            raise HTTPException(
-                status_code=401,
-                detail="User profile not found"
-            )
+            # Valid Firebase token but no MongoDB document — first-time sign-in
+            # via Google before /auth/register is called.
+            # Auto-create a minimal user document so the request succeeds and
+            # the frontend can drive onboarding (wizard) normally.
+            display_name: str = token_data.get("name") or ""
+            email: str = token_data.get("email") or ""
+            username: str = display_name or (email.split("@")[0] if email else "user")
+            now = datetime.now(timezone.utc)
+            new_user_doc = {
+                "firebase_uid": token_data["firebase_uid"],
+                "email": email,
+                "username": username,
+                "full_name": display_name or username,
+                "photo_url": token_data.get("picture"),
+                "role": "user",
+                "subscription": {
+                    "tier": SubscriptionTier.FREE.value,
+                    "status": "active",
+                },
+                "wizard_completed": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            result = await users_collection.insert_one(new_user_doc)
+            token_data["user_id"] = str(result.inserted_id)
 
         # uid is an alias for firebase_uid (Firebase authentication identifier only)
         # NEVER use uid for MongoDB storage — always use user_id (MongoDB ObjectId string)
         token_data["uid"] = token_data.get("firebase_uid")
-            
+
         # Cache the validated token AFTER MongoDB data is fully joined
         _cache_token(token, token_data)
 
         return token_data
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
-            status_code=401,
-            detail=f"Invalid Firebase token: {str(e)}"
+            status_code=500,
+            detail=f"Failed to resolve user profile: {str(e)}"
         )
 
 

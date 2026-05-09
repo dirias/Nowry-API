@@ -89,10 +89,13 @@ class FullAnnualPlanResponse(BaseModel):
     Aggregated response for GET /annual-plan/full.
     Returns the plan together with all associated focus areas, priorities,
     goals, activities, and quarter reports in a single round-trip.
+
+    plan is None when the user has no plan for the requested year — callers
+    should treat this as empty state, not an error.
     """
-    plan: Dict[str, Any]
-    focus_areas: List[Dict[str, Any]]
-    priorities: List[Dict[str, Any]]
-    goals: List[Dict[str, Any]]
-    activities: List[Dict[str, Any]]
-    quarter_reports: List[Dict[str, Any]]
+    plan: Optional[Dict[str, Any]] = None
+    focus_areas: List[Dict[str, Any]] = []
+    priorities: List[Dict[str, Any]] = []
+    goals: List[Dict[str, Any]] = []
+    activities: List[Dict[str, Any]] = []
+    quarter_reports: List[Dict[str, Any]] = []
