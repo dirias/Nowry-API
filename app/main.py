@@ -52,6 +52,7 @@ from app.routers import (
     quiz_ai,
     study_sessions,
     stripe_webhooks,
+    subscriptions,
 )
 
 
@@ -114,6 +115,7 @@ app.include_router(agent.router)         # Study Buddy AI companion
 app.include_router(quiz.router, prefix="/v1/assistant/quiz", tags=["quiz"])      # Active Study Partner (deck)
 app.include_router(quiz_ai.router, prefix="/v1/assistant/quiz", tags=["quiz"])   # Active Study Partner (AI)
 app.include_router(study_sessions.router, prefix="/v1/study-sessions", tags=["study-sessions"])  # Session history
+app.include_router(subscriptions.router)  # Stripe checkout, portal, and subscription status
 
 
 @app.get("/")
