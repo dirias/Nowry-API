@@ -328,6 +328,12 @@ async def get_user_stats(user_id: str) -> dict:
             streak += 1
             check_date -= timedelta(days=1)
 
+        # Fetch ai_usage_count from user's subscription subdoc
+        user_doc = await users_collection.find_one(
+            {"_id": ObjectId(user_oid)},
+            {"subscription.ai_usage_count": 1},
+        )
+
         return {
             "total_cards": total_cards,
             "flashcards_count": flashcards_count,
@@ -336,7 +342,7 @@ async def get_user_stats(user_id: str) -> dict:
             "study_streak": streak,
             "quiz_questions": quiz_questions,
             "visual_diagrams": visual_diagrams,
-            "ai_generations_month": 0,  # TODO: Track monthly AI usage
+            "ai_generations_month": (user_doc or {}).get("subscription", {}).get("ai_usage_count", 0),
         }
     except Exception as e:
         logger.error(f"Error calculating user stats: {e}", exc_info=True)

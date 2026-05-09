@@ -2,8 +2,10 @@ from fastapi import Request, HTTPException, Depends
 from bson import ObjectId
 from typing import Callable
 from pymongo.collection import Collection
+from datetime import datetime, timezone
 
 from app.auth.firebase_auth import get_firebase_user
+from app.config.database import users_collection
 
 def require_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
     """
@@ -61,6 +63,43 @@ async def require_admin(
             detail="Admin access required"
         )
     return current_user
+
+
+async def track_ai_usage(
+    current_user: dict = Depends(get_firebase_user),
+) -> dict:
+    """
+    Increment the user's monthly AI usage counter by +1 per API call (D-09).
+    Returns the updated user document. Does NOT enforce limits — enforcement is Phase 4.
+    """
+    user_id = current_user.get("user_id")
+    now = datetime.now(timezone.utc)
+    user = await users_collection.find_one_and_update(
+        {"_id": ObjectId(user_id)},
+        {
+            "$inc": {"subscription.ai_usage_count": 1},
+            "$set": {"subscription.last_ai_usage_at": now},
+        },
+        return_document=True,
+        upsert=False,
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+async def get_subscription_tier(
+    current_user: dict = Depends(get_firebase_user),
+) -> str:
+    """Returns the user's current subscription tier as a string: 'free', 'plus', or 'pro'."""
+    user_id = current_user.get("user_id")
+    user = await users_collection.find_one(
+        {"_id": ObjectId(user_id)},
+        {"subscription.tier": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user.get("subscription", {}).get("tier", "free")
 
 
 def require_public_or_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
