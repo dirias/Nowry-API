@@ -16,6 +16,7 @@ import stripe
 from fastapi import APIRouter, Request, HTTPException
 from stripe import Webhook, SignatureVerificationError
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.config.database import users_collection, stripe_processed_events_collection
 from app.config.subscription_plans import STRIPE_PRICE_IDS
@@ -23,7 +24,7 @@ from app.config.subscription_plans import STRIPE_PRICE_IDS
 # Configure Stripe API key once at module level — never per-request
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-WEBHOOK_SECRET: str | None = os.getenv("STRIPE_WEBHOOK_SECRET")
+WEBHOOK_SECRET: Optional[str] = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 # Router has no auth dependency — Stripe sends its own Stripe-Signature header
 router = APIRouter(prefix="/stripe", tags=["stripe"])
@@ -39,13 +40,16 @@ async def stripe_webhook(request: Request) -> dict:
     or encoding conversion invalidates the HMAC signature check.
     """
     payload: bytes = await request.body()  # raw bytes — NEVER .json() or .decode()
-    sig_header: str | None = request.headers.get("stripe-signature")
+    sig_header: Optional[str] = request.headers.get("stripe-signature")
 
     try:
         event = Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
     except SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception:
+        # Catches misconfiguration (e.g. WEBHOOK_SECRET=None) and malformed headers
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     # Idempotency: check if this event was already processed before mutating MongoDB
@@ -97,11 +101,11 @@ async def _handle_subscription_updated(event: dict) -> None:
     # Derive billing details from subscription items
     items_data: list = subscription.get("items", {}).get("data", [])
     first_item: dict = items_data[0] if items_data else {}
-    price_id: str | None = first_item.get("price", {}).get("id")
-    interval: str | None = first_item.get("plan", {}).get("interval")
+    price_id: Optional[str] = first_item.get("price", {}).get("id")
+    interval: Optional[str] = first_item.get("plan", {}).get("interval")
 
-    current_period_end: int | None = subscription.get("current_period_end")
-    next_billing_date: datetime | None = (
+    current_period_end: Optional[int] = subscription.get("current_period_end")
+    next_billing_date: Optional[datetime] = (
         datetime.fromtimestamp(current_period_end, tz=timezone.utc)
         if current_period_end else None
     )
@@ -143,7 +147,7 @@ async def _handle_subscription_deleted(event: dict) -> None:
     if not user:
         return
 
-    past_due_since: datetime | None = (
+    past_due_since: Optional[datetime] = (
         user.get("subscription", {}).get("subscription_status_updated_at")
     )
 
@@ -211,7 +215,7 @@ async def _handle_payment_succeeded(event: dict) -> None:
     # Derive next reset date from invoice line item period end
     lines_data: list = invoice.get("lines", {}).get("data", [])
     first_line: dict = lines_data[0] if lines_data else {}
-    next_period_end: int | None = first_line.get("period", {}).get("end")
+    next_period_end: Optional[int] = first_line.get("period", {}).get("end")
     reset_date: datetime = (
         datetime.fromtimestamp(next_period_end, tz=timezone.utc)
         if next_period_end else now
