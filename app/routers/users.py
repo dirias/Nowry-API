@@ -399,13 +399,22 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
             "visual_diagrams": stats["visual_diagrams"],
             "ai_generations": stats["ai_generations_month"],
         },
-        # Billing fields — passed through directly from MongoDB
+        # Billing fields — convert datetime → ISO string for JSON serialization
         "ai_usage_count": stored_sub.get("ai_usage_count", 0),
-        "ai_usage_reset_date": stored_sub.get("ai_usage_reset_date"),
-        "next_billing_date": stored_sub.get("next_billing_date"),
+        "ai_usage_reset_date": (
+            stored_sub["ai_usage_reset_date"].isoformat()
+            if stored_sub.get("ai_usage_reset_date") else None
+        ),
+        "next_billing_date": (
+            stored_sub["next_billing_date"].isoformat()
+            if stored_sub.get("next_billing_date") else None
+        ),
         "stripe_subscription_id": stored_sub.get("stripe_subscription_id"),
         "billing_interval": stored_sub.get("billing_interval"),
-        "subscription_status_updated_at": stored_sub.get("subscription_status_updated_at"),
+        "subscription_status_updated_at": (
+            stored_sub["subscription_status_updated_at"].isoformat()
+            if stored_sub.get("subscription_status_updated_at") else None
+        ),
     }
 
     # Get notification preferences
