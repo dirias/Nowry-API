@@ -78,7 +78,7 @@ async def stripe_webhook(request: Request) -> dict:
 async def _dispatch_event(event: dict) -> None:
     """Route Stripe event to the appropriate handler. Unknown events are silently ignored."""
     event_type: str = event["type"]
-    if event_type == "customer.subscription.updated":
+    if event_type in ("customer.subscription.created", "customer.subscription.updated"):
         await _handle_subscription_updated(event)
     elif event_type == "customer.subscription.deleted":
         await _handle_subscription_deleted(event)
