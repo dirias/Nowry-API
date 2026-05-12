@@ -1,4 +1,3 @@
-from app.ai_orchestrator.llm_clients.groq_client import Groq_client
 import json
 from fastapi import HTTPException
 
@@ -24,8 +23,10 @@ def text_node(state):
         sample_number=sample_number
     )
 
-    groq_client = Groq_client()
-    ai_response = groq_client.request(request_string)
+    llm_client = state.get("llm_client")
+    if not llm_client:
+        raise HTTPException(status_code=500, detail="LLM client not injected into state")
+    ai_response = llm_client.request(request_string)
     raw_output = ai_response.choices[0].message.content
 
     try:
