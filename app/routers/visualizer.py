@@ -1,12 +1,12 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.ai_orchestrator.orchestrator import orchestrator
-from app.auth.dependencies import track_ai_usage
-from app.config.database import users_collection
-from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
-from bson import ObjectId
+from app.auth.dependencies import track_ai_usage, get_subscription_tier
+from app.utils.logger import get_logger
 
 router = APIRouter(prefix="/visualizer", tags=["visualizer"])
+
+logger = get_logger(__name__)
 
 
 class VisualRequest(BaseModel):
@@ -16,27 +16,13 @@ class VisualRequest(BaseModel):
 
 @router.post("/generate")
 async def generate_visual(
-    request: VisualRequest, current_user: dict = Depends(track_ai_usage)
+    request: VisualRequest,
+    current_user: dict = Depends(track_ai_usage),
+    tier: str = Depends(get_subscription_tier),
 ) -> dict:
-    # --- Subscription Check ---
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    subscription_data = user.get("subscription", {"tier": "free"})
-    tier_key = subscription_data.get("tier", "free")
-    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
-
-    if not plan["features"]["ai_content_generation"]:
-        raise HTTPException(
-            status_code=403,
-            detail=f"AI Visualization is not available on the {plan['name']} plan. Upgrade to unlock.",
-        )
-    # --------------------------
+    logger.info(f"[visualizer] tier={tier}")
     try:
-        inputs = {"text": request.text, "viz_type": request.viz_type}
+        inputs = {"text": request.text, "viz_type": request.viz_type, "tier": tier}
         # Invoke via orchestrator
         result = orchestrator.invoke("visualizer", inputs)
 
@@ -47,5 +33,7 @@ async def generate_visual(
             "mermaid_code": result.get("mermaid_code"),
             "explanation": result.get("explanation"),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
