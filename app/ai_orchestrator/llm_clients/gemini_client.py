@@ -78,8 +78,11 @@ class Gemini_client:
         Raises:
             RuntimeError: If Gemini API call fails.
         """
-        response = self.model.generate_content(
-            request_string,
-            generation_config=genai.types.GenerationConfig(temperature=0.7),
-        )
-        return _GeminiResponseShim.from_text(response.text)
+        try:
+            response = self.model.generate_content(
+                request_string,
+                generation_config=genai.types.GenerationConfig(temperature=0.7),
+            )
+            return _GeminiResponseShim.from_text(response.text)
+        except Exception as e:
+            raise RuntimeError(f"Gemini API call failed: {type(e).__name__}") from e

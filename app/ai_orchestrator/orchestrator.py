@@ -37,8 +37,11 @@ class AIOrchestrator:
             state["llm_client"] = self.groq_client          # Groq Llama 3.3 70B
         elif tier == "plus":
             state["llm_client"] = self.gemini_flash_client   # Gemini Flash
-        else:  # pro — and any unknown tier defaults to Pro quality
+        elif tier == "pro":
             state["llm_client"] = self.gemini_pro_client     # Gemini Pro
+        else:
+            logger.error(f"[{graph_name}] Unknown tier={tier!r} — defaulting to free (Groq)")
+            state["llm_client"] = self.groq_client           # Unknown tier defaults to free
         logger.info(f"[{graph_name}] tier={tier} — llm_client assigned")
 
         try:
@@ -49,7 +52,7 @@ class AIOrchestrator:
         except Exception as e:
             logger.exception(f"[{graph_name}] Pipeline failed: {e}")
             raise HTTPException(
-                status_code=500, detail=f"Pipeline '{graph_name}' failed due to: {e}"
+                status_code=500, detail="AI pipeline failed. Please try again."
             )
 
 
