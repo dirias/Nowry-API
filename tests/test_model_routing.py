@@ -112,6 +112,30 @@ class TestFreetierRouting:
             "Missing tier must default to free (Groq client)"
         )
 
+    def test_unknown_tier_defaults_to_free(self):
+        """Unknown tier must not escalate — must default to free (Groq), not Pro."""
+        from app.ai_orchestrator.orchestrator import AIOrchestrator
+
+        orch = AIOrchestrator.__new__(AIOrchestrator)
+
+        mock_groq = MagicMock()
+        mock_gemini_flash = MagicMock()
+        mock_gemini_pro = MagicMock()
+        mock_graph = MagicMock()
+        mock_graph.invoke.return_value = {"result": "ok"}
+
+        orch.groq_client = mock_groq
+        orch.gemini_flash_client = mock_gemini_flash
+        orch.gemini_pro_client = mock_gemini_pro
+        orch.graphs = {"rag": mock_graph}
+
+        state = {"prompt": "test", "tier": "enterprise"}
+        orch.invoke("rag", state)
+
+        assert state["llm_client"] is mock_groq, (
+            "Unknown tier must not escalate — must default to free (Groq client)"
+        )
+
 
 class TestGeminiClientInit:
     """GATE-01: Gemini client must initialize correctly with model ID."""
