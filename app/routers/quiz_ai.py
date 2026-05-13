@@ -30,7 +30,8 @@ from groq import Groq
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.auth.dependencies import track_ai_usage
+from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
+from app.auth.dependencies import get_subscription_tier, track_ai_usage
 from app.config.database import ai_quiz_sessions_collection, users_collection
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
@@ -114,22 +115,48 @@ def _get_groq_client() -> Groq:
     return Groq(api_key=api_key)
 
 
+def _get_llm_client_for_tier(tier: str):
+    """Return the appropriate LLM client for the given subscription tier.
+
+    Centralizes all tier-to-model dispatch for quiz AI (mirrors orchestrator.py pattern).
+
+    Returns:
+        - free: Groq client (Llama 3.3 70B, zero marginal cost)
+        - plus: Gemini Flash client
+        - pro:  Gemini Pro client
+    Raises:
+        RuntimeError: if GROQ_API_KEY is missing (free tier)
+        ValueError: if GEMINI_API_KEY is missing (plus/pro tier)
+        ValueError: if tier is an unexpected value (fail-fast)
+    """
+    if tier == "free":
+        return _get_groq_client()
+    elif tier == "plus":
+        return Gemini_client("models/gemini-flash-latest")
+    elif tier == "pro":
+        return Gemini_client("models/gemini-pro-latest")
+    else:
+        raise ValueError(f"Unknown subscription tier: {tier!r}. Expected 'free', 'plus', or 'pro'.")
+
+
 async def _generate_questions(
     topic: str,
     question_count: int,
     language: str,
-    client: Groq,
+    tier: str,
 ) -> list[AIQuizQuestionStored]:
     """
-    Call Groq to generate `question_count` questions on `topic`.
+    Call the tier-appropriate LLM to generate `question_count` questions on `topic`.
 
     The model is asked to return a JSON array of question objects. Each object
     must have the fields defined in AIQuizQuestionStored. We request three
     question types in a balanced mix to ensure variety.
 
     Returns a list of AIQuizQuestionStored instances.
-    Raises HTTPException(502) on Groq API failure or malformed JSON.
+    Raises HTTPException(502) on LLM API failure or malformed JSON.
     """
+    llm_client = _get_llm_client_for_tier(tier)
+
     lang_name: str = _LANGUAGE_NAMES.get(language.split("-")[0].lower(), "English")
 
     system_prompt: str = (
@@ -190,33 +217,43 @@ async def _generate_questions(
     last_exc: Exception | None = None
     for attempt in range(1, 3):  # up to 2 attempts
         try:
-            completion = client.chat.completions.create(
-                model=_GROQ_MODEL,
-                max_tokens=4096,
-                temperature=0.7,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            choice = completion.choices[0]
-            finish_reason: str = choice.finish_reason or "unknown"
-            raw_text = (choice.message.content or "").strip()
+            if tier == "free":
+                # Groq: native chat.completions.create interface
+                completion = llm_client.chat.completions.create(
+                    model=_GROQ_MODEL,
+                    max_tokens=4096,
+                    temperature=0.7,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                choice = completion.choices[0]
+                finish_reason: str = choice.finish_reason or "unknown"
+                raw_text = (choice.message.content or "").strip()
+            else:
+                # Gemini: combine prompts, use request() — returns _GeminiResponseShim
+                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                completion = llm_client.request(combined_prompt)
+                choice = completion.choices[0]
+                finish_reason = "stop"
+                raw_text = (choice.message.content or "").strip()
+
             if raw_text:
                 break
             logger.warning(
-                f"[ai_quiz] Groq returned empty content on attempt {attempt} "
-                f"(finish_reason={finish_reason}). Retrying…"
+                f"[ai_quiz] LLM returned empty content on attempt {attempt} "
+                f"(finish_reason={finish_reason}, tier={tier}). Retrying…"
             )
         except Exception as exc:
             last_exc = exc
-            logger.warning(f"[ai_quiz] Groq API error on attempt {attempt}: {exc}")
+            logger.warning(f"[ai_quiz] LLM API error on attempt {attempt} (tier={tier}): {exc}")
 
     if not raw_text:
         if last_exc:
-            logger.error(f"[ai_quiz] Groq API failed after retries: {last_exc}")
+            logger.error(f"[ai_quiz] LLM API failed after retries (tier={tier}): {last_exc}")
         else:
-            logger.error("[ai_quiz] Groq returned empty content after retries")
+            logger.error(f"[ai_quiz] LLM returned empty content after retries (tier={tier})")
         raise HTTPException(
             status_code=502,
             detail="AI service error while generating quiz questions. Please try again.",
@@ -234,7 +271,7 @@ async def _generate_questions(
         if not isinstance(parsed, list):
             raise ValueError("Expected a JSON array")
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.error(f"[ai_quiz] Groq returned malformed JSON: {exc}\nRaw: {raw_text[:500]}")
+        logger.error(f"[ai_quiz] LLM returned malformed JSON: {exc}\nRaw: {raw_text[:500]}")
         raise HTTPException(
             status_code=502,
             detail="AI returned an unexpected format. Please try again.",
@@ -297,6 +334,7 @@ async def start_ai_quiz_session(
     request: Request,
     body: AIQuizStartRequest,
     current_user: dict = Depends(track_ai_usage),
+    tier: str = Depends(get_subscription_tier),
 ) -> AIQuizStartResponse:
     """
     Generate an AI quiz on any topic and return the first question.
@@ -305,6 +343,7 @@ async def start_ai_quiz_session(
     - Does NOT consume the user's monthly message budget.
     - Free tier is always capped at 10 questions.
     - Plus/Pro use their configured ai_quiz_question_count preference (default 10, max 20).
+    - Free tier uses Groq/Llama 3.3 70B; Plus gets Gemini Flash; Pro gets Gemini Pro.
     """
     user_id: str = current_user.get("user_id", "")
     if not user_id:
@@ -318,18 +357,17 @@ async def start_ai_quiz_session(
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
 
-    tier: SubscriptionTier = _resolve_tier(user_doc)
-    effective_count: int = _resolve_question_count(body.question_count, user_doc, tier)
+    subscription_tier: SubscriptionTier = _resolve_tier(user_doc)
+    effective_count: int = _resolve_question_count(body.question_count, user_doc, subscription_tier)
 
-    # Initialise Groq client
-    try:
-        groq_client: Groq = _get_groq_client()
-    except RuntimeError:
-        logger.error("[ai_quiz] GROQ_API_KEY is not configured")
+    # Validate tier before calling _generate_questions (fail-fast)
+    if tier not in ("free", "plus", "pro"):
+        logger.error(f"[ai_quiz] Unknown tier={tier!r} — cannot route to LLM")
         raise HTTPException(
             status_code=500,
             detail="AI service is not configured. Contact support.",
         )
+    logger.info(f"[ai_quiz] tier={tier} — routing quiz generation")
 
     # Resolve topic — fall back to a generic label when the frontend couldn't extract one
     effective_topic: str = (body.topic or "").strip() or "the current topic"
@@ -339,7 +377,7 @@ async def start_ai_quiz_session(
         topic=effective_topic,
         question_count=effective_count,
         language=body.language,
-        client=groq_client,
+        tier=tier,
     )
 
     # Persist session document with full question set (including correct answers)
@@ -360,7 +398,7 @@ async def start_ai_quiz_session(
     await ai_quiz_sessions_collection.insert_one(session_doc)
     logger.info(
         f"[ai_quiz] Session started: user={user_id}, topic={body.topic!r}, "
-        f"questions={len(questions)}, tier={tier.value}"
+        f"questions={len(questions)}, tier={tier}"
     )
 
     return AIQuizStartResponse(
