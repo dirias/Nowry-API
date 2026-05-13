@@ -31,7 +31,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
-from app.auth.dependencies import get_subscription_tier, track_ai_usage
+from app.auth.dependencies import track_ai_usage
 from app.config.database import ai_quiz_sessions_collection, users_collection
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
@@ -82,7 +82,7 @@ def _resolve_tier(user: dict) -> SubscriptionTier:
 def _resolve_question_count(
     requested: int,
     user: dict,
-    tier: SubscriptionTier,
+    tier: str,
 ) -> int:
     """
     Return the effective question count for this session.
@@ -91,7 +91,7 @@ def _resolve_question_count(
     Plus/Pro respect the user-configured preference (ai_quiz_question_count),
     clamped to the requested value and the hard maximum of 20.
     """
-    if tier == SubscriptionTier.FREE:
+    if tier == "free":
         return 10
 
     configured: int = (
@@ -334,7 +334,6 @@ async def start_ai_quiz_session(
     request: Request,
     body: AIQuizStartRequest,
     current_user: dict = Depends(track_ai_usage),
-    tier: str = Depends(get_subscription_tier),
 ) -> AIQuizStartResponse:
     """
     Generate an AI quiz on any topic and return the first question.
@@ -349,7 +348,7 @@ async def start_ai_quiz_session(
     if not user_id:
         raise HTTPException(status_code=401, detail="User record not found")
 
-    # Fetch user for tier + preference resolution
+    # Fetch user for preference resolution (subscription tier read from this doc — single source)
     user_doc = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
         {"subscription": 1, "preferences.agent.ai_quiz_question_count": 1},
@@ -357,16 +356,14 @@ async def start_ai_quiz_session(
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
 
-    subscription_tier: SubscriptionTier = _resolve_tier(user_doc)
-    effective_count: int = _resolve_question_count(body.question_count, user_doc, subscription_tier)
+    # Single tier source: derived from the already-fetched user_doc (CR-02, CR-03)
+    tier: str = user_doc.get("subscription", {}).get("tier", "free")
+    effective_count: int = _resolve_question_count(body.question_count, user_doc, tier)
 
     # Validate tier before calling _generate_questions (fail-fast)
     if tier not in ("free", "plus", "pro"):
-        logger.error(f"[ai_quiz] Unknown tier={tier!r} — cannot route to LLM")
-        raise HTTPException(
-            status_code=500,
-            detail="AI service is not configured. Contact support.",
-        )
+        logger.error(f"[ai_quiz] Unknown tier={tier!r} — defaulting to free for quiz routing")
+        tier = "free"
     logger.info(f"[ai_quiz] tier={tier} — routing quiz generation")
 
     # Resolve topic — fall back to a generic label when the frontend couldn't extract one

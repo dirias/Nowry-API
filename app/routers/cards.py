@@ -7,7 +7,7 @@ from app.models.CardGenerationRequest import CardGenerationRequest
 from app.config.database import cards_collection
 from app.ai_orchestrator.orchestrator import orchestrator
 from app.auth.firebase_auth import get_firebase_user
-from app.auth.dependencies import track_ai_usage, get_subscription_tier
+from app.auth.dependencies import track_ai_usage
 from app.utils.logger import get_logger
 
 router = APIRouter(
@@ -28,8 +28,9 @@ def get_cards_collection() -> Collection:
 async def generate_card(
     payload: CardGenerationRequest,
     current_user: dict = Depends(track_ai_usage),
-    tier: str = Depends(get_subscription_tier),
 ) -> dict:
+    # TODO: AI usage limit enforcement is pending (Phase 4 deferred — WR-01)
+    tier: str = current_user.get("subscription", {}).get("tier", "free")
     logger.info(f"[cards] tier={tier}")
     try:
         logger.info(f"Received generation request: {payload}")
