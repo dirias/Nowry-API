@@ -31,10 +31,11 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
-from app.auth.dependencies import track_ai_usage
-from app.config.database import ai_quiz_sessions_collection, users_collection
+from app.auth.dependencies import get_subscription_tier, track_ai_usage
+from app.config.database import ai_quiz_sessions_collection, books_collection, users_collection
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
+from app.models.book_generation import GenerateQuizFromBookRequest
 from app.models.quiz import (
     AIQuizQuestionResponse,
     AIQuizQuestionStored,
@@ -403,3 +404,113 @@ async def start_ai_quiz_session(
         total_questions=len(questions),
         first_question=_to_response_question(questions[0]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Lexical JSON text extraction helper
+# ---------------------------------------------------------------------------
+
+
+def _extract_text_from_lexical_quiz(lexical_state: dict) -> str:
+    """Recursively walk Lexical JSON state, collecting text node values."""
+    texts: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+        elif isinstance(node, dict):
+            if node.get("type") == "text" and "text" in node:
+                texts.append(node["text"])
+            for key in ("children", "root"):
+                if key in node:
+                    walk(node[key])
+
+    walk(lexical_state)
+    return " ".join(texts)
+
+
+# ---------------------------------------------------------------------------
+# POST /generate-from-book — Plus+ only
+# ---------------------------------------------------------------------------
+
+
+@router.post("/generate-from-book")
+async def generate_quiz_from_book(
+    body: GenerateQuizFromBookRequest,
+    current_user: dict = Depends(track_ai_usage),
+    tier: str = Depends(get_subscription_tier),
+) -> dict:
+    """Generate quiz questions from full book content. Plus+ only."""
+    if tier == "free":
+        raise HTTPException(status_code=403, detail="Book-wide quiz generation requires Plus or Pro.")
+
+    user_id: str = current_user.get("user_id", "")
+
+    try:
+        book = await books_collection.find_one({"_id": ObjectId(body.book_id), "deleted_at": None})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid book ID.")
+
+    if not book or book.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Book not found.")
+
+    raw_content: str = book.get("full_content", "")
+    try:
+        lexical_state = json.loads(raw_content)
+        plain_text = _extract_text_from_lexical_quiz(lexical_state)
+    except (json.JSONDecodeError, KeyError):
+        plain_text = raw_content
+
+    _MAX_BOOK_CHARS = 50_000
+    if len(plain_text) > _MAX_BOOK_CHARS:
+        logger.warning(f"[generate_quiz_from_book] Book truncated {len(plain_text)} → {_MAX_BOOK_CHARS}")
+        plain_text = plain_text[:_MAX_BOOK_CHARS]
+
+    if not plain_text.strip():
+        raise HTTPException(status_code=400, detail="Book has no text content to analyze.")
+
+    question_limit = 20 if tier == "plus" else None  # Pro = unlimited
+
+    llm_client = _get_llm_client_for_tier(tier)
+
+    system_prompt = (
+        "You are a quiz generation expert. Given book content, generate high-quality quiz questions. "
+        "Return ONLY a JSON array with no markdown fences. "
+        "Each question must have 'question', 'correct_answer', 'incorrect_answers' (list of 3), "
+        f"and 'difficulty' ('Easy'|'Medium'|'Hard'). "
+        f"Generate at most {question_limit if question_limit else 'as many as appropriate'} questions."
+    )
+    user_prompt = f"Book content:\n{plain_text}"
+
+    raw_text: str = ""
+    for attempt in range(1, 3):
+        try:
+            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+            completion = llm_client.request(combined_prompt)
+            raw_text = (completion.choices[0].message.content or "").strip()
+            if raw_text:
+                break
+            logger.warning(f"[generate_quiz_from_book] Empty response attempt {attempt}")
+        except Exception as exc:
+            logger.warning(f"[generate_quiz_from_book] LLM error attempt {attempt}: {exc}")
+
+    if not raw_text:
+        raise HTTPException(status_code=502, detail="AI service error. Please try again.")
+
+    if raw_text.startswith("```"):
+        lines = raw_text.splitlines()
+        raw_text = "\n".join(line for line in lines if not line.startswith("```")).strip()
+
+    try:
+        parsed: list = json.loads(raw_text)
+        if not isinstance(parsed, list):
+            raise ValueError("Expected JSON array")
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.error(f"[generate_quiz_from_book] Malformed JSON: {exc}\nRaw: {raw_text[:500]}")
+        raise HTTPException(status_code=502, detail="AI returned unexpected format. Please try again.")
+
+    if question_limit:
+        parsed = parsed[:question_limit]
+
+    return {"questions": parsed}
