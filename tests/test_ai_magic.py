@@ -557,12 +557,72 @@ async def test_generate_quiz_from_book_plus_success(mock_books_collection, mock_
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_quiz_analyze_deck_free_forbidden(mock_deck_with_cards):
+async def test_quiz_analyze_deck_free_forbidden(mock_deck_with_cards, mock_user_doc, mock_user_doc_plus):
     """QUIZ-03: Free and Plus tier → 403 Forbidden on POST /quiz/analyze-deck."""
-    pytest.skip("Wave 0 stub — implement after quiz_ai.py analyze-deck endpoint is built")
+    from fastapi import HTTPException
+    from app.routers.quiz_ai import analyze_deck_for_quiz
+
+    deck_id = str(mock_deck_with_cards["deck"]["_id"])
+
+    # Free tier → 403
+    user_doc_free = dict(mock_user_doc)
+    user_doc_free["user_id"] = "507f1f77bcf86cd799439011"
+
+    with pytest.raises(HTTPException) as exc_free:
+        await analyze_deck_for_quiz(
+            deck_id=deck_id,
+            current_user=user_doc_free,
+            tier="free",
+        )
+    assert exc_free.value.status_code == 403
+
+    # Plus tier → 403
+    with pytest.raises(HTTPException) as exc_plus:
+        await analyze_deck_for_quiz(
+            deck_id=deck_id,
+            current_user=mock_user_doc_plus,
+            tier="plus",
+        )
+    assert exc_plus.value.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_quiz_analyze_deck_pro_allowed(mock_deck_with_cards, mock_user_doc_pro):
     """QUIZ-03: Pro tier → 200 with non-empty quiz_questions list."""
-    pytest.skip("Wave 0 stub — implement after quiz_ai.py analyze-deck endpoint is built")
+    import json as _json
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from app.routers.quiz_ai import analyze_deck_for_quiz
+
+    deck_data = mock_deck_with_cards
+    deck_doc = deck_data["deck"]
+    card_docs = deck_data["cards"]
+    deck_id_str = str(deck_doc["_id"])
+
+    questions_json = _json.dumps(["What is Card 0?", "What is Card 1?"])
+
+    mock_gemini_instance = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = questions_json
+    mock_gemini_instance.request.return_value = mock_shim
+
+    # Mock cards_collection.find(...).skip(...).to_list(...)
+    mock_cursor = MagicMock()
+    mock_cursor.skip.return_value = mock_cursor
+    mock_cursor.to_list = AsyncMock(side_effect=[card_docs, []])
+
+    with patch("app.routers.quiz_ai.decks_collection") as mock_decks_col:
+        mock_decks_col.find_one = AsyncMock(return_value=deck_doc)
+        with patch("app.routers.quiz_ai.cards_collection") as mock_cards_col:
+            mock_cards_col.find.return_value = mock_cursor
+            with patch("app.routers.quiz_ai.Gemini_client", return_value=mock_gemini_instance):
+                result = await analyze_deck_for_quiz(
+                    deck_id=deck_id_str,
+                    current_user=mock_user_doc_pro,
+                    tier="pro",
+                )
+
+    assert hasattr(result, "quiz_questions")
+    assert len(result.quiz_questions) > 0
+    assert result.card_count == len(card_docs)
+    assert result.deck_id == deck_id_str
