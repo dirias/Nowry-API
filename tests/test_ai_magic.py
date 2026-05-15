@@ -483,13 +483,73 @@ async def test_quiz_free_cap_5():
 @pytest.mark.asyncio
 async def test_generate_quiz_from_book_free_403(mock_books_collection):
     """QUIZ-02: Free tier → 403 Forbidden on POST /quiz/generate-from-book."""
-    pytest.skip("Wave 0 stub — implement after quiz_ai.py generate-from-book endpoint is built")
+    from fastapi import HTTPException
+    from unittest.mock import patch
+    from app.models.book_generation import GenerateQuizFromBookRequest
+    from app.routers.quiz_ai import generate_quiz_from_book
+
+    user_doc = {
+        "_id": "507f1f77bcf86cd799439011",
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "free"},
+    }
+    body = GenerateQuizFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await generate_quiz_from_book(
+            body=body,
+            current_user=user_doc,
+            tier="free",
+        )
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_generate_quiz_from_book_plus_success(mock_books_collection, mock_user_doc_plus):
     """QUIZ-02: Plus tier → 200 with non-empty questions array."""
-    pytest.skip("Wave 0 stub — implement after quiz_ai.py generate-from-book endpoint is built")
+    import json as _json
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from app.models.book_generation import GenerateQuizFromBookRequest
+    from app.routers.quiz_ai import generate_quiz_from_book
+
+    body = GenerateQuizFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    book_doc = {
+        "_id": "60b8d295f1d2c17f4e4b1234",
+        "user_id": "507f1f77bcf86cd799439011",
+        "full_content": _json.dumps({
+            "root": {"children": [{"type": "paragraph", "children": [
+                {"type": "text", "text": "Study content for plus quiz test."}
+            ]}]}
+        }),
+        "deleted_at": None,
+    }
+
+    quiz_json = _json.dumps([
+        {"question": "What is photosynthesis?", "correct_answer": "Food from sunlight",
+         "incorrect_answers": ["A", "B", "C"], "difficulty": "Easy"},
+        {"question": "Define osmosis?", "correct_answer": "Water across membrane",
+         "incorrect_answers": ["A", "B", "C"], "difficulty": "Medium"},
+    ])
+
+    mock_gemini_instance = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = quiz_json
+    mock_gemini_instance.request.return_value = mock_shim
+
+    with patch("app.routers.quiz_ai.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=book_doc)
+        with patch("app.routers.quiz_ai.Gemini_client", return_value=mock_gemini_instance):
+            result = await generate_quiz_from_book(
+                body=body,
+                current_user=mock_user_doc_plus,
+                tier="plus",
+            )
+
+    assert "questions" in result
+    assert len(result["questions"]) > 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
