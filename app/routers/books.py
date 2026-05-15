@@ -1,15 +1,44 @@
+import os
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
+from groq import Groq
+from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
 from app.models.Book import Book, BookSummary
+from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
-from app.auth.dependencies import require_ownership
+from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# LLM client helpers — tier routing (mirrors quiz_ai.py pattern)
+# ---------------------------------------------------------------------------
+
+_GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+
+def _get_groq_client() -> Groq:
+    api_key: str = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY environment variable is not set")
+    return Groq(api_key=api_key)
+
+
+def _get_llm_client_for_tier(tier: str):
+    if tier == "free":
+        return _get_groq_client()
+    elif tier == "plus":
+        return Gemini_client("models/gemini-flash-latest")
+    elif tier == "pro":
+        return Gemini_client("models/gemini-pro-latest")
+    else:
+        raise ValueError(f"Unknown subscription tier: {tier!r}. Expected 'free', 'plus', or 'pro'.")
+
 
 router = APIRouter(
     prefix="/book",
@@ -372,3 +401,78 @@ async def import_book_from_file(
             "warnings": warnings,
         },
     }
+
+
+@router.post("/{book_id}/ai-expand", response_model=AIExpandResponse)
+async def ai_expand_text(
+    book_id: str,
+    body: AIExpandRequest,
+    current_user: dict = Depends(track_ai_usage),
+) -> AIExpandResponse:
+    """Expand selected text using tier-appropriate LLM. All tiers have access; model quality differs."""
+    user_id: str = current_user.get("user_id", "")
+    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    if tier not in ("free", "plus", "pro"):
+        tier = "free"
+
+    # Ownership check
+    try:
+        book = await books_collection.find_one({"_id": ObjectId(book_id), "deleted_at": None})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid book ID.")
+    if not book or book.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Book not found.")
+
+    # Character limits: Free=500, Plus=2000, Pro=unlimited
+    char_limits: dict = {"free": 500, "plus": 2000}
+    limit = char_limits.get(tier)
+    if limit and len(body.selected_text) > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected text exceeds the {limit}-character limit for your plan.",
+        )
+
+    llm_client = _get_llm_client_for_tier(tier)
+
+    system_prompt = (
+        "You are a writing assistant. Expand the provided text with more detail, "
+        "examples, and explanation while preserving its core meaning and tone. "
+        "Return ONLY the expanded text — no preamble, no markdown fences."
+    )
+    user_prompt = (
+        f"Instruction: {body.instruction}\n\n"
+        f"Text to expand:\n{body.selected_text}"
+    )
+
+    raw_text: str = ""
+    last_exc = None
+    for attempt in range(1, 3):
+        try:
+            if tier == "free":
+                completion = llm_client.chat.completions.create(
+                    model=_GROQ_MODEL,
+                    max_tokens=1500,
+                    temperature=0.7,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                raw_text = (completion.choices[0].message.content or "").strip()
+            else:
+                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                completion = llm_client.request(combined_prompt)
+                raw_text = (completion.choices[0].message.content or "").strip()
+
+            if raw_text:
+                break
+            logger.warning(f"[ai_expand] LLM returned empty on attempt {attempt} (tier={tier}).")
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"[ai_expand] LLM API error on attempt {attempt} (tier={tier}): {exc}")
+
+    if not raw_text:
+        logger.error(f"[ai_expand] Failed after retries. last_exc={last_exc}")
+        raise HTTPException(status_code=502, detail="AI service error. Please try again.")
+
+    return AIExpandResponse(expanded_text=raw_text)
