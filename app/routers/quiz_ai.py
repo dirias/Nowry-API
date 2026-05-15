@@ -32,10 +32,17 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
 from app.auth.dependencies import get_subscription_tier, track_ai_usage
-from app.config.database import ai_quiz_sessions_collection, books_collection, users_collection
+from app.config.database import (
+    ai_quiz_sessions_collection,
+    books_collection,
+    cards_collection,
+    decks_collection,
+    users_collection,
+)
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
 from app.models.book_generation import GenerateQuizFromBookRequest
+from app.models.deck_quiz_analysis import DeckQuizAnalysisResponse
 from app.models.quiz import (
     AIQuizQuestionResponse,
     AIQuizQuestionStored,
@@ -514,3 +521,109 @@ async def generate_quiz_from_book(
         parsed = parsed[:question_limit]
 
     return {"questions": parsed}
+
+
+# ---------------------------------------------------------------------------
+# POST /analyze-deck — Pro only
+# ---------------------------------------------------------------------------
+
+
+@router.post("/analyze-deck", response_model=DeckQuizAnalysisResponse)
+async def analyze_deck_for_quiz(
+    deck_id: str,
+    current_user: dict = Depends(track_ai_usage),
+    tier: str = Depends(get_subscription_tier),
+) -> DeckQuizAnalysisResponse:
+    """Pro-only: analyze a full deck and generate quiz questions from its content."""
+    if tier != "pro":
+        raise HTTPException(status_code=403, detail="Deck quiz analysis requires Pro.")
+
+    user_id: str = current_user.get("user_id", "")
+
+    try:
+        deck_oid = ObjectId(deck_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid deck ID.")
+
+    # Verify deck ownership
+    deck = await decks_collection.find_one({"_id": deck_oid, "user_id": user_id, "deleted_at": None})
+    if not deck:
+        raise HTTPException(status_code=404, detail="Deck not found.")
+
+    # Load all cards in batches of 25 — use $or for ObjectId/string deck_id mismatch
+    # (same pattern as POST /card/analyze-deck in cards.py — CARD-03)
+    deck_or = [{"deck_id": deck_oid}, {"deck_id": str(deck_oid)}]
+    base_query = {"user_id": user_id, "deleted_at": None, "$or": deck_or}
+
+    all_cards: list = []
+    skip = 0
+    BATCH_SIZE = 25
+    while True:
+        batch = await cards_collection.find(base_query).skip(skip).to_list(length=BATCH_SIZE)
+        if not batch:
+            break
+        all_cards.extend(batch)
+        skip += BATCH_SIZE
+        if len(batch) < BATCH_SIZE:
+            break
+
+    if not all_cards:
+        return DeckQuizAnalysisResponse(quiz_questions=[], card_count=0, deck_id=deck_id)
+
+    card_count = len(all_cards)
+
+    # Process in batches of 25 — generate quiz questions per batch then combine
+    llm_client = _get_llm_client_for_tier("pro")  # always Gemini Pro for deck analysis — Pro-only
+
+    all_questions: list = []
+    for batch_start in range(0, card_count, BATCH_SIZE):
+        batch = all_cards[batch_start: batch_start + BATCH_SIZE]
+        batch_text = "\n".join(
+            f"Card {i + 1}: Front: {c.get('title', '')} | Back: {c.get('content', '')}"
+            for i, c in enumerate(batch)
+        )
+        questions_per_batch = max(1, len(batch) // 2)  # ~2 questions per 4 cards
+
+        system_prompt = (
+            "You are a quiz generation expert. Given flashcard content, generate quiz questions. "
+            "Return ONLY a JSON array of question strings — no markdown, no objects, just plain strings. "
+            f"Generate exactly {questions_per_batch} quiz questions from the cards provided."
+        )
+        user_prompt = f"Deck name: {deck.get('name', 'Unknown')}\n\nCards:\n{batch_text}"
+
+        raw_text: str = ""
+        for attempt in range(1, 3):
+            try:
+                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                completion = llm_client.request(combined_prompt)
+                raw_text = (completion.choices[0].message.content or "").strip()
+                if raw_text:
+                    break
+                logger.warning(f"[analyze_deck_for_quiz] Empty response attempt {attempt}")
+            except Exception as exc:
+                logger.warning(f"[analyze_deck_for_quiz] LLM error attempt {attempt}: {exc}")
+
+        if not raw_text:
+            logger.error(f"[analyze_deck_for_quiz] LLM failed for batch starting at {batch_start}")
+            continue
+
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            raw_text = "\n".join(line for line in lines if not line.startswith("```")).strip()
+
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                all_questions.extend(str(q) for q in parsed if q)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error(f"[analyze_deck_for_quiz] Malformed JSON batch: {exc}\nRaw: {raw_text[:300]}")
+            # Continue to next batch rather than failing entire request
+
+    if not all_questions:
+        raise HTTPException(status_code=502, detail="AI service error. Please try again.")
+
+    return DeckQuizAnalysisResponse(
+        quiz_questions=all_questions,
+        card_count=card_count,
+        deck_id=deck_id,
+    )
