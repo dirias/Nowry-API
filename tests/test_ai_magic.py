@@ -223,16 +223,94 @@ async def test_ai_expand_wrong_owner(mock_user_doc):
 # CARD-02: POST /card/generate-from-book — Plus+ only
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ensure_cards_importable():
+    """
+    Install sys.modules stubs for cards.py import chain.
+    Mirrors _ensure_books_importable — cards.py also imports firebase_auth.
+    """
+    _ensure_books_importable()
+    # Stub orchestrator to prevent langgraph / LangChain import errors
+    if "app.ai_orchestrator.orchestrator" not in sys.modules:
+        mock_orch = MagicMock()
+        sys.modules["app.ai_orchestrator.orchestrator"] = mock_orch
+    if "app.ai_orchestrator.llm_clients.gemini_client" not in sys.modules:
+        mock_gemini_mod = MagicMock()
+        sys.modules["app.ai_orchestrator.llm_clients.gemini_client"] = mock_gemini_mod
+    # Stub subscription_plans to avoid SubscriptionTier import issues in quiz_ai
+    if "app.config.subscription_plans" not in sys.modules:
+        mock_plans = MagicMock()
+        sys.modules["app.config.subscription_plans"] = mock_plans
+
+
+_ensure_cards_importable()
+
+
 @pytest.mark.asyncio
-async def test_generate_from_book_free_403(mock_books_collection):
+async def test_generate_from_book_free_403(mock_books_collection, mock_user_doc):
     """CARD-02: Free tier → 403 Forbidden on POST /card/generate-from-book."""
-    pytest.skip("Wave 0 stub — implement after cards.py generate-from-book endpoint is built")
+    from fastapi import HTTPException
+    from unittest.mock import patch
+    from app.models.book_generation import GenerateFromBookRequest
+    from app.routers.cards import generate_cards_from_book
+
+    user_doc = dict(mock_user_doc)
+    user_doc["user_id"] = "507f1f77bcf86cd799439011"
+
+    body = GenerateFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await generate_cards_from_book(
+            body=body,
+            current_user=user_doc,
+            tier="free",
+        )
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_generate_from_book_plus_success(mock_books_collection, mock_user_doc_plus):
     """CARD-02: Plus tier → 200 with non-empty cards array."""
-    pytest.skip("Wave 0 stub — implement after cards.py generate-from-book endpoint is built")
+    import json as _json
+    from unittest.mock import patch
+    from app.models.book_generation import GenerateFromBookRequest
+    from app.routers.cards import generate_cards_from_book
+
+    body = GenerateFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    book_doc = {
+        "_id": "60b8d295f1d2c17f4e4b1234",
+        "user_id": "507f1f77bcf86cd799439011",
+        "full_content": _json.dumps({
+            "root": {"children": [{"type": "paragraph", "children": [
+                {"type": "text", "text": "Study content for plus tier test."}
+            ]}]}
+        }),
+        "deleted_at": None,
+    }
+
+    cards_json = _json.dumps([
+        {"title": "What is photosynthesis?", "content": "The process by which plants make food from sunlight."},
+        {"title": "Define osmosis", "content": "Movement of water across a semipermeable membrane."},
+    ])
+
+    mock_gemini_instance = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = cards_json
+    mock_gemini_instance.request.return_value = mock_shim
+
+    with patch("app.routers.cards.books_collection") as mock_books_col:
+        mock_books_col.find_one = AsyncMock(return_value=book_doc)
+        with patch("app.routers.cards.Gemini_client", return_value=mock_gemini_instance):
+            result = await generate_cards_from_book(
+                body=body,
+                current_user=mock_user_doc_plus,
+                tier="plus",
+            )
+
+    assert len(result.cards) > 0
+    assert result.cards[0].title != ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,15 +318,96 @@ async def test_generate_from_book_plus_success(mock_books_collection, mock_user_
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_analyze_deck_non_pro_403(mock_deck_with_cards):
+async def test_analyze_deck_non_pro_403(mock_deck_with_cards, mock_user_doc, mock_user_doc_plus):
     """CARD-03: Free and Plus tier → 403 Forbidden on POST /card/analyze-deck."""
-    pytest.skip("Wave 0 stub — implement after cards.py analyze-deck endpoint is built")
+    from fastapi import HTTPException
+    from app.models.deck_analysis import DeckAnalysisRequest
+    from app.routers.cards import analyze_deck
+
+    deck_id = str(mock_deck_with_cards["deck"]["_id"])
+    body = DeckAnalysisRequest(deck_id=deck_id)
+
+    # Free tier → 403
+    user_doc_free = dict(mock_user_doc)
+    user_doc_free["user_id"] = "507f1f77bcf86cd799439011"
+
+    with pytest.raises(HTTPException) as exc_free:
+        await analyze_deck(body=body, current_user=user_doc_free, tier="free")
+    assert exc_free.value.status_code == 403
+
+    # Plus tier → 403
+    with pytest.raises(HTTPException) as exc_plus:
+        await analyze_deck(body=body, current_user=mock_user_doc_plus, tier="plus")
+    assert exc_plus.value.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_analyze_deck_pro_success(mock_deck_with_cards, mock_user_doc_pro):
     """CARD-03: Pro tier → 200 with duplicates, gaps, rewrite_suggestions keys."""
-    pytest.skip("Wave 0 stub — implement after cards.py analyze-deck endpoint is built")
+    import json as _json
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from bson import ObjectId
+    from app.models.deck_analysis import DeckAnalysisRequest
+    from app.routers.cards import analyze_deck
+
+    deck_data = mock_deck_with_cards
+    deck_doc = deck_data["deck"]
+    card_docs = deck_data["cards"]
+    deck_id_str = str(deck_doc["_id"])
+
+    body = DeckAnalysisRequest(deck_id=deck_id_str)
+
+    analysis_json = _json.dumps({
+        "duplicates": [
+            {
+                "card_a_id": str(card_docs[0]["_id"]),
+                "card_b_id": str(card_docs[1]["_id"]),
+                "reason": "Both cards cover the same concept.",
+            }
+        ],
+        "gaps": [
+            {"topic": "Memory techniques", "description": "No cards covering spaced repetition."}
+        ],
+        "rewrite_suggestions": [
+            {
+                "card_id": str(card_docs[2]["_id"]),
+                "original_front": card_docs[2]["title"],
+                "original_back": card_docs[2]["content"],
+                "suggested_front": "What is Card 2?",
+                "suggested_back": "An improved explanation of Card 2.",
+                "reason": "The original phrasing is ambiguous.",
+            }
+        ],
+    })
+
+    mock_gemini_instance = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = analysis_json
+    mock_gemini_instance.request.return_value = mock_shim
+
+    # Mock cards_collection.find(...).skip(...).to_list(...)
+    mock_cursor = MagicMock()
+    mock_cursor.skip.return_value = mock_cursor
+    mock_cursor.to_list = AsyncMock(side_effect=[card_docs, []])  # first batch: cards, second: empty
+
+    with patch("app.routers.cards.decks_collection") as mock_decks_col:
+        mock_decks_col.find_one = AsyncMock(return_value=deck_doc)
+        with patch("app.routers.cards.cards_collection") as mock_cards_col:
+            mock_cards_col.find.return_value = mock_cursor
+            with patch("app.routers.cards.Gemini_client", return_value=mock_gemini_instance):
+                result = await analyze_deck(
+                    body=body,
+                    current_user=mock_user_doc_pro,
+                    tier="pro",
+                )
+
+    assert hasattr(result, "duplicates")
+    assert hasattr(result, "gaps")
+    assert hasattr(result, "rewrite_suggestions")
+    assert len(result.duplicates) == 1
+    assert len(result.gaps) == 1
+    assert len(result.rewrite_suggestions) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
