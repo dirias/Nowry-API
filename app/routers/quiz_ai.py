@@ -92,7 +92,7 @@ def _resolve_question_count(
     clamped to the requested value and the hard maximum of 20.
     """
     if tier == "free":
-        return 10
+        return 5  # per QUIZ-01 / D-03
 
     configured: int = (
         user.get("preferences", {})

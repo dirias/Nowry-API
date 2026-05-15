@@ -240,6 +240,54 @@ def _ensure_cards_importable():
     if "app.config.subscription_plans" not in sys.modules:
         mock_plans = MagicMock()
         sys.modules["app.config.subscription_plans"] = mock_plans
+    # Stub slowapi + app.core.limiter to unblock quiz_ai.py import on CI (no slowapi installed)
+    if "slowapi" not in sys.modules:
+        sys.modules["slowapi"] = MagicMock()
+    if "slowapi.util" not in sys.modules:
+        sys.modules["slowapi.util"] = MagicMock()
+    if "app.core.limiter" not in sys.modules:
+        mock_limiter_mod = MagicMock()
+        sys.modules["app.core.limiter"] = mock_limiter_mod
+    # Stub app.models.quiz — contains str|None Pydantic fields that fail on Python 3.9
+    # Must provide real Pydantic models so FastAPI router @response_model works at import time
+    if "app.models.quiz" not in sys.modules:
+        from typing import Optional, Literal as _Literal
+        from pydantic import BaseModel as _BM, Field as _Field
+
+        class _AIQuizQuestionResponse(_BM):
+            card_id: str
+            question_type: str
+            question_text: str
+            options: Optional[list] = None
+            hint_available: bool = True
+            card_index: int
+
+        class _AIQuizQuestionStored(_BM):
+            card_id: str
+            question_type: str
+            question_text: str
+            options: Optional[list] = None
+            hint_available: bool = True
+            correct_answer: str
+            rubric: str = ""
+            card_index: int
+
+        class _AIQuizStartRequest(_BM):
+            topic: Optional[str] = _Field(default=None, max_length=200)
+            question_count: int = _Field(default=10, ge=1, le=20)
+            language: str = _Field(default="en", max_length=10)
+
+        class _AIQuizStartResponse(_BM):
+            session_id: str
+            total_questions: int
+            first_question: _AIQuizQuestionResponse
+
+        mock_quiz_mod = MagicMock()
+        mock_quiz_mod.AIQuizQuestionResponse = _AIQuizQuestionResponse
+        mock_quiz_mod.AIQuizQuestionStored = _AIQuizQuestionStored
+        mock_quiz_mod.AIQuizStartRequest = _AIQuizStartRequest
+        mock_quiz_mod.AIQuizStartResponse = _AIQuizStartResponse
+        sys.modules["app.models.quiz"] = mock_quiz_mod
 
 
 _ensure_cards_importable()
@@ -417,7 +465,15 @@ async def test_analyze_deck_pro_success(mock_deck_with_cards, mock_user_doc_pro)
 @pytest.mark.asyncio
 async def test_quiz_free_cap_5():
     """QUIZ-01: Free tier quiz generation returns at most 5 questions (cap changed from 10)."""
-    pytest.skip("Wave 0 stub — implement after quiz_ai.py Free cap is updated")
+    from app.routers.quiz_ai import _resolve_question_count
+
+    # With no explicit count — free tier always returns 5
+    # Note: signature is _resolve_question_count(requested, user, tier)
+    user_doc = {"subscription": {"tier": "free"}, "preferences": {}}
+    assert _resolve_question_count(5, user_doc, "free") == 5
+    # With a high explicit count — still capped at 5
+    assert _resolve_question_count(10, user_doc, "free") == 5
+    assert _resolve_question_count(20, user_doc, "free") == 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
