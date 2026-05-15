@@ -85,6 +85,9 @@ async def track_ai_usage(
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # Re-inject user_id (Firebase UID string) — MongoDB doc has _id/firebase_uid
+    # but not user_id. Endpoints call current_user.get("user_id") for ownership checks.
+    user["user_id"] = current_user.get("user_id")
     return user
 
 
