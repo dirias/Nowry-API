@@ -25,7 +25,8 @@ class Book(BaseModel, SoftDeleteMixin):
     page_size: Optional[str] = "a4"  # Page size preference (a4, letter, legal, etc.)
     full_content: Optional[str] = ""  # Document content (JSON format for new books, HTML for legacy)
     auto_save_enabled: Optional[bool] = False  # Auto-save preference (default: off)
-    
+    illustration_count: Optional[int] = 0  # Per-book diagram generation counter (Phase 6)
+
     # Public Sharing
     is_public: bool = False
     published_at: Optional[datetime] = None
