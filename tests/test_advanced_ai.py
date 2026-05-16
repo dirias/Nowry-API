@@ -42,6 +42,14 @@ def _ensure_advanced_ai_importable() -> None:
     mock_deps.track_ai_usage = MagicMock()
     mock_deps.get_subscription_tier = MagicMock()
     sys.modules.setdefault("app.auth.dependencies", mock_deps)
+    # Stub orchestrator to prevent langgraph / LangChain import errors on test runner
+    # (same pattern as _ensure_cards_importable in test_ai_magic.py)
+    if "app.ai_orchestrator.orchestrator" not in sys.modules:
+        sys.modules["app.ai_orchestrator.orchestrator"] = MagicMock()
+    if "app.ai_orchestrator.llm_clients.gemini_client" not in sys.modules:
+        sys.modules["app.ai_orchestrator.llm_clients.gemini_client"] = MagicMock()
+    if "app.ai_orchestrator.llm_clients.tts_client" not in sys.modules:
+        sys.modules["app.ai_orchestrator.llm_clients.tts_client"] = MagicMock()
 
 
 _ensure_advanced_ai_importable()
@@ -54,13 +62,64 @@ _ensure_advanced_ai_importable()
 @pytest.mark.asyncio
 async def test_diagram_free_tier_cap(mock_book_doc_with_counter):
     """ILLUS-01: Free tier with illustration_count >= 2 → 403 Forbidden."""
-    pytest.skip("Wave 0 stub — implement after illustrations.py endpoint is built")
+    from fastapi import HTTPException
+    from unittest.mock import patch, AsyncMock
+    from app.models.illustration import DiagramRequest
+    from app.routers.illustrations import generate_diagram
+
+    # Set illustration_count to cap limit
+    mock_book_doc_with_counter["illustration_count"] = 2
+
+    body = DiagramRequest(selected_text="Some text about photosynthesis")
+    user = {
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "free"},
+    }
+
+    with patch("app.routers.illustrations.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        with pytest.raises(HTTPException) as exc_info:
+            await generate_diagram(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                current_user=user,
+            )
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_diagram_increments_counter(mock_book_doc_with_counter):
     """ILLUS-01: Successful diagram generation increments illustration_count via $inc."""
-    pytest.skip("Wave 0 stub — implement after illustrations.py endpoint is built")
+    from unittest.mock import patch, AsyncMock, call
+    from app.models.illustration import DiagramRequest
+    from app.routers.illustrations import generate_diagram
+
+    # illustration_count=0 (default fixture) — within free tier cap
+    body = DiagramRequest(selected_text="Explain the water cycle")
+    user = {
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "free"},
+    }
+
+    with patch("app.routers.illustrations.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        mock_col.update_one = AsyncMock()
+        with patch(
+            "app.routers.illustrations.orchestrator.invoke",
+            return_value={"mermaid_code": "graph TD; A-->B", "explanation": "test"},
+        ):
+            await generate_diagram(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                current_user=user,
+            )
+
+    # Assert $inc with +1 was called (first update_one call — before LLM)
+    update_calls = mock_col.update_one.call_args_list
+    assert len(update_calls) >= 1
+    first_call_args = update_calls[0]
+    assert first_call_args[0][1] == {"$inc": {"illustration_count": 1}}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,7 +129,35 @@ async def test_diagram_increments_counter(mock_book_doc_with_counter):
 @pytest.mark.asyncio
 async def test_diagram_plus_no_cap(mock_book_doc_with_counter, mock_user_doc_plus):
     """ILLUS-02: Plus tier with illustration_count >= 2 → still succeeds (no cap for Plus)."""
-    pytest.skip("Wave 0 stub — implement after illustrations.py endpoint is built")
+    from unittest.mock import patch, AsyncMock
+    from app.models.illustration import DiagramRequest, DiagramResponse
+    from app.routers.illustrations import generate_diagram
+
+    # Set illustration_count above free tier cap
+    mock_book_doc_with_counter["illustration_count"] = 5
+
+    body = DiagramRequest(selected_text="Explain the Krebs cycle")
+    user = {
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "plus"},
+    }
+
+    with patch("app.routers.illustrations.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        mock_col.update_one = AsyncMock()
+        with patch(
+            "app.routers.illustrations.orchestrator.invoke",
+            return_value={"mermaid_code": "graph TD; A-->B", "explanation": "Krebs cycle"},
+        ):
+            result = await generate_diagram(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                current_user=user,
+            )
+
+    # Plus tier should never get 403 regardless of illustration_count
+    assert isinstance(result, DiagramResponse)
+    assert result.mermaid_code == "graph TD; A-->B"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,7 +167,35 @@ async def test_diagram_plus_no_cap(mock_book_doc_with_counter, mock_user_doc_plu
 @pytest.mark.asyncio
 async def test_diagram_pro_no_cap(mock_book_doc_with_counter, mock_user_doc_pro):
     """ILLUS-03: Pro tier with illustration_count >= 2 → still succeeds (no cap for Pro)."""
-    pytest.skip("Wave 0 stub — implement after illustrations.py endpoint is built")
+    from unittest.mock import patch, AsyncMock
+    from app.models.illustration import DiagramRequest, DiagramResponse
+    from app.routers.illustrations import generate_diagram
+
+    # Set illustration_count above free tier cap
+    mock_book_doc_with_counter["illustration_count"] = 5
+
+    body = DiagramRequest(selected_text="Explain the Big Bang theory")
+    user = {
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "pro"},
+    }
+
+    with patch("app.routers.illustrations.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        mock_col.update_one = AsyncMock()
+        with patch(
+            "app.routers.illustrations.orchestrator.invoke",
+            return_value={"mermaid_code": "graph TD; A-->B", "explanation": "Big Bang"},
+        ):
+            result = await generate_diagram(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                current_user=user,
+            )
+
+    # Pro tier should never get 403 regardless of illustration_count
+    assert isinstance(result, DiagramResponse)
+    assert result.mermaid_code == "graph TD; A-->B"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
