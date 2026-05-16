@@ -90,13 +90,48 @@ async def test_diagram_pro_no_cap(mock_book_doc_with_counter, mock_user_doc_pro)
 @pytest.mark.asyncio
 async def test_tts_free_403(mock_book_doc_with_counter):
     """TTS-01: Free tier → 403 Forbidden on POST /book/{id}/tts."""
-    pytest.skip("Wave 0 stub — implement after tts.py endpoint is built")
+    from fastapi import HTTPException
+    from unittest.mock import patch, AsyncMock
+    from app.models.tts import TTSRequest
+    from app.routers.tts import generate_tts
+
+    body = TTSRequest(text="Hello world", language_code="en-US")
+    user = {"user_id": "507f1f77bcf86cd799439011"}
+
+    with patch("app.routers.tts.get_subscription_tier", return_value="free"):
+        with pytest.raises(HTTPException) as exc_info:
+            await generate_tts(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                tier="free",
+                current_user=user,
+            )
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_tts_plus_returns_audio(mock_book_doc_with_counter, mock_user_doc_plus, mock_tts_client):
     """TTS-01: Plus tier → 200 with audio/mpeg content (mocked Google Cloud TTS)."""
-    pytest.skip("Wave 0 stub — implement after tts.py endpoint is built")
+    from unittest.mock import patch, AsyncMock
+    from app.models.tts import TTSRequest
+    from app.routers.tts import generate_tts
+
+    body = TTSRequest(text="Hello world", language_code="en-US")
+    user = {"user_id": "507f1f77bcf86cd799439011"}
+
+    with patch("app.routers.tts.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        with patch("app.routers.tts.get_tts_client", return_value=mock_tts_client):
+            response = await generate_tts(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                tier="plus",
+                current_user=user,
+            )
+
+    assert response.media_type == "audio/mpeg"
+    assert response.body == b"fake-mp3-bytes"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,10 +141,55 @@ async def test_tts_plus_returns_audio(mock_book_doc_with_counter, mock_user_doc_
 @pytest.mark.asyncio
 async def test_tts_pro_language_code(mock_book_doc_with_counter, mock_user_doc_pro, mock_tts_client):
     """TTS-02: Pro tier with language_code='fr-FR' → synthesize_speech called with fr-FR."""
-    pytest.skip("Wave 0 stub — implement after tts.py endpoint is built")
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from app.models.tts import TTSRequest
+    from app.routers.tts import generate_tts
+
+    body = TTSRequest(text="Bonjour le monde", language_code="fr-FR")
+    user = {"user_id": "507f1f77bcf86cd799439011"}
+
+    mock_texttospeech = MagicMock()
+
+    with patch("app.routers.tts.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        with patch("app.routers.tts.get_tts_client", return_value=mock_tts_client):
+            with patch("app.routers.tts.texttospeech", mock_texttospeech):
+                await generate_tts(
+                    book_id="60b8d295f1d2c17f4e4b1234",
+                    body=body,
+                    tier="pro",
+                    current_user=user,
+                )
+
+    # Verify VoiceSelectionParams was called with language_code='fr-FR'
+    voice_call_kwargs = mock_texttospeech.VoiceSelectionParams.call_args.kwargs
+    assert voice_call_kwargs.get("language_code") == "fr-FR"
 
 
 @pytest.mark.asyncio
 async def test_tts_plus_ignores_language(mock_book_doc_with_counter, mock_user_doc_plus, mock_tts_client):
     """TTS-02: Plus tier: language_code param in body is ignored → always uses en-US."""
-    pytest.skip("Wave 0 stub — implement after tts.py endpoint is built")
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from app.models.tts import TTSRequest
+    from app.routers.tts import generate_tts
+
+    body = TTSRequest(text="こんにちは世界", language_code="ja-JP")
+    user = {"user_id": "507f1f77bcf86cd799439011"}
+
+    mock_texttospeech = MagicMock()
+
+    with patch("app.routers.tts.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        with patch("app.routers.tts.get_tts_client", return_value=mock_tts_client):
+            with patch("app.routers.tts.texttospeech", mock_texttospeech):
+                await generate_tts(
+                    book_id="60b8d295f1d2c17f4e4b1234",
+                    body=body,
+                    tier="plus",
+                    current_user=user,
+                )
+
+    # Verify VoiceSelectionParams was called with en-US (not ja-JP) for Plus tier
+    voice_call_kwargs = mock_texttospeech.VoiceSelectionParams.call_args.kwargs
+    assert voice_call_kwargs.get("language_code") == "en-US"
+    assert voice_call_kwargs.get("language_code") != "ja-JP"

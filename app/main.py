@@ -53,6 +53,7 @@ from app.routers import (
     study_sessions,
     stripe_webhooks,
     subscriptions,
+    tts,
 )
 
 
@@ -116,6 +117,7 @@ app.include_router(quiz.router, prefix="/v1/assistant/quiz", tags=["quiz"])     
 app.include_router(quiz_ai.router, prefix="/v1/assistant/quiz", tags=["quiz"])   # Active Study Partner (AI)
 app.include_router(study_sessions.router, prefix="/v1/study-sessions", tags=["study-sessions"])  # Session history
 app.include_router(subscriptions.router)  # Stripe checkout, portal, and subscription status
+app.include_router(tts.router)            # AMagic TTS — POST /book/{book_id}/tts
 
 
 @app.get("/")
