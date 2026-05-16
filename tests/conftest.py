@@ -126,3 +126,28 @@ def mock_deck_with_cards():
             for i in range(5)
         ],
     }
+
+
+@pytest.fixture
+def mock_book_doc_with_counter():
+    """Book document with illustration_count field for Phase 6 tests."""
+    from bson import ObjectId
+    return {
+        "_id": ObjectId("60b8d295f1d2c17f4e4b1234"),
+        "user_id": "507f1f77bcf86cd799439011",
+        "title": "Test Book",
+        "full_content": '{"root":{"children":[]}}',
+        "deleted_at": None,
+        "illustration_count": 0,
+    }
+
+
+@pytest.fixture
+def mock_tts_client():
+    """Mock google.cloud.texttospeech.TextToSpeechClient for TTS tests."""
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.audio_content = b"fake-mp3-bytes"
+    client.synthesize_speech.return_value = mock_response
+    return client

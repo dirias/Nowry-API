@@ -1,6 +1,11 @@
 # Firebase
 firebase-service-account.json
 
+# GCP Service Account keys (T-6-01: never commit credentials)
+*-service-account*.json
+*-credentials*.json
+gcp-key*.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
