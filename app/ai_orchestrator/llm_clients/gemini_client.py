@@ -11,6 +11,25 @@ import os
 from dataclasses import dataclass, field
 from typing import List
 import google.generativeai as genai
+from google.api_core import exceptions as _google_exc
+
+
+# ---------------------------------------------------------------------------
+# Typed exceptions for upstream retry/status-code decisions
+# ---------------------------------------------------------------------------
+
+class GeminiQuotaError(RuntimeError):
+    """Raised when Gemini returns ResourceExhausted (quota / rate-limit hit).
+
+    Callers should NOT retry immediately — fail fast with HTTP 503.
+    """
+
+
+class GeminiTransientError(RuntimeError):
+    """Raised when Gemini returns a transient server-side error (5xx).
+
+    Callers may retry with exponential backoff.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +95,11 @@ class Gemini_client:
             _GeminiResponseShim with the response text.
 
         Raises:
-            RuntimeError: If Gemini API call fails.
+            GeminiQuotaError: If Gemini returns ResourceExhausted (quota / rate-limit).
+                              Callers should fail fast — do NOT retry.
+            GeminiTransientError: If Gemini returns a transient server-side error.
+                                  Callers may retry with backoff.
+            RuntimeError: For any other unexpected Gemini API failure.
         """
         try:
             response = self.model.generate_content(
@@ -84,5 +107,13 @@ class Gemini_client:
                 generation_config=genai.types.GenerationConfig(temperature=0.7),
             )
             return _GeminiResponseShim.from_text(response.text)
+        except _google_exc.ResourceExhausted as e:
+            raise GeminiQuotaError(
+                f"Gemini API call failed: ResourceExhausted — quota or rate-limit hit"
+            ) from e
+        except (_google_exc.ServiceUnavailable, _google_exc.InternalServerError) as e:
+            raise GeminiTransientError(
+                f"Gemini API call failed: {type(e).__name__}"
+            ) from e
         except Exception as e:
             raise RuntimeError(f"Gemini API call failed: {type(e).__name__}") from e

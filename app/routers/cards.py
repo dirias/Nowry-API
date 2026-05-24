@@ -1,11 +1,17 @@
 # app/routers/card.py
 
+import asyncio
 import json
 import os
+import random
 from fastapi import APIRouter, Depends, HTTPException
 from pymongo.collection import Collection
 from groq import Groq
-from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
+from app.ai_orchestrator.llm_clients.gemini_client import (
+    Gemini_client,
+    GeminiQuotaError,
+    GeminiTransientError,
+)
 from app.models.StudyCard import StudyCard
 from app.models.CardGenerationRequest import CardGenerationRequest
 from app.models.book_generation import (
@@ -181,11 +187,20 @@ async def generate_cards_from_book(
     )
     user_prompt = f"Book content:\n{plain_text}"
 
+    # Retry only on transient errors; fail fast on quota exhaustion.
+    # Backoff: attempt 1 → immediate, attempt 2 → ~1 s, attempt 3 → ~2 s (with jitter).
+    _MAX_ATTEMPTS: int = 3
+    _BACKOFF_BASE: float = 1.0  # seconds
+
     raw_text: str = ""
     last_exc: Exception | None = None
-    for attempt in range(1, 3):
+    combined_prompt: str = f"{system_prompt}\n\n{user_prompt}"
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            delay: float = _BACKOFF_BASE * (2 ** (attempt - 2)) + random.uniform(0.0, 0.3)
+            await asyncio.sleep(delay)
         try:
-            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
             completion = llm_client.request(combined_prompt)
             raw_text = (completion.choices[0].message.content or "").strip()
             if raw_text:
@@ -193,12 +208,15 @@ async def generate_cards_from_book(
             logger_cards.warning(f"[generate_cards_from_book] Empty response attempt {attempt}")
         except HTTPException:
             raise
-        except Exception as exc:
+        except GeminiQuotaError as exc:
+            logger_cards.warning(f"[generate_cards_from_book] Quota exhausted attempt {attempt}: {exc}")
+            raise HTTPException(status_code=503, detail="AI service error. Please try again.")
+        except (GeminiTransientError, Exception) as exc:
             last_exc = exc
             logger_cards.warning(f"[generate_cards_from_book] LLM error attempt {attempt}: {exc}")
 
     if not raw_text:
-        raise HTTPException(status_code=502, detail="AI service error. Please try again.")
+        raise HTTPException(status_code=503, detail="AI service error. Please try again.")
 
     # Strip markdown fences
     if raw_text.startswith("```"):
@@ -279,22 +297,34 @@ async def analyze_deck(
     )
     user_prompt = f"Deck name: {deck.get('name', 'Unknown')}\n\nCards:\n{cards_text}"
 
+    # Retry only on transient errors; fail fast on quota exhaustion.
+    # Backoff: attempt 1 → immediate, attempt 2 → ~1 s, attempt 3 → ~2 s (with jitter).
+    _MAX_ATTEMPTS: int = 3
+    _BACKOFF_BASE: float = 1.0  # seconds
+
     raw_text: str = ""
     last_exc: Exception | None = None
-    for attempt in range(1, 3):
+    combined_prompt: str = f"{system_prompt}\n\n{user_prompt}"
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            delay: float = _BACKOFF_BASE * (2 ** (attempt - 2)) + random.uniform(0.0, 0.3)
+            await asyncio.sleep(delay)
         try:
-            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
             completion = llm_client.request(combined_prompt)
             raw_text = (completion.choices[0].message.content or "").strip()
             if raw_text:
                 break
             logger_cards.warning(f"[analyze_deck] Empty response attempt {attempt}")
-        except Exception as exc:
+        except GeminiQuotaError as exc:
+            logger_cards.warning(f"[analyze_deck] Quota exhausted attempt {attempt}: {exc}")
+            raise HTTPException(status_code=503, detail="AI service error. Please try again.")
+        except (GeminiTransientError, Exception) as exc:
             last_exc = exc
             logger_cards.warning(f"[analyze_deck] LLM error attempt {attempt}: {exc}")
 
     if not raw_text:
-        raise HTTPException(status_code=502, detail="AI service error. Please try again.")
+        raise HTTPException(status_code=503, detail="AI service error. Please try again.")
 
     if raw_text.startswith("```"):
         lines = raw_text.splitlines()
