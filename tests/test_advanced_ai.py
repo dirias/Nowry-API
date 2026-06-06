@@ -89,9 +89,11 @@ async def test_diagram_free_tier_cap(mock_book_doc_with_counter):
 
 
 @pytest.mark.asyncio
-async def test_diagram_increments_counter(mock_book_doc_with_counter):
-    """ILLUS-01: Successful diagram generation increments illustration_count via $inc."""
-    from unittest.mock import patch, AsyncMock, call
+async def test_diagram_does_not_increment_counter_on_generate(mock_book_doc_with_counter):
+    """ILLUS-01: generate_diagram does NOT increment illustration_count (count-on-insert fix,
+    commit eaa8c7f). Counter increments only when user clicks 'Insert into Book' via
+    POST /book/{id}/diagram/confirm."""
+    from unittest.mock import patch, AsyncMock
     from app.models.illustration import DiagramRequest
     from app.routers.illustrations import generate_diagram
 
@@ -115,11 +117,68 @@ async def test_diagram_increments_counter(mock_book_doc_with_counter):
                 current_user=user,
             )
 
-    # Assert $inc with +1 was called (first update_one call — before LLM)
-    update_calls = mock_col.update_one.call_args_list
-    assert len(update_calls) >= 1
-    first_call_args = update_calls[0]
-    assert first_call_args[0][1] == {"$inc": {"illustration_count": 1}}
+    # generate_diagram must NOT call update_one — counter is deferred to confirm endpoint
+    assert mock_col.update_one.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_confirm_diagram_increments_counter(mock_book_doc_with_counter):
+    """ILLUS-01: POST /book/{id}/diagram/confirm increments illustration_count via $inc.
+    This is the count-on-insert endpoint — called by the frontend only when the user
+    actually clicks 'Insert into Book' in DiagramPreviewPanel."""
+    from unittest.mock import patch, AsyncMock
+    from app.routers.illustrations import confirm_diagram_insert
+
+    # illustration_count=0 (default fixture) — within free tier cap
+    user = {
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "free"},
+    }
+
+    with patch("app.routers.illustrations.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        mock_col.update_one = AsyncMock()
+        result = await confirm_diagram_insert(
+            book_id="60b8d295f1d2c17f4e4b1234",
+            current_user=user,
+        )
+
+    # confirm endpoint must call update_one with $inc: {illustration_count: 1}
+    assert mock_col.update_one.call_count == 1
+    call_args = mock_col.update_one.call_args
+    assert call_args[0][1] == {"$inc": {"illustration_count": 1}}
+    assert result == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_confirm_diagram_free_tier_cap(mock_book_doc_with_counter):
+    """ILLUS-01: confirm_diagram_insert returns 403 when Free tier is already at cap.
+    Race-condition guard — a concurrent session could fill the last slot between
+    generate and insert."""
+    from fastapi import HTTPException
+    from unittest.mock import patch, AsyncMock
+    from app.routers.illustrations import confirm_diagram_insert
+
+    # Set illustration_count to cap limit
+    mock_book_doc_with_counter["illustration_count"] = 2
+
+    user = {
+        "user_id": "507f1f77bcf86cd799439011",
+        "subscription": {"tier": "free"},
+    }
+
+    with patch("app.routers.illustrations.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
+        mock_col.update_one = AsyncMock()
+        with pytest.raises(HTTPException) as exc_info:
+            await confirm_diagram_insert(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                current_user=user,
+            )
+
+    assert exc_info.value.status_code == 403
+    # update_one must NOT be called when cap is reached
+    assert mock_col.update_one.call_count == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
