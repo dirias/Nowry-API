@@ -7,6 +7,8 @@ class QuizState(TypedDict):
     sampleText: str
     numQuestions: int
     difficulty: str
+    tier: str
+    llm_client: Any
     prompt: Optional[str]
     generated_quiz: Optional[List[dict]]
 

@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, List, Any
 from .text_node import text_node
 
 
@@ -7,6 +7,8 @@ class RAGState(TypedDict):
     prompt: str
     sampleText: str
     sampleNumber: int
+    tier: str
+    llm_client: Any
     generated_cards: Optional[List[dict]]
 
 
