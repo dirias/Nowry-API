@@ -7,6 +7,7 @@ from datetime import datetime
 import google.generativeai as genai
 from groq import Groq
 from app.utils.logger import get_logger
+from app.config.subscription_plans import AGENT_MODELS
 
 logger = get_logger(__name__)
 
@@ -103,25 +104,27 @@ class AgentLLM:
         return schema
 
     async def chat(
-        self, 
-        message: str, 
-        history: List[Dict[str, str]], 
-        system_prompt: str, 
+        self,
+        message: str,
+        history: List[Dict[str, str]],
+        system_prompt: str,
         tools: Optional[Any] = None,
         tool_dispatcher: Optional[callable] = None,
-        user_id: str = None
+        user_id: str = None,
+        tier: str = None,
     ) -> str:
         provider = self._get_provider()
-        
-        if provider == "gemini":
-            return await self._chat_gemini(message, history, system_prompt, tools, tool_dispatcher, user_id)
-        else:
-            return await self._chat_groq(message, history, system_prompt, tools, tool_dispatcher, user_id)
 
-    async def _chat_gemini(self, message, history, system_prompt, tools, tool_dispatcher, user_id):
-        # Existing logic mostly stays the same, but wrapped
+        if provider == "gemini":
+            return await self._chat_gemini(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
+        else:
+            return await self._chat_groq(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
+
+    async def _chat_gemini(self, message, history, system_prompt, tools, tool_dispatcher, user_id, tier: str = None):
+        # Resolve model based on tier — falls back to gemini-flash-latest for unknown/None tiers
+        model_name = AGENT_MODELS.get(tier, "models/gemini-flash-latest") if tier else "models/gemini-flash-latest"
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name=model_name,
             system_instruction=system_prompt,
             tools=tools,
         )
@@ -189,7 +192,7 @@ class AgentLLM:
         cleaned = re.sub(r'<function=\w+>[^<]*$', '', cleaned)
         return cleaned.strip()
 
-    async def _chat_groq(self, message, history, system_prompt, tools, tool_dispatcher, user_id):
+    async def _chat_groq(self, message, history, system_prompt, tools, tool_dispatcher, user_id, tier: str = None):
         openai_tools = self._convert_tools_to_openai(tools)
 
         # For Groq/OpenAI models, we append a strict tool-calling formatting directive
