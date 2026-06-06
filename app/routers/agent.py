@@ -49,7 +49,9 @@ from app.utils.agent_tools import (
 )
 
 from app.utils.agent_llm import agent_llm
+from app.models.agent_models import GeneratePersonalityRequest, GeneratePersonalityResponse
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import os
 from app.utils.logger import get_logger
 
@@ -1266,6 +1268,68 @@ async def _dispatch_tool_call(fn_name: str, fn_args: dict, user_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Smart Pet — Personality generation constants
+# ---------------------------------------------------------------------------
+
+_PERSONALITY_SYSTEM_PROMPT = (
+    "You are a personality writer for an AI study companion app. "
+    "Generate a vivid, coherent personality description for an AI pet companion. "
+    "Output exactly 3-5 sentences describing HOW the companion speaks, thinks, and reacts. "
+    "Do not describe appearance. Do not include harmful, offensive, or manipulative content. "
+    "Do not break the fourth wall or reference being an AI. "
+    "Output only the personality description — no preamble, no labels, no quotation marks."
+)
+
+PERSONALITY_LIMITS = {SubscriptionTier.PLUS: 1, SubscriptionTier.PRO: 3}
+
+PERSONALITY_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+}
+
+_PERSONA_BREAK_SIGNALS = ("As an AI", "language model", "I am programmed", "I cannot assist as")
+
+
+# ---------------------------------------------------------------------------
+# Smart Pet — Persistent history helpers (Plus/Pro only)
+# ---------------------------------------------------------------------------
+
+
+async def _load_persistent_history(user_id: str, limit: int = 20) -> list[dict]:
+    """Load last `limit` turns from MongoDB agent.chat_history (Plus/Pro only)."""
+    doc = await users_collection.find_one(
+        {"_id": ObjectId(user_id)},
+        {"agent.chat_history": {"$slice": -limit}},
+    )
+    raw = (doc or {}).get("agent", {}).get("chat_history", [])
+    return [{"role": entry["role"], "content": entry["content"]} for entry in raw]
+
+
+async def _append_to_persistent_history(user_id: str, user_msg: str, model_reply: str) -> None:
+    """Append two turns to MongoDB and cap at 50 via $slice."""
+    now = datetime.now(timezone.utc)
+    await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$push": {"agent.chat_history": {"$each": [
+            {"role": "user", "content": user_msg, "ts": now},
+            {"role": "model", "content": model_reply, "ts": now},
+        ], "$slice": -50}}},
+        upsert=True,
+    )
+
+
+def _sanitize_style_hints(raw: str) -> str:
+    """Strip prompt injection patterns from user-supplied style hints."""
+    truncated = raw[:200].replace('\n', ' ').replace('\r', ' ')
+    injection_signals = ('ignore', 'disregard', 'forget', 'system:', 'assistant:', 'jailbreak', 'override')
+    if any(sig in truncated.lower() for sig in injection_signals):
+        return ""
+    return truncated.strip()
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -2169,29 +2233,56 @@ async def chat(
         raise HTTPException(status_code=404, detail="User not found")
 
     tier = _resolve_tier(user)
-    plan = SUBSCRIPTION_PLANS[tier]
-    messages_limit: int = plan["limits"]["agent_messages_per_month"]
-
-    # Enforce monthly budget for capped tiers
-    agent_data = user.get("agent", {})
-    messages_used: int = agent_data.get("messages_used_this_month", 0)
+    plan_features = SUBSCRIPTION_PLANS[tier]["features"]
+    messages_limit: int = SUBSCRIPTION_PLANS[tier]["limits"]["agent_messages_per_month"]
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    tracked_month = agent_data.get("tracked_month", current_month)
 
-    if tracked_month != current_month:
-        messages_used = 0
-
-    if messages_limit != -1 and messages_used >= messages_limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Monthly message limit of {messages_limit} reached. Upgrade to Plus or Pro for unlimited messages.",
+    # Atomic message cap enforcement (race-condition safe — replaces non-atomic read-check-write)
+    if messages_limit != -1:
+        cap_result = await users_collection.update_one(
+            {
+                "_id": ObjectId(user_id),
+                "$or": [
+                    {"agent.tracked_month": current_month,
+                     "agent.messages_used_this_month": {"$lt": messages_limit}},
+                    {"agent.tracked_month": {"$ne": current_month}},
+                ],
+            },
+            {
+                "$inc": {"agent.messages_used_this_month": 1},
+                "$set": {"agent.tracked_month": current_month},
+            },
         )
+        if cap_result.matched_count == 0:
+            raise HTTPException(status_code=429, detail="message_limit_reached")
+    else:
+        # Unlimited (Plus/Pro): just track for reporting
+        await users_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {
+                "$inc": {"agent.messages_used_this_month": 1},
+                "$set": {"agent.tracked_month": current_month},
+            },
+            upsert=True,
+        )
+
+    # Tier-gated memory: session-only for Free, persistent for Plus/Pro
+    if plan_features.get("agent_persistent_memory"):
+        saved_history = await _load_persistent_history(user_id, limit=20)
+        history_for_llm = saved_history + [
+            {"role": msg.role, "content": msg.content} for msg in body.history[-10:]
+        ]
+    else:
+        # Free: session-only — never load from MongoDB
+        history_for_llm = [
+            {"role": msg.role, "content": msg.content} for msg in body.history[-10:]
+        ]
 
     # Privacy gate: check knowledge access preference
     knowledge_access, _, conciseness, tone = _get_agent_prefs(user)
 
     # Build system prompt (includes knowledge access, style directives, screen context, and stage)
-    model_name = AGENT_MODELS[tier]
+    agent_data = user.get("agent", {})
     xp: int = agent_data.get("xp", 0)
     current_stage: int = _level_to_stage(_calculate_level(xp))
     pet_prefs: dict = user.get("preferences", {}).get("pet", {})
@@ -2226,10 +2317,7 @@ async def chat(
         rag_book_context=rag_book_context,
     )
 
-    history = [
-        {"role": msg.role, "content": msg.content}
-        for msg in body.history[-10:]
-    ]
+    history = history_for_llm
 
     # ── Quiz intent detection (runs BEFORE the main LLM call) ────────────────
     # Detect quiz intent first so we can skip the main LLM call entirely when
@@ -2277,7 +2365,8 @@ async def chat(
                 system_prompt=system_prompt,
                 tools=KNOWLEDGE_TOOLS if knowledge_access else None,
                 tool_dispatcher=_dispatch_tool_call,
-                user_id=user_id
+                user_id=user_id,
+                tier=tier,
             )
 
         except Exception as exc:
@@ -2287,19 +2376,31 @@ async def chat(
                 detail=f"AI service error: {str(exc)}",
             )
 
-    # Increment usage counter + award XP for engagement
-    new_messages_used = messages_used + 1
+    # Persona break detection (log + flag, do NOT block reply)
+    persona_break_detected = any(signal in reply for signal in _PERSONA_BREAK_SIGNALS)
+    if persona_break_detected:
+        logger.warning(
+            "[SmartPet] Persona break detected for user_id=%s tier=%s", user_id, tier
+        )
+
+    # Append to persistent history for Plus/Pro
+    if plan_features.get("agent_persistent_memory"):
+        await _append_to_persistent_history(user_id, body.message, reply)
+
+    # Track last interaction timestamp + award XP for engagement
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
-        {
-            "$set": {
-                "agent.messages_used_this_month": new_messages_used,
-                "agent.tracked_month": current_month,
-                "agent.last_interaction": datetime.now(timezone.utc),
-            }
-        },
+        {"$set": {"agent.last_interaction": datetime.now(timezone.utc)}},
     )
     xp_result: dict = await grant_xp(user_id, 5)  # 5 XP per Buddy interaction
+
+    # Fetch updated messages_used for response
+    updated_agent = await users_collection.find_one(
+        {"_id": ObjectId(user_id)}, {"agent.messages_used_this_month": 1}
+    )
+    new_messages_used: int = (updated_agent or {}).get("agent", {}).get(
+        "messages_used_this_month", 1
+    )
 
     return ChatResponse(
         reply=reply,
@@ -2311,4 +2412,85 @@ async def chat(
         new_stage=xp_result["new_stage"],
         avatar_regen_pending=xp_result.get("avatar_regen_pending", False),
         quiz_config=quiz_config,
+    )
+
+
+@router.post("/generate-personality", response_model=GeneratePersonalityResponse)
+async def generate_personality(
+    body: GeneratePersonalityRequest,
+    current_user: dict = Depends(get_firebase_user),
+) -> GeneratePersonalityResponse:
+    """Generate/rewrite the Smart Pet's custom personality (Plus/Pro only, monthly budget)."""
+    user_id = current_user.get("user_id")
+    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="user_not_found")
+
+    tier = _resolve_tier(user_doc)
+
+    # Gate: Free tier cannot use custom personality (per D-10)
+    if not SUBSCRIPTION_PLANS[tier]["features"].get("agent_custom_personality"):
+        raise HTTPException(status_code=403, detail="custom_personality_requires_plus")
+
+    # Monthly limit (D-12)
+    limit = PERSONALITY_LIMITS.get(tier, 1)
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    # Atomic counter check + increment (race-condition safe)
+    update_result = await users_collection.update_one(
+        {
+            "_id": ObjectId(user_id),
+            "$or": [
+                {"agent.personality_generation_reset_date": current_month,
+                 "agent.personality_generations_used": {"$lt": limit}},
+                {"agent.personality_generation_reset_date": {"$ne": current_month}},
+            ],
+        },
+        {
+            "$inc": {"agent.personality_generations_used": 1},
+            "$set": {"agent.personality_generation_reset_date": current_month},
+        },
+    )
+    if update_result.matched_count == 0:
+        raise HTTPException(status_code=402, detail="personality_generation_limit_reached")
+
+    # Build sanitized prompt
+    user_prompt_parts = []
+    if body.pet_species:
+        user_prompt_parts.append(f"Pet species: {body.pet_species}")
+    if body.style_hints:
+        safe_hints = _sanitize_style_hints(body.style_hints)
+        if safe_hints:
+            user_prompt_parts.append(f"Desired style: {safe_hints}")
+    user_prompt = "\n".join(user_prompt_parts) or "Generate a warm and curious personality."
+
+    # One-shot Gemini call with safety settings
+    model_name = AGENT_MODELS[tier]
+    gen_model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=_PERSONALITY_SYSTEM_PROMPT,
+        generation_config=genai.types.GenerationConfig(temperature=0.9, max_output_tokens=512),
+    )
+    try:
+        response = gen_model.generate_content(user_prompt, safety_settings=PERSONALITY_SAFETY_SETTINGS)
+        personality_text = response.text.strip()
+    except Exception as exc:
+        # Safety block or API error
+        if "block" in str(exc).lower():
+            raise HTTPException(status_code=422, detail="personality_content_blocked")
+        raise HTTPException(status_code=502, detail="personality_generation_failed")
+
+    # Persist generated personality to user doc
+    updated = await users_collection.find_one_and_update(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"agent.personality_text": personality_text}},
+        return_document=True,
+    )
+    used = (updated or {}).get("agent", {}).get("personality_generations_used", 1)
+
+    return GeneratePersonalityResponse(
+        personality_text=personality_text,
+        generations_used=used,
+        generations_limit=limit,
+        reset_date=current_month,
     )
