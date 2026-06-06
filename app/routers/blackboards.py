@@ -13,7 +13,6 @@ from app.models.Blackboard import (
     BoardToCardRequest,
     BoardToCardResponse,
 )
-from app.models.agent_models import _parse_card_output
 from app.models.common import BlackboardResponse, OkResponse
 from app.ai_orchestrator.orchestrator import orchestrator
 from bson import ObjectId
@@ -257,28 +256,28 @@ async def generate_cards_from_board(
         node_text = node_text[:8000]
         nodes_truncated = True
 
-    # Invoke orchestrator with retry (max 3 attempts, 0.5s back-off)
-    # T-07-02-04: asyncio.wait_for with 10s timeout prevents event-loop blocking
+    # Invoke orchestrator via the "rag" graph (same pipeline as POST /cards/generate)
+    # T-07-02-04: asyncio.wait_for with 30s timeout (LLM latency can be 10-20s)
+    tier_str = tier if isinstance(tier, str) else tier.value
     state = {
-        "content": node_text,
-        "tier": tier if isinstance(tier, str) else tier.value,
+        "prompt": "Generate flashcards from the following board notes. Each card should have a clear question (front) and a concise answer (back).",
+        "sampleText": node_text,
+        "sampleNumber": min(len(cleaned), 10),
+        "tier": tier_str,
     }
-    last_error = None
     cards = []
     for attempt in range(3):
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(orchestrator.invoke, "cards", state),
-                timeout=10.0,
+                asyncio.to_thread(orchestrator.invoke, "rag", state),
+                timeout=30.0,
             )
-            raw = result.get("generation", "") or str(result.get("cards", ""))
-            parsed = _parse_card_output(raw)
-            cards = [{"front": c.front, "back": c.back} for c in parsed.cards]
-            break
+            cards = result.get("generated_cards") or []
+            if cards:
+                break
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="card_generation_timeout")
-        except ValueError as e:
-            last_error = e
+        except Exception:
             if attempt < 2:
                 await asyncio.sleep(0.5 * (attempt + 1))
 
