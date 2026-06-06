@@ -172,4 +172,8 @@ async def create_indexes():
         "processed_at", expireAfterSeconds=2592000  # 30 days
     )
 
+    # Phase 7: Blackboard multi-board indexes
+    await db.blackboards.create_index([("owner_user_id", 1)])
+    await db.blackboards.create_index([("collaborators", 1)])
+
     logger.info("Database indexes created successfully.")
