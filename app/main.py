@@ -56,6 +56,7 @@ from app.routers import (
     tts,
     illustrations,
     sheets,
+    goal_ai,
 )
 
 
@@ -122,6 +123,7 @@ app.include_router(subscriptions.router)  # Stripe checkout, portal, and subscri
 app.include_router(tts.router)            # AMagic TTS — POST /book/{book_id}/tts
 app.include_router(illustrations.router)  # Illustration Magic — POST /book/{book_id}/diagram
 app.include_router(sheets.router)         # Micro Sheets — CRUD /sheets
+app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (Pro-only)
 
 
 @app.get("/")
