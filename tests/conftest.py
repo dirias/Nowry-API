@@ -151,3 +151,46 @@ def mock_tts_client():
     mock_response.audio_content = b"fake-mp3-bytes"
     client.synthesize_speech.return_value = mock_response
     return client
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7 — Blackboard & Smart Pet fixtures
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def mock_blackboard_doc():
+    """Simulates a MongoDB blackboard document with Phase 7 multi-board fields."""
+    from bson import ObjectId
+    return {
+        "_id": ObjectId("617f1f77bcf86cd799439abc"),
+        "board_id": "main",
+        "owner_user_id": "507f1f77bcf86cd799439011",
+        "collaborators": [],
+        "name": "My Blackboard",
+        "nodes": [],
+        "edges": [],
+        "viewport": {"x": 0, "y": 0, "zoom": 1},
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+@pytest.fixture
+def mock_invitation():
+    """Simulates a share invitation payload."""
+    return {"invitee_email": "collaborator@example.com"}
+
+
+@pytest.fixture
+def mock_blackboards_collection(mock_blackboard_doc):
+    """Mock Motor collection for blackboards."""
+    collection = MagicMock()
+    collection.find_one = AsyncMock(return_value=mock_blackboard_doc)
+    collection.find_one_and_update = AsyncMock(return_value=mock_blackboard_doc)
+    collection.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+    collection.insert_one = AsyncMock(return_value=MagicMock(inserted_id="617f1f77bcf86cd799439abc"))
+    collection.count_documents = AsyncMock(return_value=0)
+    mock_cursor = MagicMock()
+    mock_cursor.to_list = AsyncMock(return_value=[mock_blackboard_doc])
+    collection.find = MagicMock(return_value=mock_cursor)
+    return collection
