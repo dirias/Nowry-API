@@ -21,7 +21,9 @@ class BlackboardEdge(BaseModel):
 
 class Blackboard(BaseModel):
     id: Optional[str] = None
-    user_id: str
+    user_id: str                              # Legacy single-board field — kept for backward compat
+    owner_user_id: Optional[str] = None      # Phase 7: explicit owner for multi-board
+    collaborators: List[str] = []            # Phase 7: user_ids with write access
     name: str = "My Blackboard"
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
@@ -35,3 +37,24 @@ class BlackboardUpdate(BaseModel):
     nodes: Optional[List[Dict[str, Any]]] = None
     edges: Optional[List[Dict[str, Any]]] = None
     viewport: Optional[Dict[str, float]] = None
+
+
+# ── Phase 7: New request/response models ──────────────────────────────────────
+
+class CreateBoardRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+
+
+class InviteCollaboratorRequest(BaseModel):
+    invitee_email: str = Field(..., min_length=1)
+
+
+class BoardToCardRequest(BaseModel):
+    node_ids: List[str]
+    node_texts: List[str]
+
+
+class BoardToCardResponse(BaseModel):
+    cards: List[Dict[str, str]]   # each: {"front": str, "back": str}
+    node_count: int
+    nodes_truncated: bool
