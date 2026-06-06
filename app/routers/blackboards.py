@@ -95,7 +95,13 @@ async def list_boards(current_user: dict = Depends(get_firebase_user)):
     for doc in shared:
         all_boards.setdefault(doc["_id"], doc)
 
-    return [_serialize(doc) for doc in all_boards.values()]
+    result = []
+    for doc in all_boards.values():
+        doc["is_owner"] = (doc.get("owner_user_id") == user_id) or (
+            doc.get("user_id") == user_id and doc.get("owner_user_id") is None
+        )
+        result.append(_serialize(doc))
+    return result
 
 
 # ── Existing: GET /{board_id} — Retrieve a single board ────────────────────
@@ -114,22 +120,7 @@ async def get_blackboard(board_id: str, current_user: dict = Depends(get_firebas
         doc = await db.blackboards.find_one({"board_id": board_id, "user_id": user_id})
 
     if not doc:
-        # Auto-create on first access
-        now = datetime.now(timezone.utc)
-        new_board = {
-            "board_id": board_id,
-            "user_id": user_id,
-            "name": "My Blackboard",
-            "nodes": [],
-            "edges": [],
-            "viewport": {"x": 0, "y": 0, "zoom": 1},
-            "created_at": now,
-            "updated_at": now,
-        }
-        result = await db.blackboards.insert_one(new_board)
-        new_board["_id"] = result.inserted_id
-        doc = new_board
-
+        raise HTTPException(status_code=404, detail="board_not_found")
     return _serialize(doc)
 
 
@@ -154,7 +145,10 @@ async def save_blackboard(
         # Fall back to legacy board_id string field
         existing = await db.blackboards.find_one({"board_id": board_id})
 
-    if existing and existing.get("owner_user_id") is not None:
+    if not existing:
+        raise HTTPException(status_code=404, detail="board_not_found")
+
+    if existing.get("owner_user_id") is not None:
         # Phase 7 board: enforce owner/collaborator guard
         owner = existing.get("owner_user_id")
         collaborators = existing.get("collaborators", [])
@@ -174,11 +168,12 @@ async def save_blackboard(
         update_fields["viewport"] = update.viewport
 
     result = await db.blackboards.find_one_and_update(
-        {"board_id": board_id, "user_id": user_id},
+        {"_id": existing["_id"]},
         {"$set": update_fields},
         return_document=True,
-        upsert=True,
     )
+    if result is None:
+        raise HTTPException(status_code=404, detail="board_not_found")
     return _serialize(result)
 
 

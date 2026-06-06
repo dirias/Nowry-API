@@ -76,6 +76,9 @@ class BlackboardResponse(BaseModel):
     id: str
     board_id: Optional[str] = None
     user_id: str
+    owner_user_id: Optional[str] = None
+    collaborators: List[str] = []
+    is_owner: Optional[bool] = None
     name: str
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
