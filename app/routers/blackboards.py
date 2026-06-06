@@ -229,11 +229,14 @@ async def generate_cards_from_board(
     user_id = current_user.get("user_id")
 
     # Access guard: owner or collaborator (T-07-02-02 mitigation)
+    # Two-step lookup: ObjectId first, then legacy board_id string (same as GET/PUT)
     board = None
     try:
         board = await db.blackboards.find_one({"_id": ObjectId(board_id)})
     except Exception:
         pass
+    if not board:
+        board = await db.blackboards.find_one({"board_id": board_id, "user_id": user_id})
 
     if not board:
         raise HTTPException(status_code=404, detail="board_not_found")
