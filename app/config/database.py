@@ -40,6 +40,9 @@ study_sessions_collection = db["study_sessions"]
 # Stripe webhook idempotency — deduplicates events, TTL 30 days
 stripe_processed_events_collection = db["stripe_processed_events"]
 
+# Micro Sheets
+sheets_collection = db["sheets"]
+
 async def create_indexes():
     # User indexes
     await users_collection.create_index("firebase_uid", unique=True)
@@ -134,6 +137,10 @@ async def create_indexes():
     # ── Soft-delete TTL indexes (30-day retention) ──────────────────────────
     _RETENTION_SECONDS = 2592000  # 30 days: 60 * 60 * 24 * 30
 
+    # Micro Sheets indexes
+    await sheets_collection.create_index("user_id")
+    await sheets_collection.create_index("updated_at")
+
     _collection_ttl_map = [
         ("books",         books_collection),
         ("decks",         decks_collection),
@@ -141,6 +148,7 @@ async def create_indexes():
         ("tasks",         tasks_collection),
         ("annual_plans",  annual_plans_collection),
         ("goals",         goals_collection),
+        ("sheets",        sheets_collection),
     ]
 
     for collection_name, collection in _collection_ttl_map:
