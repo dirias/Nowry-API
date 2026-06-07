@@ -109,7 +109,7 @@ async def analyze_goals(
     combined_prompt = f"{_SYSTEM_PROMPT}\n\n{plan_summary}"
 
     try:
-        response = _gemini_client.request(combined_prompt)
+        response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
         raw_text = response.choices[0].message.content
         # Strip markdown fences if present
         raw_text = re.sub(r"^```json\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
