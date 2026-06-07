@@ -38,7 +38,7 @@ class Sheet(BaseModel, SoftDeleteMixin):
 class SheetSummary(BaseModel):
     """Lightweight model for list view — excludes the data payload for performance."""
 
-    id: Optional[str] = Field(default=None, alias="_id")
+    id: Optional[PyObjectId] = Field(default=None, alias="_id")
     user_id: Optional[str] = None
     title: str = "Untitled Sheet"
     created_at: Optional[datetime] = None
