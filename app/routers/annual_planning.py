@@ -29,7 +29,10 @@ async def verify_annual_plan_ownership(plan_id: str, user_id: str):
         obj_id = ObjectId(plan_id)
     except InvalidId:
         obj_id = plan_id
+    # Try ObjectId lookup first; fall back to string _id (existing docs may have string _id)
     plan = await annual_plans_collection.find_one({"_id": obj_id})
+    if not plan:
+        plan = await annual_plans_collection.find_one({"_id": plan_id})
     if not plan or str(plan.get("user_id")) != str(user_id):
         raise HTTPException(status_code=403, detail="Not authorized to access this plan data")
 
@@ -39,7 +42,10 @@ async def verify_focus_area_ownership(fa_id: str, user_id: str):
         obj_id = ObjectId(fa_id)
     except InvalidId:
         obj_id = fa_id
+    # Try ObjectId lookup first; fall back to string _id (PyObjectId model_dump serializes to str)
     fa = await focus_areas_collection.find_one({"_id": obj_id})
+    if not fa:
+        fa = await focus_areas_collection.find_one({"_id": fa_id})
     if not fa: raise HTTPException(status_code=404, detail="Focus area not found")
     await verify_annual_plan_ownership(fa["annual_plan_id"], user_id)
 
@@ -49,7 +55,10 @@ async def verify_goal_ownership(goal_id: str, user_id: str):
         obj_id = ObjectId(goal_id)
     except InvalidId:
         obj_id = goal_id
+    # Try ObjectId lookup first; fall back to string _id (existing docs may have string _id)
     goal = await goals_collection.find_one({"_id": obj_id})
+    if not goal:
+        goal = await goals_collection.find_one({"_id": goal_id})
     if not goal: raise HTTPException(status_code=404, detail="Goal not found")
     await verify_focus_area_ownership(goal["focus_area_id"], user_id)
 

@@ -7,7 +7,7 @@ from datetime import datetime
 
 class Activity(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
-    goal_id: str
+    goal_id: Optional[str] = None  # Stamped from URL path param in create_activity; optional here so body validation passes
     title: str
     description: Optional[str] = ""
     frequency: str = "daily"  # daily, weekly, custom

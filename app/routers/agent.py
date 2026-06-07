@@ -1658,7 +1658,7 @@ async def _fetch_intervention_context(
         try:
             if body.most_missed_card_id:
                 card = await cards_collection.find_one(
-                    {"_id": ObjectId(body.most_missed_card_id)},
+                    {"_id": ObjectId(body.most_missed_card_id), "user_id": user_id},  # CR-06: scope to caller
                     {"back": 1, "deck_id": 1},
                 )
                 if card:
@@ -2048,15 +2048,45 @@ async def generate_avatar(
     if not pet.get("pet_species"):
         raise HTTPException(status_code=400, detail="avatar_missing_species")
 
-    # Rate limit check + monthly reset
+    # Rate limit — CR-04: atomic slot reservation eliminates TOCTOU race under concurrent requests.
+    # Counter is incremented before the slow fal.ai call and rolled back on external failure.
     current_month: str = datetime.now(timezone.utc).strftime("%Y-%m")
-    generation_count: int = pet.get("avatar_generation_count", 0)
     stored_month: Optional[str] = pet.get("avatar_reset_month")
-    if stored_month != current_month:
-        generation_count = 0  # reset
+    old_count: int = pet.get("avatar_generation_count", 0) if stored_month == current_month else 0
 
     if body.trigger == "manual":
-        if generation_count >= limit:
+        reserve_result = await users_collection.update_one(
+            {
+                "_id": ObjectId(user_id),
+                "$or": [
+                    # Same-month path: only if under limit
+                    {
+                        "preferences.pet.avatar_reset_month": current_month,
+                        "preferences.pet.avatar_generation_count": {"$lt": limit},
+                    },
+                    # Month-rollover path: any prior month qualifies
+                    {"preferences.pet.avatar_reset_month": {"$ne": current_month}},
+                ],
+            },
+            [
+                {
+                    "$set": {
+                        "preferences.pet.avatar_generation_count": {
+                            "$cond": [
+                                {"$ne": [
+                                    {"$ifNull": ["$preferences.pet.avatar_reset_month", ""]},
+                                    current_month,
+                                ]},
+                                1,  # month rolled over — start fresh at 1
+                                {"$add": ["$preferences.pet.avatar_generation_count", 1]},
+                            ]
+                        },
+                        "preferences.pet.avatar_reset_month": current_month,
+                    }
+                }
+            ],
+        )
+        if reserve_result.matched_count == 0:
             raise HTTPException(status_code=429, detail="avatar_rate_limit_exceeded")
 
     if body.trigger == "evolution":
@@ -2068,7 +2098,7 @@ async def generate_avatar(
     if not avatar_seed:
         avatar_seed = str(_uuid_mod.uuid4())
         await users_collection.update_one(
-            {"firebase_uid": user_id},
+            {"_id": ObjectId(user_id)},  # CR-01 fix: use _id not firebase_uid
             {"$set": {"preferences.pet.avatar_seed": avatar_seed}}
         )
         pet["avatar_seed"] = avatar_seed
@@ -2089,24 +2119,33 @@ async def generate_avatar(
         avatar_url = await _call_fal_avatar(prompt, seed_int)
     except Exception as e:
         logger.error(f"Avatar generation failed: {e}")
+        # CR-04: Roll back the atomically reserved slot so the user can retry
+        if body.trigger == "manual":
+            await users_collection.update_one(
+                {"_id": ObjectId(user_id)},
+                {"$inc": {"preferences.pet.avatar_generation_count": -1}},
+            )
         raise HTTPException(status_code=502, detail="avatar_generation_failed")
 
-    # Persist
+    # Persist avatar data.
+    # For manual trigger: count/month already written atomically in the reservation above.
+    # For evolution trigger: count_increment = 0; normalise month field to current_month.
     now = datetime.now(timezone.utc)
-    count_increment: int = 1 if body.trigger == "manual" else 0
+    persist_fields: dict = {
+        "preferences.pet.avatar_url": avatar_url,
+        "preferences.pet.avatar_stage": stage,
+        "preferences.pet.avatar_generated_at": now,
+        "preferences.pet.avatar_regen_pending": False,
+    }
+    if body.trigger == "evolution":
+        persist_fields["preferences.pet.avatar_reset_month"] = current_month
     await users_collection.update_one(
-        {"firebase_uid": user_id},
-        {"$set": {
-            "preferences.pet.avatar_url": avatar_url,
-            "preferences.pet.avatar_stage": stage,
-            "preferences.pet.avatar_generated_at": now,
-            "preferences.pet.avatar_generation_count": generation_count + count_increment,
-            "preferences.pet.avatar_reset_month": current_month,
-            "preferences.pet.avatar_regen_pending": False,
-        }}
+        {"_id": ObjectId(user_id)},  # CR-01 fix: use _id not firebase_uid
+        {"$set": persist_fields}
     )
 
-    generations_remaining: int = limit - (generation_count + count_increment)
+    new_count: int = old_count + (1 if body.trigger == "manual" else 0)
+    generations_remaining: int = limit - new_count
 
     return GenerateAvatarResponse(
         avatar_url=avatar_url,
@@ -2139,15 +2178,42 @@ async def generate_animation(
 
     pet: dict = user_doc.get("preferences", {}).get("pet", {})
 
-    # Rate limit check + monthly reset
+    # Rate limit — CR-04: atomic slot reservation eliminates TOCTOU race under concurrent requests.
     current_month: str = datetime.now(timezone.utc).strftime("%Y-%m")
-    generation_count: int = pet.get("animation_generation_count", 0)
     stored_month: Optional[str] = pet.get("animation_reset_month")
-    if stored_month != current_month:
-        generation_count = 0  # reset for new month
+    old_count: int = pet.get("animation_generation_count", 0) if stored_month == current_month else 0
 
     if body.trigger == "manual":
-        if generation_count >= limit:
+        reserve_result = await users_collection.update_one(
+            {
+                "_id": ObjectId(user_id),
+                "$or": [
+                    {
+                        "preferences.pet.animation_reset_month": current_month,
+                        "preferences.pet.animation_generation_count": {"$lt": limit},
+                    },
+                    {"preferences.pet.animation_reset_month": {"$ne": current_month}},
+                ],
+            },
+            [
+                {
+                    "$set": {
+                        "preferences.pet.animation_generation_count": {
+                            "$cond": [
+                                {"$ne": [
+                                    {"$ifNull": ["$preferences.pet.animation_reset_month", ""]},
+                                    current_month,
+                                ]},
+                                1,
+                                {"$add": ["$preferences.pet.animation_generation_count", 1]},
+                            ]
+                        },
+                        "preferences.pet.animation_reset_month": current_month,
+                    }
+                }
+            ],
+        )
+        if reserve_result.matched_count == 0:
             raise HTTPException(status_code=429, detail="animation_rate_limit_exceeded")
 
     # Check avatar_url exists and is a hosted HTTPS URL (Cloudinary)
@@ -2181,28 +2247,37 @@ async def generate_animation(
         video_url: str = await _call_fal_animation(avatar_url, motion_prompt, seed=seed_int)
     except Exception as e:
         logger.error(f"Animation generation failed: {e}")
+        # CR-04: Roll back the atomically reserved slot so the user can retry
+        if body.trigger == "manual":
+            await users_collection.update_one(
+                {"_id": ObjectId(user_id)},
+                {"$inc": {"preferences.pet.animation_generation_count": -1}},
+            )
         raise HTTPException(status_code=502, detail="animation_generation_failed")
 
     # Compute current stage from XP
     xp: int = user_doc.get("agent", {}).get("xp", 0)
     stage: int = _level_to_stage(_calculate_level(xp))
 
-    # Persist animation data
+    # Persist animation data.
+    # For manual trigger: count/month already written atomically in the reservation above.
+    # For evolution trigger: count_increment = 0; normalise month field to current_month.
     now = datetime.now(timezone.utc)
-    count_increment: int = 1 if body.trigger == "manual" else 0
+    persist_fields: dict = {
+        "preferences.pet.animation_url": video_url,
+        "preferences.pet.animation_stage": stage,
+        "preferences.pet.animation_generated_at": now,
+        "preferences.pet.animation_regen_pending": False,
+    }
+    if body.trigger == "evolution":
+        persist_fields["preferences.pet.animation_reset_month"] = current_month
     await users_collection.update_one(
-        {"firebase_uid": user_id},
-        {"$set": {
-            "preferences.pet.animation_url": video_url,
-            "preferences.pet.animation_stage": stage,
-            "preferences.pet.animation_generated_at": now,
-            "preferences.pet.animation_generation_count": generation_count + count_increment,
-            "preferences.pet.animation_reset_month": current_month,
-            "preferences.pet.animation_regen_pending": False,
-        }}
+        {"_id": ObjectId(user_id)},  # CR-01 fix: use _id not firebase_uid
+        {"$set": persist_fields}
     )
 
-    generations_remaining: int = limit - (generation_count + count_increment)
+    new_count: int = old_count + (1 if body.trigger == "manual" else 0)
+    generations_remaining: int = limit - new_count
 
     return GenerateAnimationResponse(
         animation_url=video_url,

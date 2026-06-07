@@ -31,6 +31,7 @@ class PyObjectId(ObjectId):
                 ]),
             ]),
             serialization=core_schema.plain_serializer_function_ser_schema(
-                lambda x: str(x)
+                lambda x: str(x),
+                when_used='json',  # Only serialize to string for JSON responses; model_dump() returns ObjectId so MongoDB stores BSON ObjectId
             ),
         )
