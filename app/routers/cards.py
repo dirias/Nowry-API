@@ -2,16 +2,15 @@
 
 import asyncio
 import json
-import os
 import random
 from fastapi import APIRouter, Depends, HTTPException
 from pymongo.collection import Collection
-from groq import Groq
 from app.ai_orchestrator.llm_clients.gemini_client import (
-    Gemini_client,
     GeminiQuotaError,
     GeminiTransientError,
 )
+from app.core.model_config import get_client_for_tier
+from app.core import prompt_manager
 from app.models.StudyCard import StudyCard
 from app.models.CardGenerationRequest import CardGenerationRequest
 from app.models.book_generation import (
@@ -42,26 +41,7 @@ router = APIRouter(
 logger = get_logger(__name__)
 logger_cards = get_logger(__name__)
 
-_GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_BOOK_TEXT_CHARS: int = 50_000
-
-
-def _get_groq_client_cards() -> Groq:
-    api_key: str = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY environment variable is not set")
-    return Groq(api_key=api_key)
-
-
-def _get_llm_client_for_tier_cards(tier: str):
-    if tier == "free":
-        return _get_groq_client_cards()
-    elif tier == "plus":
-        return Gemini_client("models/gemini-flash-latest")
-    elif tier == "pro":
-        return Gemini_client("models/gemini-pro-latest")
-    else:
-        raise ValueError(f"Unknown subscription tier: {tier!r}. Expected 'free', 'plus', or 'pro'.")
 
 
 def _extract_text_from_lexical(lexical_state: dict) -> str:
@@ -176,14 +156,13 @@ async def generate_cards_from_book(
 
     card_limit = 20 if tier == "plus" else None  # Pro = unlimited
 
-    llm_client = _get_llm_client_for_tier_cards(tier)
+    llm_client = get_client_for_tier(tier)
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
 
-    system_prompt = (
-        "You are a flashcard generation expert. Given book content, generate high-quality "
-        "study flashcards. Return ONLY a JSON array with no markdown fences. "
-        "Each card must have 'title' (front of card, a question or concept) and "
-        "'content' (back of card, the answer or explanation). "
-        f"Generate at most {card_limit if card_limit else 'as many as appropriate'} cards."
+    system_prompt = prompt_manager.get_prompt(
+        "nowry-book-cards",
+        card_limit=card_limit if card_limit else "as many as appropriate",
     )
     user_prompt = f"Book content:\n{plain_text}"
 
@@ -286,7 +265,9 @@ async def analyze_deck(
         for c in all_cards
     )
 
-    llm_client = _get_llm_client_for_tier_cards(tier)  # always Gemini Pro for Pro tier
+    llm_client = get_client_for_tier(tier)  # always Gemini Pro for Pro tier
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
 
     system_prompt = (
         "You are a flashcard quality analyst. Analyze the provided deck cards and return a JSON object with:\n"
