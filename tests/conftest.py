@@ -1,6 +1,31 @@
+import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# Phase 10 — heavy dependency stub mocks
+# These packages are not installed in the local Python 3.9 dev env.
+# Stubbing them here (before any test imports orchestrator.py or model_config)
+# allows AIOrchestrator and all graph nodes to be imported without errors.
+# Uses setdefault() so already-mocked modules (from test_model_config.py's
+# top-level guards) are not overwritten.
+# ---------------------------------------------------------------------------
+_STUB_MOCKS = [
+    "langgraph",
+    "langgraph.graph",
+    "langgraph.prebuilt",
+    "langchain",
+    "langchain.schema",
+    "langchain_core",
+    "langchain_groq",
+    "langchain_community",
+    "groq",
+    "google.generativeai",
+    "langfuse",
+]
+for _mod in _STUB_MOCKS:
+    sys.modules.setdefault(_mod, MagicMock())
 
 
 @pytest.fixture

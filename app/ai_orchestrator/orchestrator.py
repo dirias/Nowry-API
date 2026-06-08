@@ -4,8 +4,7 @@ from app.utils.logger import get_logger
 from app.ai_orchestrator.rag.rag_graph import rag_app
 from app.ai_orchestrator.quiz.quiz_graph import quiz_app
 from app.ai_orchestrator.visualizer.visualizer_graph import visualizer_app
-from app.ai_orchestrator.llm_clients.groq_client import Groq_client
-from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
+from app.core import model_config
 
 logger = get_logger(__name__)
 
@@ -19,10 +18,7 @@ class AIOrchestrator:
             "quiz": quiz_app,
             "visualizer": visualizer_app,
         }
-        # Initialize LLM clients once at startup; reused per request (D-02)
-        self.groq_client = Groq_client()                                         # Free tier — Llama 3.3 70B
-        self.gemini_flash_client = Gemini_client("models/gemini-flash-latest")   # Plus tier — Gemini Flash
-        self.gemini_pro_client = Gemini_client("models/gemini-pro-latest")        # Pro tier — Gemini Pro
+        # LLM clients moved to module-level singletons in app.core.model_config (D-13)
 
     def invoke(self, graph_name: str, state: Dict[str, Any]) -> Dict[str, Any]:
         if graph_name not in self.graphs:
@@ -31,17 +27,9 @@ class AIOrchestrator:
 
         graph = self.graphs[graph_name]
 
-        # Model routing per tier (D-02) — tier must be set by route handler before invoking
+        # Model routing per tier (D-13) — delegates to centralized model_config singleton
         tier: str = state.get("tier", "free")
-        if tier == "free":
-            state["llm_client"] = self.groq_client          # Groq Llama 3.3 70B
-        elif tier == "plus":
-            state["llm_client"] = self.gemini_flash_client   # Gemini Flash
-        elif tier == "pro":
-            state["llm_client"] = self.gemini_pro_client     # Gemini Pro
-        else:
-            logger.error(f"[{graph_name}] Unknown tier={tier!r} — defaulting to free (Groq)")
-            state["llm_client"] = self.groq_client           # Unknown tier defaults to free
+        state["llm_client"] = model_config.get_client_for_tier(tier)
         logger.info(f"[{graph_name}] tier={tier} — llm_client assigned")
 
         try:
