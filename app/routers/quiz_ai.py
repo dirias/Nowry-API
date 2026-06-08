@@ -26,12 +26,12 @@ import random
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from groq import Groq
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
 from app.auth.dependencies import get_subscription_tier, track_ai_usage
+from app.core.model_config import get_client_for_tier
+from app.core import prompt_manager
 from app.config.database import (
     ai_quiz_sessions_collection,
     books_collection,
@@ -115,38 +115,6 @@ def _resolve_question_count(
 _GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
-def _get_groq_client() -> Groq:
-    """Return a configured Groq client. Raises RuntimeError if key missing."""
-    api_key: str = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY environment variable is not set")
-    return Groq(api_key=api_key)
-
-
-def _get_llm_client_for_tier(tier: str):
-    """Return the appropriate LLM client for the given subscription tier.
-
-    Centralizes all tier-to-model dispatch for quiz AI (mirrors orchestrator.py pattern).
-
-    Returns:
-        - free: Groq client (Llama 3.3 70B, zero marginal cost)
-        - plus: Gemini Flash client
-        - pro:  Gemini Pro client
-    Raises:
-        RuntimeError: if GROQ_API_KEY is missing (free tier)
-        ValueError: if GEMINI_API_KEY is missing (plus/pro tier)
-        ValueError: if tier is an unexpected value (fail-fast)
-    """
-    if tier == "free":
-        return _get_groq_client()
-    elif tier == "plus":
-        return Gemini_client("models/gemini-flash-latest")
-    elif tier == "pro":
-        return Gemini_client("models/gemini-pro-latest")
-    else:
-        raise ValueError(f"Unknown subscription tier: {tier!r}. Expected 'free', 'plus', or 'pro'.")
-
-
 async def _generate_questions(
     topic: str,
     question_count: int,
@@ -163,48 +131,13 @@ async def _generate_questions(
     Returns a list of AIQuizQuestionStored instances.
     Raises HTTPException(502) on LLM API failure or malformed JSON.
     """
-    llm_client = _get_llm_client_for_tier(tier)
+    llm_client = get_client_for_tier(tier)
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
 
     lang_name: str = _LANGUAGE_NAMES.get(language.split("-")[0].lower(), "English")
 
-    system_prompt: str = (
-        "You are an expert quiz designer. "
-        "Generate a set of study quiz questions on the given topic. "
-        f"All question text and answer text must be written in {lang_name}. "
-        "When the topic involves a language with non-latin script (Japanese, Chinese, Korean, Arabic, etc.), "
-        "include romanisation or pronunciation guides in parentheses wherever helpful to the learner.\n\n"
-        "Rules:\n"
-        "- Return ONLY a valid JSON array — no markdown, no prose, no code fences.\n"
-        "- Each element must be an object with exactly these fields:\n"
-        "  question_type: one of 'fill_in_blank' | 'multiple_choice' | 'short_answer'\n"
-        "  question_text: the full question string\n"
-        "  options: an array of 4 strings for multiple_choice, null otherwise\n"
-        "  correct_answer: the primary expected answer string\n"
-        "  rubric: a concise grading guide (1-3 sentences) written as instructions to an evaluator. "
-        "Default stance is PERMISSIVE — describe what disqualifies an answer, not what qualifies it. "
-        "Always accept: any correct script system (kanji, hiragana, katakana, romaji, pinyin, etc.), "
-        "reasonable typos or misspellings that don't change meaning, equivalent forms in any language, "
-        "and any phrasing that demonstrates the student knows the answer. "
-        "Only describe restrictions when the question explicitly requires a specific form or register. "
-        "Example: 'Accept any correct past tense form in any script — 食べた, tabeta, and tabemashita "
-        "are all valid. Only reject if the student gives a non-past form or the wrong verb entirely. "
-        "Typos like tabetta are fine.'\n"
-        "- Distribute question types: roughly 1/3 each.\n"
-        "- For multiple_choice: include the correct answer as one of the 4 options.\n"
-        "- Make questions genuinely educational — not trivially easy.\n"
-        "- VARIETY IS CRITICAL: each quiz session must feel different. "
-        "Deliberately avoid the most common or obvious examples for the topic — "
-        "choose a wide, randomised spread from across the full topic range. "
-        "If the topic is a vocabulary or word list (e.g. JLPT verbs, Spanish irregular verbs), "
-        "do NOT default to the most frequent/basic items. Pick an eclectic mix including "
-        "mid-frequency and less obvious entries so repeated sessions feel fresh.\n"
-        "- Never repeat the same concept in two questions within this session.\n"
-        "- When a fill_in_blank question requires a specific form, variant, or register "
-        "(e.g. a verb tense, grammatical case, chemical symbol, abbreviated form), state it "
-        "explicitly in the question_text so the student knows exactly what is expected. "
-        "The correct_answer must be precisely the form the question asks for — they must always agree.\n"
-        "- Output must be a JSON array only. No other text whatsoever."
-    )
+    system_prompt = prompt_manager.get_prompt("nowry-quiz-intent", lang_name=lang_name)
 
     variety_hint: str = random.choice([
         "Focus on mid-frequency items — skip the most beginner-obvious examples.",
@@ -479,14 +412,13 @@ async def generate_quiz_from_book(
 
     question_limit = 20 if tier == "plus" else None  # Pro = unlimited
 
-    llm_client = _get_llm_client_for_tier(tier)
+    llm_client = get_client_for_tier(tier)
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
 
-    system_prompt = (
-        "You are a quiz generation expert. Given book content, generate high-quality quiz questions. "
-        "Return ONLY a JSON array with no markdown fences. "
-        "Each question must have 'question', 'correct_answer', 'incorrect_answers' (list of 3), "
-        f"and 'difficulty' ('Easy'|'Medium'|'Hard'). "
-        f"Generate at most {question_limit if question_limit else 'as many as appropriate'} questions."
+    system_prompt = prompt_manager.get_prompt(
+        "nowry-quiz-from-book",
+        question_limit=question_limit if question_limit else "as many as appropriate",
     )
     user_prompt = f"Book content:\n{plain_text}"
 
@@ -573,7 +505,9 @@ async def analyze_deck_for_quiz(
     card_count = len(all_cards)
 
     # Process in batches of 25 — generate quiz questions per batch then combine
-    llm_client = _get_llm_client_for_tier("pro")  # always Gemini Pro for deck analysis — Pro-only
+    llm_client = get_client_for_tier("pro")  # always Gemini Pro for deck analysis — Pro-only
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
 
     all_questions: list = []
     for batch_start in range(0, card_count, BATCH_SIZE):
@@ -584,11 +518,7 @@ async def analyze_deck_for_quiz(
         )
         questions_per_batch = max(1, len(batch) // 2)  # ~2 questions per 4 cards
 
-        system_prompt = (
-            "You are a quiz generation expert. Given flashcard content, generate quiz questions. "
-            "Return ONLY a JSON array of question strings — no markdown, no objects, just plain strings. "
-            f"Generate exactly {questions_per_batch} quiz questions from the cards provided."
-        )
+        system_prompt = prompt_manager.get_prompt("nowry-quiz-from-deck", questions_per_batch=questions_per_batch)
         user_prompt = f"Deck name: {deck.get('name', 'Unknown')}\n\nCards:\n{batch_text}"
 
         raw_text: str = ""
