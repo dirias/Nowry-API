@@ -1,5 +1,6 @@
 import json
 from fastapi import HTTPException
+from app.core import prompt_manager
 
 
 def text_node(state):
@@ -14,13 +15,12 @@ def text_node(state):
     if not prompt or not sample_text or sample_number is None:
         raise HTTPException(status_code=400, detail="Invalid input data")
 
-    from app.core.prompts import RAG_CARD_GENERATION_TEMPLATE
-
-    # Construct LLM request
-    request_string = RAG_CARD_GENERATION_TEMPLATE.format(
+    # Construct LLM request via centralized prompt manager (D-13)
+    request_string = prompt_manager.get_prompt(
+        "nowry-cards-magic",
         prompt=prompt,
         sample_text=sample_text,
-        sample_number=sample_number
+        sample_number=sample_number,
     )
 
     llm_client = state.get("llm_client")

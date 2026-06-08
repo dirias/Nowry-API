@@ -7,6 +7,7 @@ the user's subscription tier. This node no longer manages client lifecycle.
 import json
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
+from app.core import prompt_manager
 
 
 class VisualizerOutput(BaseModel):
@@ -23,17 +24,15 @@ def generate_visual_node(state):
     if not llm_client:
         raise HTTPException(status_code=500, detail="LLM client not injected into state")
 
-    from app.core.prompts import VISUALIZER_GENERATION_TEMPLATE
-
-    # Build prompt string — format template with all required variables
-    # VISUALIZER_GENERATION_TEMPLATE uses {text}, {viz_type}, and {format_instructions}
+    # Build prompt string via centralized prompt manager (D-13)
     format_instructions = (
         "Return a JSON object with exactly these keys: "
         "mermaid_code (string: the valid mermaid.js diagram code), "
         "explanation (string: brief explanation of the diagram). "
         "Do not wrap in markdown code blocks."
     )
-    prompt_string = VISUALIZER_GENERATION_TEMPLATE.format(
+    prompt_string = prompt_manager.get_prompt(
+        "nowry-viz-magic",
         text=text,
         viz_type=viz_type,
         format_instructions=format_instructions,
