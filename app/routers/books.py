@@ -4,40 +4,18 @@ from typing import List, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
-from groq import Groq
-from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
 from app.models.Book import Book, BookSummary
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils.logger import get_logger
+from app.core.model_config import get_client_for_tier
+from app.core import prompt_manager
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# LLM client helpers — tier routing (mirrors quiz_ai.py pattern)
-# ---------------------------------------------------------------------------
-
 _GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-
-def _get_groq_client() -> Groq:
-    api_key: str = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY environment variable is not set")
-    return Groq(api_key=api_key)
-
-
-def _get_llm_client_for_tier(tier: str):
-    if tier == "free":
-        return _get_groq_client()
-    elif tier == "plus":
-        return Gemini_client("models/gemini-flash-latest")
-    elif tier == "pro":
-        return Gemini_client("models/gemini-pro-latest")
-    else:
-        raise ValueError(f"Unknown subscription tier: {tier!r}. Expected 'free', 'plus', or 'pro'.")
 
 
 router = APIRouter(
@@ -432,13 +410,11 @@ async def ai_expand_text(
             detail=f"Selected text exceeds the {limit}-character limit for your plan.",
         )
 
-    llm_client = _get_llm_client_for_tier(tier)
+    llm_client = get_client_for_tier(tier)
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
 
-    system_prompt = (
-        "You are a writing assistant. Expand the provided text with more detail, "
-        "examples, and explanation while preserving its core meaning and tone. "
-        "Return ONLY the expanded text — no preamble, no markdown fences."
-    )
+    system_prompt = prompt_manager.get_prompt("nowry-book-expand")
     user_prompt = (
         f"Instruction: {body.instruction}\n\n"
         f"Text to expand:\n{body.selected_text}"
