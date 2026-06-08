@@ -129,3 +129,201 @@ def test_model_config_derived_from_live_wiring(monkeypatch):
     source = inspect.getsource(sync_langfuse.derive_model_config_dict)
     assert "subscription_plans" not in source
     assert "AGENT_MODELS" not in source
+
+
+# ---------------------------------------------------------------------------
+# Wave 2 (Plan 02) tests: cache-gating, idempotent re-run, dry-run no-writes
+# ---------------------------------------------------------------------------
+
+import json
+from datetime import datetime
+
+
+def _write_tmp_cache(tmp_path):
+    """Write an isolated langfuse_cache.json copy with the real 8-prompt
+    shape so each cache-gating/regeneration test doesn't repeat the JSON
+    construction. Returns the Path to the written file."""
+    cache_path = tmp_path / "langfuse_cache.json"
+    cache_data = {
+        "version": 1,
+        "updated_at": None,
+        "prompts": {name: content for name, content in _FALLBACKS.items()},
+        "model_config": {},
+    }
+    cache_path.write_text(json.dumps(cache_data, indent=2))
+    return cache_path
+
+
+def _patch_model_config(monkeypatch):
+    """Patch model_config singleton attributes so derive_model_config_dict()
+    returns a deterministic, known dict across these tests."""
+    fake_groq = MagicMock()
+    fake_groq.model = "llama-3.3-70b-versatile"
+    fake_flash = MagicMock()
+    fake_flash._model_id = "models/gemini-flash-latest"
+    fake_pro = MagicMock()
+    fake_pro._model_id = "models/gemini-pro-latest"
+
+    import app.core.model_config as model_config
+
+    monkeypatch.setattr(model_config, "_groq_client", fake_groq)
+    monkeypatch.setattr(model_config, "_gemini_flash_client", fake_flash)
+    monkeypatch.setattr(model_config, "_gemini_pro_client", fake_pro)
+
+    return {
+        "free": "llama-3.3-70b-versatile",
+        "plus": "models/gemini-flash-latest",
+        "pro": "models/gemini-pro-latest",
+    }
+
+
+def test_cache_not_written_on_partial_failure(monkeypatch, tmp_path):
+    """11-03-01 / SY-04, T-11-02: a single failed push leaves
+    langfuse_cache.json byte-for-byte untouched and exits non-zero (D-10
+    all-or-nothing cache-regeneration gate)."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    expected_model_config = _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+    original_bytes = cache_path.read_bytes()
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    FAILING_NAME = "nowry-quiz-from-deck"
+
+    def fake_get_prompt(name, type="text"):
+        if name == MODEL_CONFIG_NAME_FOR_TEST:
+            return MagicMock(prompt="Model configuration", config=expected_model_config)
+        if name == FAILING_NAME:
+            raise Exception("network error fetching prompt")
+        return MagicMock(prompt=_FALLBACKS[name], config=None)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main([])
+
+    assert exc_info.value.code != 0
+    assert cache_path.read_bytes() == original_bytes
+
+
+# Module-level constant mirrored here (avoid importing sync_langfuse at
+# module load time — keeps RED-state import errors contained per-test).
+MODEL_CONFIG_NAME_FOR_TEST = "nowry-model-config"
+
+
+def test_cache_regeneration_shape(monkeypatch, tmp_path):
+    """11-03-02 / SY-04: a fully successful run regenerates langfuse_cache.json
+    with version, ISO-8601 updated_at, all 8 prompts, and a non-empty
+    model_config matching prewarm()'s expected shape."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    expected_model_config = _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    def fake_get_prompt(name, type="text"):
+        if name == MODEL_CONFIG_NAME_FOR_TEST:
+            return MagicMock(prompt="Model configuration", config=expected_model_config)
+        return MagicMock(prompt=_FALLBACKS[name], config=None)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main([])
+
+    assert exc_info.value.code == 0
+
+    data = json.loads(cache_path.read_text())
+    assert data["version"] == 1
+    assert data["updated_at"] is not None
+    # Must parse as ISO-8601 (tolerate trailing 'Z')
+    datetime.fromisoformat(data["updated_at"].replace("Z", "+00:00"))
+    assert len(data["prompts"]) == 8
+    for name in _FALLBACKS:
+        assert name in data["prompts"]
+    assert isinstance(data["model_config"], dict)
+    assert data["model_config"] == expected_model_config
+
+
+def test_idempotent_rerun_creates_no_versions(monkeypatch, tmp_path):
+    """11-03-03 / SY-04: when remote content for all 8 prompts AND the model
+    config already matches local, zero create_prompt calls occur — the
+    SY-04 contract made testable end-to-end."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    expected_model_config = _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    def fake_get_prompt(name, type="text"):
+        if name == MODEL_CONFIG_NAME_FOR_TEST:
+            return MagicMock(prompt="Model configuration", config=expected_model_config)
+        return MagicMock(prompt=_FALLBACKS[name], config=None)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main([])
+
+    assert exc_info.value.code == 0
+    assert fake_client.create_prompt.call_count == 0
+
+
+def test_dry_run_makes_no_writes(monkeypatch, tmp_path, capsys):
+    """11-04-01 / SY-01..04: --dry-run prefixes every status line with
+    [DRY RUN], makes zero create_prompt calls and zero cache writes, and
+    prints a differently-worded tally (would push / cache NOT regenerated)."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    expected_model_config = _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+    original_bytes = cache_path.read_bytes()
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    DIFFERENT_NAMES = {"nowry-cards-magic", "nowry-quiz-magic"}
+
+    def fake_get_prompt(name, type="text"):
+        if name == MODEL_CONFIG_NAME_FOR_TEST:
+            return MagicMock(prompt="Model configuration", config=expected_model_config)
+        if name in DIFFERENT_NAMES:
+            return MagicMock(prompt="DIFFERENT CONTENT THAT DOES NOT MATCH LOCAL", config=None)
+        return MagicMock(prompt=_FALLBACKS[name], config=None)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main(["--dry-run"])
+
+    assert exc_info.value.code == 0
+    assert fake_client.create_prompt.call_count == 0
+    assert cache_path.read_bytes() == original_bytes
+
+    out = capsys.readouterr().out
+    dry_run_lines = [line for line in out.splitlines() if "[DRY RUN]" in line]
+    assert len(dry_run_lines) >= 2
+    tally_lines = [line for line in out.splitlines() if "cache NOT regenerated" in line]
+    assert len(tally_lines) == 1
