@@ -223,6 +223,22 @@ def main(argv=None):
 
     # --- nowry-model-config (D-07 derivation + D-05 compare-before-push) ---
     local_model_config = derive_model_config_dict()
+
+    # T-11-06 mitigation (CR-01): a partial/empty derived config must never be
+    # trusted as a push/cache candidate -- it would silently overwrite a correct
+    # production `nowry-model-config` and get baked into the cold-start cache.
+    # Fail loudly and refuse to push or regenerate the cache if any tier is
+    # missing (e.g. GROQ_API_KEY / GEMINI_API_KEY absent from this script's env).
+    EXPECTED_TIERS = {"free", "plus", "pro"}
+    missing_tiers = EXPECTED_TIERS - local_model_config.keys()
+    if missing_tiers:
+        print(
+            f"ERROR: derived model config is missing tier(s) {sorted(missing_tiers)} -- "
+            f"refusing to push or cache an incomplete config. Check that "
+            f"GROQ_API_KEY/GEMINI_API_KEY are set in this script's environment."
+        )
+        sys.exit(1)
+
     model_config_status = "unchanged"
     try:
         current_cfg = client.get_prompt(MODEL_CONFIG_NAME, type="text")
