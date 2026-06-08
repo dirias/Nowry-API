@@ -21,10 +21,7 @@ if _SENTRY_DSN:
     )
 
 import asyncio
-import json
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +31,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.config.database import create_indexes
 from app.core.limiter import limiter
 from app.core import langfuse_client as _langfuse_module
+from app.core import prompt_manager
 
 logger = logging.getLogger(__name__)
 from app.routers import (
@@ -69,29 +67,6 @@ from app.routers import (
 
 
 
-
-async def _refresh_langfuse_cache() -> None:
-    """
-    Background task (non-blocking): write an updated langfuse_cache.json timestamp.
-    Phase 9 scope: cache skeleton only. Phase 10 populates prompts; Phase 11 syncs both.
-    If any error occurs, logs a warning and continues — never raises.
-    """
-    try:
-        logger.info("Refreshing Langfuse cache in background...")
-        cache_data = {
-            "version": 1,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "prompts": {},
-            "model_config": {},
-        }
-        cache_path = Path(__file__).parent / "config" / "langfuse_cache.json"
-        with open(cache_path, "w") as f:
-            json.dump(cache_data, f, indent=2)
-        logger.info("Langfuse cache refreshed: %s", cache_path)
-    except Exception as e:
-        logger.warning("Failed to refresh Langfuse cache: %s. Using existing cache if available.", e)
-
-
 async def _flush_langfuse_queue() -> None:
     """
     Graceful shutdown: flush pending Langfuse traces with 5s timeout.
@@ -118,10 +93,9 @@ async def _flush_langfuse_queue() -> None:
 async def lifespan(app: FastAPI):
     # Startup
     await create_indexes()
-    # [Langfuse] Non-blocking cache refresh — fire task, do NOT await
-    # In-flight requests proceed immediately; cache writes in background (D-07)
-    if _langfuse_module._langfuse_client:
-        asyncio.create_task(_refresh_langfuse_cache())
+    # [Phase 10] Pre-warm all 8 prompt templates into _prompt_cache and langfuse_cache.json.
+    # Non-raising: falls back to core/prompts.py constants on any Langfuse error (D-07).
+    await prompt_manager.prewarm()
     yield
     # Shutdown
     await _flush_langfuse_queue()
