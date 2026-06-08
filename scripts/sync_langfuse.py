@@ -178,14 +178,37 @@ def regenerate_cache(prompts_dict, model_config_dict, cache_path):
 
     T-11-02 mitigation (D-10): this is the ONLY call site of regenerate_cache()
     in the entire module, reached exclusively from the `if failed_count == 0`
-    branch in main() -- structurally impossible to write a half-synced cache."""
-    with open(cache_path) as f:
-        cache_data = json.load(f)
+    branch in main() -- structurally impossible to write a half-synced cache.
+
+    T-11-07 mitigation (CR-02): unlike prewarm()'s write-through (which
+    tolerates a failed cache write by logging a warning and continuing on
+    its in-memory fallbacks), a crash here happens AFTER prompts have
+    already been pushed to Langfuse production -- so we (a) wrap the
+    read/write in error handling that fails loudly with a clear message
+    instead of an uncaught traceback, and (b) write atomically via a
+    temp-file-then-rename so a mid-write crash (Ctrl-C, OOM, disk full)
+    can never leave langfuse_cache.json as a zero-byte or partial-JSON
+    file -- the existing cache is only ever replaced by `os.replace`,
+    which is atomic on POSIX."""
+    try:
+        with open(cache_path) as f:
+            cache_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"ERROR: could not read {cache_path} for regeneration: {exc}")
+        sys.exit(1)
+
     cache_data["prompts"] = dict(prompts_dict)
     cache_data["model_config"] = dict(model_config_dict)
     cache_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    with open(cache_path, "w") as f:
-        json.dump(cache_data, f, indent=2)
+
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+        os.replace(tmp_path, cache_path)  # atomic on POSIX -- no partial-write window
+    except OSError as exc:
+        print(f"ERROR: failed to write regenerated cache to {cache_path}: {exc}")
+        sys.exit(1)
 
 
 def _config_dicts_equal(a, b):
