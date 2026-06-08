@@ -146,16 +146,27 @@ def derive_model_config_dict():
     NEVER hardcodes values and NEVER reads the Smart Pet agent's separate
     tier->model map (a different system -- see Pitfall 4 in 11-RESEARCH.md).
     This guarantees nowry-model-config can never drift from what the
-    running app actually does."""
+    running app actually does.
+
+    T-11-06 mitigation: the attribute access below reaches into private,
+    implementation-detail attributes (`.model`, `._model_id`) on singleton
+    client objects. Wrapped in try/except so a future client refactor that
+    renames/removes these surfaces a clean error message (matching this
+    script's established clean-error-reporting pattern) instead of a raw
+    AttributeError traceback mid-run."""
     import app.core.model_config as model_config
 
     result = {}
-    if model_config._groq_client is not None:
-        result["free"] = model_config._groq_client.model
-    if model_config._gemini_flash_client is not None:
-        result["plus"] = model_config._gemini_flash_client._model_id
-    if model_config._gemini_pro_client is not None:
-        result["pro"] = model_config._gemini_pro_client._model_id
+    try:
+        if model_config._groq_client is not None:
+            result["free"] = model_config._groq_client.model
+        if model_config._gemini_flash_client is not None:
+            result["plus"] = model_config._gemini_flash_client._model_id
+        if model_config._gemini_pro_client is not None:
+            result["pro"] = model_config._gemini_pro_client._model_id
+    except AttributeError as exc:
+        print(f"ERROR: could not derive model config from live client wiring: {exc}")
+        sys.exit(1)
     return result
 
 
