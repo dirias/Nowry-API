@@ -14,8 +14,23 @@ Usage (run from Nowry-API/):
 """
 import os
 import sys
+import json
 import argparse
 import logging
+from pathlib import Path
+from datetime import datetime, timezone
+
+# This script lives in Nowry-API/scripts/ but imports the app.* package that
+# lives in Nowry-API/. Unlike root-level standalone scripts (check_models.py,
+# fix_all_public_books.py) where `python script.py` naturally puts Nowry-API/
+# on sys.path[0], a script in a subdirectory only gets scripts/ added --
+# `app` would not be importable without this. Prepend the repo root (parent
+# of this file's directory) so `python scripts/sync_langfuse.py` works from
+# Nowry-API/ exactly as documented (D-03), matching pytest's rootdir-based
+# resolution that already makes `from app.core...` work in the test suite.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from dotenv import load_dotenv
 
@@ -29,6 +44,12 @@ logging.basicConfig(level=logging.WARNING)
 PRODUCTION_LABEL = "production"
 MODEL_CONFIG_NAME = "nowry-model-config"
 DEFAULT_LANGFUSE_URL = "https://cloud.langfuse.com"
+
+# Full-rewrite target for regenerate_cache() -- mirrors prompt_manager.prewarm()'s
+# write-through path (Path(__file__).parent.parent / "config" / "langfuse_cache.json"
+# from app/core/, which resolves to the same app/config/ directory when computed
+# relative to this script's location in scripts/).
+CACHE_PATH = Path(__file__).resolve().parent.parent / "app" / "config" / "langfuse_cache.json"
 
 # Hoisted to module level (guarded by try/except) so that
 # patch("scripts.sync_langfuse.Langfuse", ..., create=True) resolves to a
@@ -138,19 +159,115 @@ def derive_model_config_dict():
     return result
 
 
+def regenerate_cache(prompts_dict, model_config_dict, cache_path):
+    """Full rewrite of langfuse_cache.json -- mirrors prompt_manager.prewarm()'s
+    write-through shape (lines 141-157) so prewarm() reads it identically.
+    Sets updated_at to an ISO-8601 UTC timestamp (this script OWNS that field --
+    Phase 10 explicitly left it None with a comment naming this phase).
+
+    T-11-02 mitigation (D-10): this is the ONLY call site of regenerate_cache()
+    in the entire module, reached exclusively from the `if failed_count == 0`
+    branch in main() -- structurally impossible to write a half-synced cache."""
+    with open(cache_path) as f:
+        cache_data = json.load(f)
+    cache_data["prompts"] = dict(prompts_dict)
+    cache_data["model_config"] = dict(model_config_dict)
+    cache_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(cache_path, "w") as f:
+        json.dump(cache_data, f, indent=2)
+
+
+def _config_dicts_equal(a, b):
+    """Order-independent structural comparison via sorted-key JSON serialization
+    (Pitfall 6 -- avoid naive `==` on dicts with possible key-order/nesting
+    differences causing false 'changed' positives)."""
+    return json.dumps(a or {}, sort_keys=True) == json.dumps(b or {}, sort_keys=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Sync prompts and model config to Langfuse.")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without writing to Langfuse or the local cache.")
     args = parser.parse_args(argv)
+    dry_run = args.dry_run
 
     secret, public = _validate_credentials()
     base_url = _validate_base_url()
     client = _build_client(secret, public, base_url)
 
-    # NOTE: prompt loop, model-config push, cache regeneration, final tally,
-    # and exit-code wiring are completed in Plan 02 (11-02-PLAN.md). This
-    # function and the helpers above are the stable contract Plan 02 builds on.
-    return client, args
+    pushed_count = 0
+    unchanged_count = 0
+    failed_count = 0
+    synced_prompts = {}
+
+    # --- 8 prompts (D-05 compare-before-push, reusing Plan 01's core) ---
+    for name, local_content in _FALLBACKS.items():
+        status = compare_and_push_prompt(client, name, local_content, dry_run=dry_run)
+        synced_prompts[name] = local_content
+        if status == "pushed":
+            pushed_count += 1
+        elif status == "unchanged":
+            unchanged_count += 1
+        else:
+            failed_count += 1
+
+    # --- nowry-model-config (D-07 derivation + D-05 compare-before-push) ---
+    local_model_config = derive_model_config_dict()
+    model_config_status = "unchanged"
+    try:
+        current_cfg = client.get_prompt(MODEL_CONFIG_NAME, type="text")
+        remote_model_config = getattr(current_cfg, "config", None)
+    except Exception as exc:
+        print(f"ERROR fetching {MODEL_CONFIG_NAME}: {exc}")
+        remote_model_config = None
+        failed_count += 1
+        model_config_status = "error"
+
+    if model_config_status != "error":
+        if _config_dicts_equal(remote_model_config, local_model_config):
+            prefix = "[DRY RUN] " if dry_run else ""
+            print(f"{prefix}{MODEL_CONFIG_NAME}: unchanged -- skipped")
+            model_config_status = "unchanged"
+        else:
+            if dry_run:
+                print(f"[DRY RUN] {MODEL_CONFIG_NAME}: content changed -- would push new version")
+                model_config_status = "changed"
+            else:
+                try:
+                    client.create_prompt(
+                        name=MODEL_CONFIG_NAME,
+                        type="text",
+                        prompt="Model configuration",
+                        config=local_model_config,
+                        labels=[PRODUCTION_LABEL],
+                    )
+                    print(f"{MODEL_CONFIG_NAME}: content changed -- pushing new version")
+                    model_config_status = "changed"
+                except Exception as exc:
+                    print(f"ERROR pushing {MODEL_CONFIG_NAME}: {exc}")
+                    failed_count += 1
+                    model_config_status = "error"
+
+    # --- dry-run: report and exit, never write anything (T-11-05 mitigation) ---
+    if dry_run:
+        cfg_word = "would update" if model_config_status == "changed" else "unchanged"
+        print(
+            f"[DRY RUN] Would push: {pushed_count}, unchanged: {unchanged_count}, "
+            f"model config {cfg_word}, cache NOT regenerated"
+        )
+        sys.exit(0)
+
+    # --- gate cache regeneration on FULL success (D-10 / T-11-02) ---
+    if failed_count == 0:
+        regenerate_cache(synced_prompts, local_model_config, CACHE_PATH)
+        cfg_word = "updated" if model_config_status == "changed" else "unchanged"
+        print(
+            f"Done: {pushed_count} pushed, {unchanged_count} unchanged, "
+            f"model config {cfg_word}, cache regenerated -> app/config/langfuse_cache.json"
+        )
+        sys.exit(0)
+    else:
+        print(f"ERROR: {failed_count} push(es) failed. Cache NOT regenerated. Re-run to retry.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
