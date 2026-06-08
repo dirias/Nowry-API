@@ -212,10 +212,31 @@ def regenerate_cache(prompts_dict, model_config_dict, cache_path):
 
 
 def _config_dicts_equal(a, b):
-    """Order-independent structural comparison via sorted-key JSON serialization
-    (Pitfall 6 -- avoid naive `==` on dicts with possible key-order/nesting
-    differences causing false 'changed' positives)."""
-    return json.dumps(a or {}, sort_keys=True) == json.dumps(b or {}, sort_keys=True)
+    """Order-independent, type-tolerant structural comparison (Pitfall 6 --
+    avoid naive `==`/byte-exact JSON comparison on dicts with possible
+    key-order or representational differences causing false 'changed'
+    positives).
+
+    T-11-08 mitigation (WR-02): `compare_and_push_prompt` tolerates
+    leading/trailing whitespace differences in prompt content via
+    `.strip()` (line 120) -- this comparison must apply equivalent
+    tolerance to model-config values, or any minor round-trip drift
+    between what's pushed and what Langfuse returns (e.g. the SDK
+    normalizing a numeric/boolean value to a string, or a stray
+    trailing space in a model identifier) would make this report
+    "changed" on every single run, defeating the idempotency guarantee
+    (SY-04) specifically for `nowry-model-config`. Stringify + strip
+    every value on both sides before the sorted-key comparison so the
+    tolerance matches prompt-content comparison's assumptions.
+
+    Assumption a future maintainer should know: this assumes Langfuse
+    round-trips `config` values as scalars whose `str()` representation
+    is stable across pushes -- if that ever stops holding (e.g. nested
+    dict/list values appear in the config), this normalization would
+    need to recurse rather than stringify at the top level."""
+    def _normalize(d):
+        return {k: str(v).strip() for k, v in (d or {}).items()}
+    return json.dumps(_normalize(a), sort_keys=True) == json.dumps(_normalize(b), sort_keys=True)
 
 
 def main(argv=None):
