@@ -34,9 +34,9 @@ if _REPO_ROOT not in sys.path:
 
 from dotenv import load_dotenv
 
-from app.core.prompt_manager import _FALLBACKS
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / "app" / ".env")
 
-load_dotenv()
+from app.core.prompt_manager import _FALLBACKS
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.WARNING)

@@ -33,10 +33,15 @@ from app.core.prompt_manager import _FALLBACKS
 def test_missing_credentials_exits_nonzero(monkeypatch):
     """11-01-01 / SY-01: missing LANGFUSE_SECRET_KEY/LANGFUSE_PUBLIC_KEY exits 1
     BEFORE any Langfuse client construction or API call (T-11-01 fail-fast)."""
+    from scripts import sync_langfuse
+
+    # delenv AFTER import: sync_langfuse's module-level load_dotenv(dotenv_path=...)
+    # (11-03 gap fix) populates os.environ from app/.env at import time, which
+    # would otherwise re-supply real credentials and defeat this test. Deleting
+    # after import (but before main()) ensures _validate_credentials() sees
+    # unset vars regardless of whether this is the first import in the session.
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
-
-    from scripts import sync_langfuse
 
     fake_langfuse_ctor = MagicMock()
     with patch("scripts.sync_langfuse.Langfuse", fake_langfuse_ctor, create=True):
@@ -45,6 +50,33 @@ def test_missing_credentials_exits_nonzero(monkeypatch):
 
     assert exc_info.value.code == 1
     assert fake_langfuse_ctor.call_count == 0
+
+
+def test_load_dotenv_called_before_prompt_manager_import():
+    """Gap-fix regression (UAT Test 1 & 2): load_dotenv(dotenv_path=...) pointing
+    at app/.env must run BEFORE `from app.core.prompt_manager import _FALLBACKS` --
+    otherwise (a) _validate_credentials() can never see app/.env's keys (UAT Test 2,
+    blocker), and (b) app.core.langfuse_client's module-level singleton (transitively
+    imported via prompt_manager) sees unset env vars and prints a spurious 'Langfuse
+    disabled' warning even on --help (UAT Test 1, minor)."""
+    from scripts import sync_langfuse
+
+    source = inspect.getsource(sync_langfuse)
+
+    load_dotenv_snippet = 'load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / "app" / ".env")'
+    import_snippet = "from app.core.prompt_manager import _FALLBACKS"
+
+    assert load_dotenv_snippet in source
+    assert import_snippet in source
+
+    load_dotenv_index = source.index(load_dotenv_snippet)
+    import_index = source.index(import_snippet)
+
+    assert load_dotenv_index < import_index, (
+        "load_dotenv(dotenv_path=...) must appear BEFORE the "
+        "app.core.prompt_manager import so env vars are loaded before "
+        "the transitively-imported langfuse_client singleton reads os.environ"
+    )
 
 
 def test_compare_before_push_skips_unchanged(monkeypatch):
