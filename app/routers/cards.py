@@ -9,7 +9,9 @@ from app.ai_orchestrator.llm_clients.gemini_client import (
     GeminiQuotaError,
     GeminiTransientError,
 )
-from app.core.model_config import get_client_for_tier
+from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
+from app.core.langfuse_client import get_langfuse_client
+from langfuse import propagate_attributes
 from app.core import prompt_manager
 from app.models.StudyCard import StudyCard
 from app.models.CardGenerationRequest import CardGenerationRequest
@@ -166,6 +168,10 @@ async def generate_cards_from_book(
     )
     user_prompt = f"Book content:\n{plain_text}"
 
+    client = get_langfuse_client()
+    model_name = TIER_MODEL_NAMES.get(tier, TIER_MODEL_NAMES["free"])
+    trace_metadata = {"feature": "book_cards", "tier": tier, "user_id": user_id, "model": model_name}
+
     # Retry only on transient errors; fail fast on quota exhaustion.
     # Backoff: attempt 1 → immediate, attempt 2 → ~1 s, attempt 3 → ~2 s (with jitter).
     _MAX_ATTEMPTS: int = 3
@@ -180,8 +186,36 @@ async def generate_cards_from_book(
             delay: float = _BACKOFF_BASE * (2 ** (attempt - 2)) + random.uniform(0.0, 0.3)
             await asyncio.sleep(delay)
         try:
-            completion = llm_client.request(combined_prompt)
-            raw_text = (completion.choices[0].message.content or "").strip()
+            if client:
+                try:
+                    with propagate_attributes(
+                        user_id=user_id,
+                        trace_name="book_cards",
+                        metadata=trace_metadata,
+                        tags=["book_cards", tier],
+                    ):
+                        with client.start_as_current_generation(
+                            name="book_cards",
+                            model=model_name,
+                            input=[{"role": "user", "content": combined_prompt}],
+                            model_parameters={"card_limit": card_limit},
+                        ) as generation:
+                            completion = llm_client.request(combined_prompt)
+                            raw_text = (completion.choices[0].message.content or "").strip()
+                            # D-13: full output, no truncation. Gemini wrapper exposes no usage -> None.
+                            generation.update(output=raw_text, usage_details=None)
+                except (GeminiQuotaError, GeminiTransientError, HTTPException):
+                    raise
+                except Exception as langfuse_exc:
+                    logger_cards.warning(
+                        f"[generate_cards_from_book] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                    )
+                    completion = llm_client.request(combined_prompt)
+                    raw_text = (completion.choices[0].message.content or "").strip()
+            else:
+                completion = llm_client.request(combined_prompt)
+                raw_text = (completion.choices[0].message.content or "").strip()
+
             if raw_text:
                 break
             logger_cards.warning(f"[generate_cards_from_book] Empty response attempt {attempt}")
