@@ -13,6 +13,9 @@ Call sites MUST guard usage:
     client = get_client_for_tier(tier)
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable.")
+
+TIER_MODEL_NAMES provides the Langfuse trace `model` metadata value per tier
+(Phase 12, D-07) — keep this in sync with get_client_for_tier()'s tier resolution.
 """
 
 import os
@@ -34,6 +37,17 @@ if "Gemini_client" not in globals():
 # Module-level env var reads — must happen before client creation (mirrors langfuse_client.py:34-36)
 _GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
 _GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
+
+_GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# D-07 (11-CONTEXT.md): tier -> model name for Langfuse trace `model` metadata (Phase 12).
+# Single source of truth — imported by orchestrator.py, books.py, cards.py, quiz_ai.py,
+# agent.py instead of each file re-deriving its own _GROQ_MODEL/_TIER_MODEL dict (MC-03).
+TIER_MODEL_NAMES: dict[str, str] = {
+    "free": _GROQ_MODEL,
+    "plus": "models/gemini-flash-latest",
+    "pro": "models/gemini-pro-latest",
+}
 
 # Module-level singleton clients — initialized once at import time (D-10)
 # Not re-created per request (that was the performance bug in the old helpers)
