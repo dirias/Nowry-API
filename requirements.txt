@@ -2,6 +2,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+eval-type-backport  # Required by pydantic v2 to resolve `X | Y` union syntax on Python <3.10
 pymongo
 motor
 python-multipart

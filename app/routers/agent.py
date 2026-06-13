@@ -15,6 +15,7 @@ Architecture: Hybrid RAG
     in standard chat-only mode.
   - All tools are READ-ONLY. No write operations are ever exposed.
 """
+from __future__ import annotations
 
 import asyncio
 import json
