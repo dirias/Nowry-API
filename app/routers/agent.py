@@ -1230,7 +1230,49 @@ KNOWLEDGE_TOOLS = [
 ]
 
 
-async def _dispatch_tool_call(fn_name: str, fn_args: dict, user_id: str) -> str:
+async def _dispatch_tool_call(
+    fn_name: str, fn_args: dict, user_id: str, client=None
+) -> str:
+    """
+    Executes the tool function requested by the model and returns the
+    result as a JSON string to feed back into the conversation.
+
+    When `client` (a Langfuse client, D-11) is provided, wraps the dispatch in a
+    nested `as_type="tool"` span that automatically nests under the calling
+    chat()'s smart_pet_chat generation via OTel context — no manual parent-id
+    wiring required.
+    """
+    span_cm = contextlib.nullcontext()
+    if client:
+        try:
+            span_cm = client.start_as_current_observation(
+                name=f"tool:{fn_name}",
+                as_type="tool",
+                input=fn_args,
+            )
+        except Exception as langfuse_exc:
+            logger.warning(
+                f"[Tool] Langfuse tracing failed for tool:{fn_name}, continuing without trace: {langfuse_exc}"
+            )
+            span_cm = contextlib.nullcontext()
+
+    with span_cm as tool_span:
+        # ── The ONE tool-execution call — executes exactly once ─────────────
+        result_str = await _dispatch_tool_call_inner(fn_name, fn_args, user_id)
+
+        if tool_span is not None:
+            try:
+                # D-13: full tool result, no truncation
+                tool_span.update(output=result_str)
+            except Exception as langfuse_exc:
+                logger.warning(
+                    f"[Tool] Langfuse tracing failed for tool:{fn_name}, continuing without trace: {langfuse_exc}"
+                )
+
+        return result_str
+
+
+async def _dispatch_tool_call_inner(fn_name: str, fn_args: dict, user_id: str) -> str:
     """
     Executes the tool function requested by the model and returns the
     result as a JSON string to feed back into the conversation.
