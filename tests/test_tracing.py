@@ -142,7 +142,28 @@ def _ensure_cards_importable() -> None:
         sys.modules["app.models.quiz"] = mock_quiz_mod
 
 
+def _ensure_tts_importable() -> None:
+    """tts.py and its tts_client helper do `from google.cloud import texttospeech` /
+    `from google.oauth2 import service_account`. _ensure_books_importable() (above)
+    registers sys.modules["google"] as a bare MagicMock() when "google" is not
+    already present — a MagicMock is not a package, so `from google.cloud import
+    texttospeech` then raises "ModuleNotFoundError: No module named 'google.cloud';
+    'google' is not a package". Register the submodules tts.py needs directly in
+    sys.modules so the `from X.Y import Z` form resolves to MagicMock attributes."""
+    for mod_name in (
+        "google.cloud",
+        "google.cloud.texttospeech",
+        "google.oauth2",
+        "google.oauth2.service_account",
+    ):
+        sys.modules.setdefault(mod_name, MagicMock())
+
+    if "app.ai_orchestrator.llm_clients.tts_client" not in sys.modules:
+        sys.modules["app.ai_orchestrator.llm_clients.tts_client"] = MagicMock()
+
+
 _ensure_cards_importable()
+_ensure_tts_importable()
 
 
 # Drop any stale app.routers.books / app.routers.cards stubs left by
@@ -152,6 +173,7 @@ _ensure_cards_importable()
 sys.modules.pop("app.routers.books", None)
 sys.modules.pop("app.routers.cards", None)
 sys.modules.pop("app.routers.quiz_ai", None)
+sys.modules.pop("app.routers.tts", None)
 
 import pytest
 
@@ -871,3 +893,176 @@ async def test_chat_langfuse_unreachable(broken_langfuse_client, caplog):
         if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
     ]
     assert len(warning_records) == 1
+
+
+# ---------------------------------------------------------------------------
+# Scenarios 9 & 10 — tts.py generate_tts (Pattern D, D-01/D-06/D-12, feature=tts_amagic, TR-04)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_tts_happy_path_traces_tts_amagic(mock_langfuse_client):
+    import app.routers.tts as tts_module
+    from app.models.tts import TTSRequest
+
+    fake_book = {"_id": "abc123", "user_id": "u1", "deleted_at": None}
+    fake_tts_client = MagicMock()
+    fake_tts_client.synthesize_speech.return_value = MagicMock(audio_content=b"fake-mp3-bytes")
+
+    body = TTSRequest(text="Hello world", language_code="fr-FR")
+    current_user = {"user_id": "u1"}
+
+    with patch.object(tts_module, "books_collection") as mock_books_collection, \
+         patch.object(tts_module, "get_tts_client", return_value=fake_tts_client), \
+         patch.object(tts_module, "get_langfuse_client", return_value=mock_langfuse_client), \
+         patch.object(tts_module, "ObjectId", side_effect=lambda x: x):
+        mock_books_collection.find_one = AsyncMock(return_value=fake_book)
+
+        response = await tts_module.generate_tts(
+            book_id="abc123", body=body, tier="pro", current_user=current_user
+        )
+
+    assert response.body == b"fake-mp3-bytes"
+    assert fake_tts_client.synthesize_speech.call_count == 1  # TR-06: single synthesis call
+
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, obs_kwargs = mock_langfuse_client.start_as_current_observation.call_args
+    assert obs_kwargs["name"] == "tts_amagic"
+    assert obs_kwargs["as_type"] == "span"
+    assert obs_kwargs["input"]["language_code"] == "fr-FR"
+
+    span_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
+    span_ctx.update.assert_called_once()
+    _, update_kwargs = span_ctx.update.call_args
+    output = update_kwargs["output"]
+    assert "audio_byte_size" in output
+    assert "voice_ssml_gender" in output
+    assert "latency_ms" in output
+    assert "audio_content" not in output
+    assert update_kwargs["metadata"]["voice_name"] == "fr-FR"
+
+
+@pytest.mark.asyncio
+async def test_generate_tts_langfuse_unreachable(broken_langfuse_client, caplog):
+    import app.routers.tts as tts_module
+    from app.models.tts import TTSRequest
+
+    fake_book = {"_id": "abc123", "user_id": "u1", "deleted_at": None}
+    fake_tts_client = MagicMock()
+    fake_tts_client.synthesize_speech.return_value = MagicMock(audio_content=b"fake-mp3-bytes")
+
+    body = TTSRequest(text="Hello world", language_code="fr-FR")
+    current_user = {"user_id": "u1"}
+
+    with patch.object(tts_module, "books_collection") as mock_books_collection, \
+         patch.object(tts_module, "get_tts_client", return_value=fake_tts_client), \
+         patch.object(tts_module, "get_langfuse_client", return_value=broken_langfuse_client), \
+         patch.object(tts_module, "ObjectId", side_effect=lambda x: x):
+        mock_books_collection.find_one = AsyncMock(return_value=fake_book)
+
+        with caplog.at_level(logging.WARNING):
+            response = await tts_module.generate_tts(
+                book_id="abc123", body=body, tier="pro", current_user=current_user
+            )
+
+    assert response.body == b"fake-mp3-bytes"
+    assert fake_tts_client.synthesize_speech.call_count == 1  # TR-06: single synthesis call even when Langfuse fails
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
+    ]
+    assert len(warning_records) == 1
+
+
+# ---------------------------------------------------------------------------
+# CI-blocking guardrails (Section 6) — fail-open (TR-06), metadata/taxonomy-shape (TR-05),
+# no-@observe-on-TTS (D-06/SC6)
+# ---------------------------------------------------------------------------
+
+
+def test_no_observe_decorator_on_tts():
+    """Guardrail 3 (D-06/SC6): tts.py must never use @observe or any langfuse decorator —
+    manual as_type="span" only."""
+    import re
+    from pathlib import Path
+
+    tts_source = Path(__file__).parent.parent / "app" / "routers" / "tts.py"
+    content = tts_source.read_text()
+
+    forbidden_patterns = [
+        r"@observe",
+        r"@langfuse\.observe",
+        r"from langfuse import observe",
+        r"from langfuse\.decorators import observe",
+    ]
+    for pattern in forbidden_patterns:
+        assert not re.search(pattern, content), f"Forbidden pattern '{pattern}' found in tts.py"
+
+    assert 'as_type="generation"' not in content
+    assert 'as_type="span"' in content
+
+
+# D-08 taxonomy — the 9 canonical feature/trace_name values, one per instrumented call path
+_D08_FEATURE_TAXONOMY = [
+    "cards_magic",
+    "quiz_magic",
+    "viz_magic",
+    "book_expand",
+    "book_cards",
+    "quiz_from_deck",
+    "quiz_from_book",
+    "smart_pet_chat",
+    "tts_amagic",
+]
+
+
+def test_d08_taxonomy_has_nine_unique_features():
+    """Guardrail 2a (TR-05): the D-08 taxonomy has exactly 9 unique feature strings."""
+    assert len(_D08_FEATURE_TAXONOMY) == 9
+    assert len(set(_D08_FEATURE_TAXONOMY)) == 9
+
+
+@pytest.mark.parametrize(
+    "file_path,expected_features",
+    [
+        ("app/ai_orchestrator/orchestrator.py", ["cards_magic", "quiz_magic", "viz_magic"]),
+        ("app/routers/books.py", ["book_expand"]),
+        ("app/routers/cards.py", ["book_cards"]),
+        ("app/routers/quiz_ai.py", ["quiz_from_deck", "quiz_from_book"]),
+        ("app/routers/agent.py", ["smart_pet_chat"]),
+        ("app/routers/tts.py", ["tts_amagic"]),
+    ],
+)
+def test_all_call_sites_use_d08_taxonomy_features(file_path, expected_features):
+    """Guardrail 2b (TR-05): every instrumented file's trace_name/feature literals are drawn
+    from the 9-value D-08 taxonomy — no renamed/drifted feature strings. This test is
+    parametrized over 6 cases (one per instrumented file) and collects as 6 separate
+    pytest items."""
+    from pathlib import Path
+
+    source = (Path(__file__).parent.parent / file_path).read_text()
+    for feature in expected_features:
+        assert feature in _D08_FEATURE_TAXONOMY, f"{feature!r} is not in the D-08 taxonomy"
+        assert f'"{feature}"' in source, f"{feature!r} not found as a string literal in {file_path}"
+
+
+def test_fail_open_coverage_across_all_call_sites():
+    """Guardrail 1 (TR-06): a fail-open ('Langfuse unreachable') test exists for every
+    call-site family — orchestrator, book_expand, book_cards, quiz_from_deck, quiz_from_book,
+    smart_pet_chat, tts_amagic. Meta-test guards against future edits silently dropping
+    fail-open coverage."""
+    import sys
+
+    this_module = sys.modules[__name__]
+    required_test_names = [
+        "test_orchestrator_langfuse_unreachable_falls_back",
+        "test_ai_expand_text_langfuse_unreachable",
+        "test_generate_cards_from_book_langfuse_unreachable",
+        "test_generate_questions_langfuse_unreachable",
+        "test_generate_quiz_from_book_langfuse_unreachable",
+        "test_chat_langfuse_unreachable",
+        "test_generate_tts_langfuse_unreachable",
+    ]
+    for name in required_test_names:
+        assert hasattr(this_module, name), f"Missing fail-open test: {name}"
+        assert callable(getattr(this_module, name))
