@@ -10,6 +10,7 @@ sys.modules stubs prevent SDK import errors on the Python 3.9 test runner.
 """
 from __future__ import annotations
 
+import json
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -85,8 +86,19 @@ def _ensure_cards_importable() -> None:
         sys.modules["slowapi"] = MagicMock()
     if "slowapi.util" not in sys.modules:
         sys.modules["slowapi.util"] = MagicMock()
-    if "app.core.limiter" not in sys.modules:
-        sys.modules["app.core.limiter"] = MagicMock()
+
+    # quiz_ai.py applies @limiter.limit("5/minute") to start_ai_quiz_session. A bare
+    # MagicMock's .limit(...) call returns a MagicMock, and applying THAT as a decorator
+    # replaces the real async function with a MagicMock — `await quiz_ai_module.
+    # start_ai_quiz_session(...)` then raises "TypeError: object MagicMock can't be used
+    # in 'await' expression". test_ai_magic.py may have already registered
+    # sys.modules["app.core.limiter"] as a bare MagicMock, so this is an unconditional
+    # overwrite with a real passthrough decorator (mirrors the gemini_client fix above).
+    mock_limiter_mod = MagicMock()
+    mock_limiter_instance = MagicMock()
+    mock_limiter_instance.limit = lambda *a, **k: (lambda fn: fn)
+    mock_limiter_mod.limiter = mock_limiter_instance
+    sys.modules["app.core.limiter"] = mock_limiter_mod
 
     if "app.models.quiz" not in sys.modules:
         from typing import Optional as _Optional
@@ -139,6 +151,7 @@ _ensure_cards_importable()
 # directly), not MagicMock stand-ins.
 sys.modules.pop("app.routers.books", None)
 sys.modules.pop("app.routers.cards", None)
+sys.modules.pop("app.routers.quiz_ai", None)
 
 import pytest
 
@@ -434,6 +447,200 @@ async def test_generate_cards_from_book_langfuse_unreachable(broken_langfuse_cli
             )
 
     assert len(response.cards) == 1
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
+    ]
+    assert len(warning_records) == 1
+
+
+# ---------------------------------------------------------------------------
+# Scenarios 5 & 6 — quiz_ai.py _generate_questions (Pattern B, D-04/D-09, feature=quiz_from_deck, TR-03)
+# ---------------------------------------------------------------------------
+
+
+def _fake_quiz_json(n=1):
+    items = [
+        {
+            "question_type": "short_answer",
+            "question_text": f"Q{i}",
+            "correct_answer": f"A{i}",
+            "rubric": "exact match",
+        }
+        for i in range(n)
+    ]
+    return json.dumps(items)
+
+
+@pytest.mark.asyncio
+async def test_generate_questions_retries_traced_separately(mock_langfuse_client):
+    import app.routers.quiz_ai as quiz_ai_module
+
+    # Attempt 1 returns EMPTY content (not an exception) — this lets attempt 1's
+    # start_as_current_generation span complete normally (generation.update is called
+    # with output=""), the "[ai_quiz] LLM returned empty content on attempt 1...
+    # Retrying" branch fires, and the loop proceeds to attempt 2, which opens its OWN
+    # span and succeeds. This is Known Failure Mode 1: both attempts are visible as
+    # separate Langfuse traces, not just the winner. (An exception on attempt 1 would
+    # instead be caught by the inner "Langfuse tracing failed" except — misattributing
+    # a genuine LLM error — and its same-attempt fallback retry would consume the
+    # second side_effect item, producing only ONE start_as_current_generation call.)
+    fake_groq_client = MagicMock()
+    fake_groq_client.chat.completions.create.side_effect = [
+        _fake_groq_completion(""),
+        _fake_groq_completion(_fake_quiz_json(1)),
+    ]
+
+    with patch.object(quiz_ai_module, "get_client_for_tier", return_value=fake_groq_client), \
+         patch.object(quiz_ai_module, "get_langfuse_client", return_value=mock_langfuse_client):
+        questions = await quiz_ai_module._generate_questions(
+            topic="Photosynthesis",
+            question_count=1,
+            language="en",
+            tier="free",
+            user_id="u1",
+            feature="quiz_from_deck",
+        )
+
+    assert len(questions) == 1
+    assert questions[0].question_text == "Q0"
+
+    # Both attempts must produce their own start_as_current_generation span (Known Failure Mode 1)
+    assert mock_langfuse_client.start_as_current_generation.call_count == 2
+    for call in mock_langfuse_client.start_as_current_generation.call_args_list:
+        _, kwargs = call
+        assert kwargs["name"] == "quiz_from_deck"
+
+
+@pytest.mark.asyncio
+async def test_generate_questions_langfuse_unreachable(broken_langfuse_client, caplog):
+    import app.routers.quiz_ai as quiz_ai_module
+
+    fake_groq_client = MagicMock()
+    fake_groq_client.chat.completions.create.return_value = _fake_groq_completion(_fake_quiz_json(1))
+
+    with patch.object(quiz_ai_module, "get_client_for_tier", return_value=fake_groq_client), \
+         patch.object(quiz_ai_module, "get_langfuse_client", return_value=broken_langfuse_client):
+        with caplog.at_level(logging.WARNING):
+            questions = await quiz_ai_module._generate_questions(
+                topic="Photosynthesis",
+                question_count=1,
+                language="en",
+                tier="free",
+                user_id="u1",
+                feature="quiz_from_deck",
+            )
+
+    assert len(questions) == 1
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "Langfuse tracing failed on attempt" in r.message
+    ]
+    assert len(warning_records) >= 1
+
+
+@pytest.mark.asyncio
+async def test_start_ai_quiz_session_passes_quiz_from_deck_feature():
+    import app.routers.quiz_ai as quiz_ai_module
+    from app.models.quiz import AIQuizQuestionStored, AIQuizStartRequest
+
+    fake_question = AIQuizQuestionStored(
+        card_id="c1", question_type="short_answer", question_text="Q1",
+        options=None, hint_available=True, correct_answer="A1", rubric="exact", card_index=0,
+    )
+
+    fake_user_doc = {"subscription": {"tier": "free"}, "preferences": {}}
+    body = AIQuizStartRequest(topic="Photosynthesis", question_count=5, language="en")
+    current_user = {"user_id": "u1"}
+
+    with patch.object(quiz_ai_module, "users_collection") as mock_users_collection, \
+         patch.object(quiz_ai_module, "ai_quiz_sessions_collection") as mock_sessions_collection, \
+         patch.object(quiz_ai_module, "_generate_questions", new_callable=AsyncMock) as mock_generate, \
+         patch.object(quiz_ai_module, "ObjectId", side_effect=lambda x: x):
+        mock_users_collection.find_one = AsyncMock(return_value=fake_user_doc)
+        mock_sessions_collection.insert_one = AsyncMock(return_value=None)
+        mock_generate.return_value = [fake_question]
+
+        from starlette.requests import Request as StarletteRequest
+        fake_request = MagicMock(spec=StarletteRequest)
+
+        await quiz_ai_module.start_ai_quiz_session(
+            request=fake_request, body=body, current_user=current_user
+        )
+
+    mock_generate.assert_called_once()
+    _, call_kwargs = mock_generate.call_args
+    assert call_kwargs["feature"] == "quiz_from_deck"
+    assert call_kwargs["user_id"] == "u1"
+
+
+# ---------------------------------------------------------------------------
+# quiz_ai.py generate_quiz_from_book (Pattern B, feature=quiz_from_book, correction #2, TR-03)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_quiz_from_book_happy_path_traces_quiz_from_book(mock_langfuse_client):
+    import app.routers.quiz_ai as quiz_ai_module
+    from app.models.book_generation import GenerateQuizFromBookRequest
+
+    fake_book = {"_id": "abc123", "user_id": "u1", "deleted_at": None, "full_content": "Some book text"}
+    fake_gemini_client = MagicMock()
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content=_fake_quiz_json(2)))]
+    fake_gemini_client.request.return_value = fake_completion
+
+    body = GenerateQuizFromBookRequest(book_id="abc123")
+    current_user = {"user_id": "u1"}
+
+    with patch.object(quiz_ai_module, "books_collection") as mock_books_collection, \
+         patch.object(quiz_ai_module, "get_client_for_tier", return_value=fake_gemini_client), \
+         patch.object(quiz_ai_module, "get_langfuse_client", return_value=mock_langfuse_client), \
+         patch.object(quiz_ai_module, "ObjectId", side_effect=lambda x: x):
+        mock_books_collection.find_one = AsyncMock(return_value=fake_book)
+
+        result = await quiz_ai_module.generate_quiz_from_book(
+            body=body, current_user=current_user, tier="plus"
+        )
+
+    assert len(result["questions"]) == 2
+
+    mock_langfuse_client.start_as_current_generation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_generation.call_args
+    assert gen_kwargs["name"] == "quiz_from_book"
+
+    generation_ctx = mock_langfuse_client.start_as_current_generation.return_value.__enter__.return_value
+    generation_ctx.update.assert_called_once()
+    _, update_kwargs = generation_ctx.update.call_args
+    assert update_kwargs["usage_details"] is None
+
+
+@pytest.mark.asyncio
+async def test_generate_quiz_from_book_langfuse_unreachable(broken_langfuse_client, caplog):
+    import app.routers.quiz_ai as quiz_ai_module
+    from app.models.book_generation import GenerateQuizFromBookRequest
+
+    fake_book = {"_id": "abc123", "user_id": "u1", "deleted_at": None, "full_content": "Some book text"}
+    fake_gemini_client = MagicMock()
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content=_fake_quiz_json(2)))]
+    fake_gemini_client.request.return_value = fake_completion
+
+    body = GenerateQuizFromBookRequest(book_id="abc123")
+    current_user = {"user_id": "u1"}
+
+    with patch.object(quiz_ai_module, "books_collection") as mock_books_collection, \
+         patch.object(quiz_ai_module, "get_client_for_tier", return_value=fake_gemini_client), \
+         patch.object(quiz_ai_module, "get_langfuse_client", return_value=broken_langfuse_client), \
+         patch.object(quiz_ai_module, "ObjectId", side_effect=lambda x: x):
+        mock_books_collection.find_one = AsyncMock(return_value=fake_book)
+
+        with caplog.at_level(logging.WARNING):
+            result = await quiz_ai_module.generate_quiz_from_book(
+                body=body, current_user=current_user, tier="plus"
+            )
+
+    assert len(result["questions"]) == 2
     warning_records = [
         r for r in caplog.records
         if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
