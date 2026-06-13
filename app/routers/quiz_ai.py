@@ -502,12 +502,42 @@ async def generate_quiz_from_book(
     )
     user_prompt = f"Book content:\n{plain_text}"
 
+    client = get_langfuse_client()
+    model_name = TIER_MODEL_NAMES.get(tier, TIER_MODEL_NAMES["free"])
+    trace_metadata = {"feature": "quiz_from_book", "tier": tier, "user_id": user_id, "model": model_name}
+
     raw_text: str = ""
     for attempt in range(1, 3):
         try:
             combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-            completion = llm_client.request(combined_prompt)
-            raw_text = (completion.choices[0].message.content or "").strip()
+            if client:
+                try:
+                    with propagate_attributes(
+                        user_id=user_id,
+                        trace_name="quiz_from_book",
+                        metadata=trace_metadata,
+                        tags=["quiz_from_book", tier],
+                    ):
+                        with client.start_as_current_generation(
+                            name="quiz_from_book",
+                            model=model_name,
+                            input=[{"role": "user", "content": combined_prompt}],
+                            model_parameters={"question_limit": question_limit},
+                        ) as generation:
+                            completion = llm_client.request(combined_prompt)
+                            raw_text = (completion.choices[0].message.content or "").strip()
+                            # D-13: full output, no truncation. Gemini wrapper exposes no usage -> None.
+                            generation.update(output=raw_text, usage_details=None)
+                except Exception as langfuse_exc:
+                    logger.warning(
+                        f"[generate_quiz_from_book] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                    )
+                    completion = llm_client.request(combined_prompt)
+                    raw_text = (completion.choices[0].message.content or "").strip()
+            else:
+                completion = llm_client.request(combined_prompt)
+                raw_text = (completion.choices[0].message.content or "").strip()
+
             if raw_text:
                 break
             logger.warning(f"[generate_quiz_from_book] Empty response attempt {attempt}")
