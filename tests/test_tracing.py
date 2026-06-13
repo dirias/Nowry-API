@@ -646,3 +646,228 @@ async def test_generate_quiz_from_book_langfuse_unreachable(broken_langfuse_clie
         if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
     ]
     assert len(warning_records) == 1
+
+
+# ---------------------------------------------------------------------------
+# Scenarios 7 & 8 — agent.py chat() (Pattern C, D-05/D-10/D-11, feature=smart_pet_chat, TR-04)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_agent_importable() -> None:
+    """app.routers.agent transitively imports groq, google.generativeai (+ subpackages),
+    and app.models.quiz (which uses `str | None` syntax — handled by eval-type-backport
+    + from __future__ import annotations in agent.py itself). The shared
+    _ensure_cards_importable() stubs cover slowapi/limiter/firebase_auth/dependencies;
+    this adds the google.generativeai subpackage stubs (test_smart_pet.py precedent)
+    and a real-Pydantic app.models.quiz.QuizConfig (the existing mock_quiz_mod stub
+    from _ensure_cards_importable() does not define QuizConfig, which agent.py needs)."""
+    for mod in ("google.generativeai", "google.generativeai.types",
+                "google.generativeai.protos", "google.api_core.exceptions"):
+        if mod not in sys.modules:
+            sys.modules[mod] = MagicMock()
+
+    # app.models.quiz may already be registered (as a bare MagicMock) by
+    # _ensure_cards_importable() — a MagicMock's .QuizConfig attribute is itself
+    # a MagicMock (hasattr is always True), which breaks Pydantic's `QuizConfig | None`
+    # schema generation in agent.py's ChatResponse. Unconditionally overwrite
+    # .QuizConfig with a real Pydantic model (same unconditional-overwrite pattern
+    # as the gemini_client/limiter stubs above).
+    from typing import Optional as _Optional
+    from pydantic import BaseModel as _BM
+
+    class _QuizConfig(_BM):
+        mode: str
+        topic: _Optional[str] = None
+        question_count: int = 10
+        deck_id: _Optional[str] = None
+
+    quiz_mod = sys.modules.get("app.models.quiz")
+    if quiz_mod is None:
+        quiz_mod = MagicMock()
+        sys.modules["app.models.quiz"] = quiz_mod
+    quiz_mod.QuizConfig = _QuizConfig
+
+    # _ensure_cards_importable() registers app.config.subscription_plans as a bare
+    # MagicMock() (since cards.py only needs it importable, not functionally correct).
+    # agent.py's chat() relies on REAL SUBSCRIPTION_PLANS/SubscriptionTier values —
+    # `SUBSCRIPTION_PLANS[tier]["features"].get("agent_persistent_memory")` must
+    # evaluate to a real bool (False for free tier) to correctly gate
+    # _append_to_persistent_history(). A MagicMock subscript/`.get()` chain returns
+    # a truthy MagicMock regardless of tier, which would call that function
+    # unconditionally. Unconditionally overwrite with the real module (same
+    # unconditional-overwrite pattern as gemini_client/limiter/QuizConfig above) —
+    # the real module has no problematic transitive imports, so this is safe.
+    import importlib
+
+    sys.modules.pop("app.config.subscription_plans", None)
+    sys.modules["app.config.subscription_plans"] = importlib.import_module(
+        "app.config.subscription_plans"
+    )
+
+    # When the full test suite runs, tests/test_blackboards.py (collected before
+    # test_tracing.py alphabetically) registers app.models.agent_models as a bare
+    # MagicMock(). agent.py's /generate-personality route declares
+    # `response_model=GeneratePersonalityResponse` — FastAPI rejects a MagicMock as
+    # an invalid Pydantic field type at router-registration time
+    # (fastapi.exceptions.FastAPIError: "Invalid args for response field!").
+    # Unconditionally overwrite with the real module (same pattern as
+    # subscription_plans above); it has no problematic transitive imports.
+    sys.modules.pop("app.models.agent_models", None)
+    sys.modules["app.models.agent_models"] = importlib.import_module(
+        "app.models.agent_models"
+    )
+
+
+_ensure_agent_importable()
+sys.modules.pop("app.routers.agent", None)
+
+
+def _make_chat_request_body(message="Hello pet"):
+    from app.routers.agent import ChatRequest
+    return ChatRequest(message=message, history=[], language="en", context=None)
+
+
+@pytest.mark.asyncio
+async def test_chat_happy_path_traces_smart_pet_chat_with_session_id(mock_langfuse_client):
+    import app.routers.agent as agent_module
+
+    fake_user = {
+        "_id": "u1",
+        "subscription": {"tier": "free"},
+        "agent": {"xp": 0},
+        "preferences": {},
+    }
+
+    with patch.object(agent_module, "users_collection") as mock_users, \
+         patch.object(agent_module, "get_langfuse_client", return_value=mock_langfuse_client), \
+         patch.object(agent_module, "_detect_quiz_intent", return_value=None), \
+         patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock) as mock_append, \
+         patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=[]), \
+         patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock) as mock_agent_chat, \
+         patch.object(agent_module, "grant_xp", new_callable=AsyncMock,
+                       return_value={"level_up": False, "new_level": 1, "new_stage": 1}), \
+         patch.object(agent_module, "ObjectId", side_effect=lambda x: x):
+        mock_users.find_one = AsyncMock(return_value=fake_user)
+        mock_users.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+        mock_agent_chat.return_value = "Hello! How can I help you study today?"
+
+        body = _make_chat_request_body()
+        fake_request = MagicMock()
+
+        response = await agent_module.chat(
+            request=fake_request, body=body, current_user={"user_id": "u1"}
+        )
+
+    assert response.reply == "Hello! How can I help you study today?"
+    assert mock_agent_chat.call_count == 1  # TR-06: single LLM invocation
+
+    mock_langfuse_client.start_as_current_generation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_generation.call_args
+    assert gen_kwargs["name"] == "smart_pet_chat"
+
+    generation_ctx = mock_langfuse_client.start_as_current_generation.return_value.__enter__.return_value
+    generation_ctx.update.assert_called_once_with(output="Hello! How can I help you study today?")
+
+    mock_append.assert_not_called()  # free tier — agent_persistent_memory feature is False
+
+
+@pytest.mark.asyncio
+async def test_chat_session_id_stable_across_two_turns(mock_langfuse_client):
+    import app.routers.agent as agent_module
+
+    fake_user = {
+        "_id": "u1",
+        "subscription": {"tier": "free"},
+        "agent": {"xp": 0},
+        "preferences": {},
+    }
+
+    propagate_calls = []
+
+    def _capture_propagate(*args, **kwargs):
+        propagate_calls.append(kwargs)
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=None)
+        cm.__exit__ = MagicMock(return_value=None)
+        return cm
+
+    with patch.object(agent_module, "users_collection") as mock_users, \
+         patch.object(agent_module, "get_langfuse_client", return_value=mock_langfuse_client), \
+         patch.object(agent_module, "propagate_attributes", side_effect=_capture_propagate), \
+         patch.object(agent_module, "_detect_quiz_intent", return_value=None), \
+         patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock), \
+         patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=[]), \
+         patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock, return_value="Reply"), \
+         patch.object(agent_module, "grant_xp", new_callable=AsyncMock,
+                       return_value={"level_up": False, "new_level": 1, "new_stage": 1}), \
+         patch.object(agent_module, "ObjectId", side_effect=lambda x: x):
+        mock_users.find_one = AsyncMock(return_value=fake_user)
+        mock_users.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+
+        fake_request = MagicMock()
+
+        await agent_module.chat(request=fake_request, body=_make_chat_request_body("Turn 1"), current_user={"user_id": "u1"})
+        await agent_module.chat(request=fake_request, body=_make_chat_request_body("Turn 2"), current_user={"user_id": "u1"})
+
+    assert len(propagate_calls) == 2
+    assert propagate_calls[0]["session_id"] == "u1"
+    assert propagate_calls[1]["session_id"] == "u1"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_call_nested_span(mock_langfuse_client):
+    import app.routers.agent as agent_module
+
+    with patch.object(agent_module, "list_decks", new_callable=AsyncMock, return_value=[{"id": "d1", "name": "Deck 1"}]):
+        result_str = await agent_module._dispatch_tool_call("list_decks", {}, "u1", client=mock_langfuse_client)
+
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, obs_kwargs = mock_langfuse_client.start_as_current_observation.call_args
+    assert obs_kwargs["name"] == "tool:list_decks"
+    assert obs_kwargs["as_type"] == "tool"
+    assert obs_kwargs["input"] == {}
+
+    tool_span_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
+    tool_span_ctx.update.assert_called_once()
+    _, update_kwargs = tool_span_ctx.update.call_args
+    assert update_kwargs["output"] == result_str
+    assert "Deck 1" in result_str
+
+
+@pytest.mark.asyncio
+async def test_chat_langfuse_unreachable(broken_langfuse_client, caplog):
+    import app.routers.agent as agent_module
+
+    fake_user = {
+        "_id": "u1",
+        "subscription": {"tier": "free"},
+        "agent": {"xp": 0},
+        "preferences": {},
+    }
+
+    with patch.object(agent_module, "users_collection") as mock_users, \
+         patch.object(agent_module, "get_langfuse_client", return_value=broken_langfuse_client), \
+         patch.object(agent_module, "_detect_quiz_intent", return_value=None), \
+         patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock) as mock_append, \
+         patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=[]), \
+         patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock, return_value="Hello there!") as mock_agent_chat, \
+         patch.object(agent_module, "grant_xp", new_callable=AsyncMock,
+                       return_value={"level_up": False, "new_level": 1, "new_stage": 1}), \
+         patch.object(agent_module, "ObjectId", side_effect=lambda x: x):
+        mock_users.find_one = AsyncMock(return_value=fake_user)
+        mock_users.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+
+        fake_request = MagicMock()
+
+        with caplog.at_level(logging.WARNING):
+            response = await agent_module.chat(
+                request=fake_request, body=_make_chat_request_body(), current_user={"user_id": "u1"}
+            )
+
+    assert response.reply == "Hello there!"
+    assert mock_agent_chat.call_count == 1  # TR-06: single LLM invocation even when Langfuse fails
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
+    ]
+    assert len(warning_records) == 1
