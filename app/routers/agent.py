@@ -49,6 +49,11 @@ from app.utils.agent_tools import (
 )
 
 from app.utils.agent_llm import agent_llm
+from app.core.model_config import TIER_MODEL_NAMES
+from app.core.langfuse_client import get_langfuse_client
+from langfuse import propagate_attributes
+import contextlib
+import functools
 from app.models.agent_models import GeneratePersonalityRequest, GeneratePersonalityResponse
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -2394,6 +2399,11 @@ async def chat(
 
     history = history_for_llm
 
+    client = get_langfuse_client()
+    tier_value: str = tier.value if hasattr(tier, "value") else str(tier)
+    model_name = TIER_MODEL_NAMES.get(tier_value, TIER_MODEL_NAMES["free"])
+    trace_metadata = {"feature": "smart_pet_chat", "tier": tier_value, "user_id": user_id, "model": model_name}
+
     # ── Quiz intent detection (runs BEFORE the main LLM call) ────────────────
     # Detect quiz intent first so we can skip the main LLM call entirely when
     # the user wants a quiz. This prevents the main model from generating a
@@ -2433,17 +2443,59 @@ async def chat(
         reply = _HANDOFF_MESSAGES.get(lang_prefix, f"Let's go! Starting your quiz on {topic_label}…")
     else:
         # ── Normal LLM call ──────────────────────────────────────────────────
-        try:
-            reply = await agent_llm.chat(
-                message=body.message,
-                history=history,
-                system_prompt=system_prompt,
-                tools=KNOWLEDGE_TOOLS if knowledge_access else None,
-                tool_dispatcher=_dispatch_tool_call,
-                user_id=user_id,
-                tier=tier,
-            )
+        turn_input = history + [{"role": "user", "content": body.message}]
 
+        # Set up Langfuse tracing context BEFORE the LLM call (fire-and-forget, TR-06).
+        # If construction fails, fall back to no-op context managers — the LLM call
+        # below executes exactly once either way, never retried for tracing reasons.
+        attrs_cm = contextlib.nullcontext()
+        gen_cm = contextlib.nullcontext()
+        if client:
+            try:
+                attrs_cm = propagate_attributes(
+                    user_id=user_id,
+                    session_id=user_id,  # D-10: stable per-user session across the pet relationship
+                    trace_name="smart_pet_chat",
+                    metadata=trace_metadata,
+                    tags=["smart_pet_chat", tier_value],
+                )
+                gen_cm = client.start_as_current_generation(
+                    name="smart_pet_chat",
+                    model=model_name,
+                    input=turn_input,
+                )
+            except Exception as langfuse_exc:
+                logger.warning(
+                    f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                )
+                attrs_cm = contextlib.nullcontext()
+                gen_cm = contextlib.nullcontext()
+
+        tool_dispatcher = functools.partial(_dispatch_tool_call, client=client) if client else _dispatch_tool_call
+
+        try:
+            with attrs_cm, gen_cm as turn_generation:
+                # ── The ONE LLM call for this turn — executes exactly once ──────
+                reply = await agent_llm.chat(
+                    message=body.message,
+                    history=history,
+                    system_prompt=system_prompt,
+                    tools=KNOWLEDGE_TOOLS if knowledge_access else None,
+                    tool_dispatcher=tool_dispatcher,
+                    user_id=user_id,
+                    tier=tier,
+                )
+
+                # Record the result on the Langfuse generation, if one is active.
+                # A failure here is a tracing-only failure: the reply is already in
+                # hand, so we log and continue — never re-invoke agent_llm.chat.
+                if turn_generation is not None:
+                    try:
+                        turn_generation.update(output=reply)  # D-13: full reply, no truncation
+                    except Exception as langfuse_exc:
+                        logger.warning(
+                            f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                        )
         except Exception as exc:
             logger.error(f"Agent Chat Error: {exc}")
             raise HTTPException(
