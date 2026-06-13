@@ -29,8 +29,11 @@ from uuid import uuid4
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from langfuse import propagate_attributes
+
 from app.auth.dependencies import get_subscription_tier, track_ai_usage
-from app.core.model_config import get_client_for_tier
+from app.core.langfuse_client import get_langfuse_client
+from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core import prompt_manager
 from app.config.database import (
     ai_quiz_sessions_collection,
@@ -120,6 +123,8 @@ async def _generate_questions(
     question_count: int,
     language: str,
     tier: str,
+    user_id: str,
+    feature: str,  # D-09: "quiz_from_deck" (only current caller: start_ai_quiz_session)
 ) -> list[AIQuizQuestionStored]:
     """
     Call the tier-appropriate LLM to generate `question_count` questions on `topic`.
@@ -134,6 +139,10 @@ async def _generate_questions(
     llm_client = get_client_for_tier(tier)
     if llm_client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
+
+    client = get_langfuse_client()
+    model_name = TIER_MODEL_NAMES.get(tier, TIER_MODEL_NAMES["free"])
+    trace_metadata = {"feature": feature, "tier": tier, "user_id": user_id, "model": model_name}
 
     lang_name: str = _LANGUAGE_NAMES.get(language.split("-")[0].lower(), "English")
 
@@ -157,28 +166,97 @@ async def _generate_questions(
     raw_text: str = ""
     last_exc: Exception | None = None
     for attempt in range(1, 3):  # up to 2 attempts
+        attempt_output: str = ""
+        attempt_error: str | None = None
         try:
-            if tier == "free":
-                # Groq: native chat.completions.create interface
-                completion = llm_client.chat.completions.create(
-                    model=_GROQ_MODEL,
-                    max_tokens=4096,
-                    temperature=0.7,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                )
-                choice = completion.choices[0]
-                finish_reason: str = choice.finish_reason or "unknown"
-                raw_text = (choice.message.content or "").strip()
+            if client:
+                try:
+                    with propagate_attributes(
+                        user_id=user_id,
+                        trace_name=feature,
+                        metadata=trace_metadata,
+                        tags=[feature, tier],
+                    ):
+                        with client.start_as_current_generation(
+                            name=feature,
+                            model=model_name,
+                            input=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            model_parameters={"temperature": 0.7, "max_tokens": 4096},
+                        ) as generation:
+                            if tier == "free":
+                                completion = llm_client.chat.completions.create(
+                                    model=_GROQ_MODEL, max_tokens=4096, temperature=0.7,
+                                    messages=[
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": user_prompt},
+                                    ],
+                                )
+                                choice = completion.choices[0]
+                                finish_reason: str = choice.finish_reason or "unknown"
+                                raw_text = (choice.message.content or "").strip()
+                                usage = getattr(completion, "usage", None)
+                                usage_details = (
+                                    {
+                                        "input": getattr(usage, "prompt_tokens", 0),
+                                        "output": getattr(usage, "completion_tokens", 0),
+                                        "total": getattr(usage, "total_tokens", 0),
+                                    }
+                                    if usage
+                                    else None
+                                )
+                            else:
+                                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                                completion = llm_client.request(combined_prompt)
+                                choice = completion.choices[0]
+                                finish_reason = "stop"
+                                raw_text = (choice.message.content or "").strip()
+                                usage_details = None
+
+                            attempt_output = raw_text
+                            # D-13: full output per attempt, no truncation
+                            generation.update(output=attempt_output, usage_details=usage_details)
+                except Exception as langfuse_exc:
+                    logger.warning(
+                        f"[ai_quiz] Langfuse tracing failed on attempt {attempt}, continuing without trace: {langfuse_exc}"
+                    )
+                    if tier == "free":
+                        completion = llm_client.chat.completions.create(
+                            model=_GROQ_MODEL, max_tokens=4096, temperature=0.7,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                        )
+                        choice = completion.choices[0]
+                        finish_reason = choice.finish_reason or "unknown"
+                        raw_text = (choice.message.content or "").strip()
+                    else:
+                        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                        completion = llm_client.request(combined_prompt)
+                        choice = completion.choices[0]
+                        finish_reason = "stop"
+                        raw_text = (choice.message.content or "").strip()
             else:
-                # Gemini: combine prompts, use request() — returns _GeminiResponseShim
-                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                completion = llm_client.request(combined_prompt)
-                choice = completion.choices[0]
-                finish_reason = "stop"
-                raw_text = (choice.message.content or "").strip()
+                if tier == "free":
+                    completion = llm_client.chat.completions.create(
+                        model=_GROQ_MODEL, max_tokens=4096, temperature=0.7,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+                    choice = completion.choices[0]
+                    finish_reason = choice.finish_reason or "unknown"
+                    raw_text = (choice.message.content or "").strip()
+                else:
+                    combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                    completion = llm_client.request(combined_prompt)
+                    choice = completion.choices[0]
+                    finish_reason = "stop"
+                    raw_text = (choice.message.content or "").strip()
 
             if raw_text:
                 break
@@ -316,6 +394,8 @@ async def start_ai_quiz_session(
         question_count=effective_count,
         language=body.language,
         tier=tier,
+        user_id=user_id,
+        feature="quiz_from_deck",  # D-09: only current caller of _generate_questions
     )
 
     # Persist session document with full question set (including correct answers)
