@@ -10,7 +10,9 @@ from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils.logger import get_logger
-from app.core.model_config import get_client_for_tier
+from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
+from app.core.langfuse_client import get_langfuse_client
+from langfuse import propagate_attributes
 from app.core import prompt_manager
 
 logger = get_logger(__name__)
@@ -420,25 +422,95 @@ async def ai_expand_text(
         f"Text to expand:\n{body.selected_text}"
     )
 
+    client = get_langfuse_client()
+    model_name = TIER_MODEL_NAMES.get(tier, TIER_MODEL_NAMES["free"])
+    trace_metadata = {"feature": "book_expand", "tier": tier, "user_id": user_id, "model": model_name}
+
     raw_text: str = ""
     last_exc = None
     for attempt in range(1, 3):
         try:
-            if tier == "free":
-                completion = llm_client.chat.completions.create(
-                    model=_GROQ_MODEL,
-                    max_tokens=1500,
-                    temperature=0.7,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                )
-                raw_text = (completion.choices[0].message.content or "").strip()
+            if client:
+                try:
+                    with propagate_attributes(
+                        user_id=user_id,
+                        trace_name="book_expand",
+                        metadata=trace_metadata,
+                        tags=["book_expand", tier],
+                    ):
+                        with client.start_as_current_generation(
+                            name="book_expand",
+                            model=model_name,
+                            input=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            model_parameters={"temperature": 0.7, "max_tokens": 1500},
+                        ) as generation:
+                            if tier == "free":
+                                completion = llm_client.chat.completions.create(
+                                    model=_GROQ_MODEL,
+                                    max_tokens=1500,
+                                    temperature=0.7,
+                                    messages=[
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": user_prompt},
+                                    ],
+                                )
+                                raw_text = (completion.choices[0].message.content or "").strip()
+                                usage = getattr(completion, "usage", None)
+                                usage_details = (
+                                    {
+                                        "input": getattr(usage, "prompt_tokens", 0),
+                                        "output": getattr(usage, "completion_tokens", 0),
+                                        "total": getattr(usage, "total_tokens", 0),
+                                    }
+                                    if usage
+                                    else None
+                                )
+                            else:
+                                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                                completion = llm_client.request(combined_prompt)
+                                raw_text = (completion.choices[0].message.content or "").strip()
+                                usage_details = None
+
+                            # D-13: full output, no truncation
+                            generation.update(output=raw_text, usage_details=usage_details)
+                except Exception as langfuse_exc:
+                    logger.warning(
+                        f"[ai_expand] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                    )
+                    if tier == "free":
+                        completion = llm_client.chat.completions.create(
+                            model=_GROQ_MODEL,
+                            max_tokens=1500,
+                            temperature=0.7,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                        )
+                        raw_text = (completion.choices[0].message.content or "").strip()
+                    else:
+                        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                        completion = llm_client.request(combined_prompt)
+                        raw_text = (completion.choices[0].message.content or "").strip()
             else:
-                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                completion = llm_client.request(combined_prompt)
-                raw_text = (completion.choices[0].message.content or "").strip()
+                if tier == "free":
+                    completion = llm_client.chat.completions.create(
+                        model=_GROQ_MODEL,
+                        max_tokens=1500,
+                        temperature=0.7,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+                    raw_text = (completion.choices[0].message.content or "").strip()
+                else:
+                    combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                    completion = llm_client.request(combined_prompt)
+                    raw_text = (completion.choices[0].message.content or "").strip()
 
             if raw_text:
                 break
