@@ -21,6 +21,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import uuid as _uuid
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -38,7 +39,7 @@ from app.config.subscription_plans import (
     SUBSCRIPTION_PLANS,
     SubscriptionTier,
 )
-from app.models.quiz import QuizConfig
+from app.models.quiz import QuizConfig, QuizOffer
 from app.utils.agent_tools import (
     get_annual_plan_context,
     get_deck_content,
@@ -166,6 +167,10 @@ class ChatResponse(BaseModel):
     # Populated when the LLM detects quiz intent. The frontend uses this to
     # automatically navigate the user into the appropriate quiz mode.
     quiz_config: QuizConfig | None = None
+    # Populated when the LLM's reply was an informational answer to an
+    # ambiguous study/help request. The frontend renders this as a
+    # "Want a quiz on <topic>?" follow-up offer (no auto-navigation).
+    quiz_offer: QuizOffer | None = None
 
 
 class GenerateAvatarRequest(BaseModel):
@@ -343,116 +348,6 @@ def _build_language_directive(language_code: str) -> str:
     )
 
 
-_QUIZ_INTENT_SYSTEM_PROMPT = """You are a quiz intent classifier for a study app.
-
-Analyse the user's message and decide if they are asking to start a quiz or to study/practice a topic.
-The user may write in ANY language — English, Spanish, French, Japanese, Portuguese, etc.
-Classify intent based on meaning, not the specific language used.
-
-Quiz/study signals (examples across languages — not an exhaustive list):
-- English: "quiz me", "test me", "ask me questions", "let's do a quiz", "I want to practice",
-  "quiz on X", "ask me about X", "start a quiz", "let's review", "quiz time", "help me study X"
-- Spanish: "ayudame a estudiar", "hazme preguntas", "quiero practicar", "ponme a prueba",
-  "hagamos un quiz", "preguntame sobre", "quiero repasar"
-- French: "teste-moi", "fais-moi un quiz", "je veux pratiquer", "pose-moi des questions"
-- Portuguese: "me teste", "quero praticar", "me faça perguntas", "vamos revisar"
-- Japanese: "クイズして", "テストして", "練習したい", "問題を出して"
-
-If NO quiz intent is detected, respond with exactly: null
-
-If quiz intent IS detected, respond with ONLY a raw JSON object — no markdown, no prose:
-{
-  "mode": "ai" | "deck",
-  "topic": "<extracted topic string or null>",
-  "question_count": <number>,
-  "deck_id": null
-}
-
-Rules:
-- mode="ai" when the user names a subject/topic with no specific deck mentioned.
-- mode="deck" when the user says "quiz me on my [deck name]" or references one of their decks.
-- topic: extract the subject they want to be quizzed on (e.g. "Japanese past tense verbs",
-  "verbos en pasado en japonés"). Keep the topic in the language the user wrote it in.
-  If mode="deck", topic is the deck name. If nothing extractable, use null.
-- question_count: use the default provided. Never invent a different number unless
-  the user explicitly states "give me N questions" — then clamp to [1, 20].
-- deck_id: always null (deck resolution happens client-side from the deck name).
-- Respond with ONLY "null" or the JSON object. No other text whatsoever."""
-
-
-def _detect_quiz_intent(
-    message: str,
-    default_question_count: int,
-    groq_client,
-    history: list[dict] | None = None,
-) -> Optional[QuizConfig]:
-    """
-    Lightweight synchronous Groq call to classify quiz intent.
-
-    Returns a QuizConfig if quiz intent is detected, None otherwise.
-    Failures are silent — quiz_config simply stays None in the response.
-    history: last few chat turns, used so the model can extract a topic from
-    context when the user says "quiz me" without naming a topic explicitly.
-    """
-    try:
-        # Build a short context snippet from the last 4 messages so the model
-        # can infer the topic from a prior "Help me study X" exchange.
-        context_lines: list[str] = []
-        if history:
-            for turn in history[-4:]:
-                role = turn.get("role", "user")
-                content = (turn.get("content") or "")[:300]  # cap per-message
-                context_lines.append(f"{role}: {content}")
-        context_block = "\n".join(context_lines)
-
-        user_content = (
-            f"Default question count: {default_question_count}\n"
-            + (f"Recent conversation context:\n{context_block}\n" if context_block else "")
-            + f"User message: {message}"
-        )
-
-        completion = groq_client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            max_tokens=256,
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": _QUIZ_INTENT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-        )
-        raw: str = (completion.choices[0].message.content or "").strip()
-
-        # Strip accidental markdown fences
-        if raw.startswith("```"):
-            lines = raw.splitlines()
-            raw = "\n".join(line for line in lines if not line.startswith("```")).strip()
-
-        if raw.lower() in ("null", "none", ""):
-            return None
-
-        parsed: dict = json.loads(raw)
-
-        mode = parsed.get("mode", "ai")
-        if mode not in ("ai", "deck"):
-            mode = "ai"
-
-        raw_count = parsed.get("question_count", default_question_count)
-        try:
-            q_count = max(1, min(20, int(raw_count)))
-        except (TypeError, ValueError):
-            q_count = default_question_count
-
-        return QuizConfig(
-            mode=mode,
-            topic=parsed.get("topic") or None,
-            question_count=q_count,
-            deck_id=None,
-        )
-    except Exception as exc:
-        logger.warning(f"[quiz_intent] Detection failed (non-fatal): {exc}")
-        return None
-
-
 TUTOR_RULES = """
 TUTOR BEHAVIOR (core teaching identity — always active):
 
@@ -492,6 +387,76 @@ LANGUAGE LEARNING SPECIFICS (apply when primary_topic or card content is a langu
 - For Japanese/Chinese/Korean: include romaji/pinyin/romanization unless the user seems advanced
 - Distinguish casual vs formal/polite forms when relevant
 - Common usage patterns are worth more than rare textbook examples
+"""
+
+
+SMALL_TALK_RULES = """
+SMALL TALK & GREETINGS (highest priority — overrides IDENTITY RULES #2/#3 and QUIZ MODE below):
+- If the user's message is a simple greeting, farewell, or short social remark
+  (e.g. "Hola", "hi", "good morning", "thanks", "how are you", "lol", "ok"), respond
+  briefly and naturally to THAT message — a short, warm greeting back. Do NOT pivot
+  into a lesson, explanation, or example about the user's primary topic or interests,
+  even if earlier conversation history is about those topics.
+- In this case: do NOT call the `start_quiz` tool, and do NOT append a
+  [[QUIZ_OFFER:...]] marker — regardless of what was discussed earlier in this
+  conversation.
+- Only bring up study content, the user's interests, or a quiz offer if the user's
+  CURRENT message actually asks for help, study, practice, or references that topic.
+  A bare greeting is never, by itself, a reason to continue an earlier topic.
+"""
+
+
+QUIZ_TRIGGER_RULES = """
+QUIZ MODE — TOOL USE CONTRACT:
+- You have a `start_quiz` tool. Call it with confidence="high" whenever the user's
+  message is ANY unambiguous, explicit request to be quizzed, tested, examined, or
+  given practice questions — no matter how it's phrased or which language it's in.
+  Judge the INTENT, not the exact wording. Both of these grammatical shapes count as
+  unambiguous and MUST call the tool:
+    (a) verb-imperative requests directed at the assistant: "quiz me on X", "test me",
+        "practice with me on X", "examine me on X";
+    (b) noun/imperative requests asking for an artifact or session to be produced:
+        "make/create/generate a quiz/questionnaire/test/exam about X", "give me some
+        practice questions on X", "give me a questionary on X".
+  This applies identically across all supported languages (English, Spanish, French,
+  German, Japanese, Portuguese, Italian, Chinese, Korean, Arabic) and across any
+  synonym for quiz/test/exam/questionnaire/practice/questions. Do not require the
+  exact words below — they are illustrative anchors, not a checklist:
+    - Spanish: "hazme un cuestionario sobre X", "ponme a prueba", "tómame un examen de X"
+    - French: "fais-moi un quiz sur X", "interroge-moi sur X"
+    - German: "mach ein Quiz über X", "teste mich zu X"
+    - Japanese: "Xのクイズを作って", "テストして", "問題を出して"
+    - Portuguese: "me faça um questionário sobre X"
+    - Italian: "fammi un quiz su X", "interrogami"
+    - Chinese: "给我出一些关于X的题", "考我"
+    - Korean: "X에 대한 퀴즈를 내줘"
+    - Arabic: "اختبرني في X"
+    - English: "quiz me on photosynthesis", "test me on chapter 3", "let's practice
+      Spanish verbs", "make a quiz/questionnaire/test about X", "create some practice
+      questions on X"
+- Examples that NEVER call the tool — answer them directly and completely, as you
+  normally would: "explain photosynthesis", "what is chapter 3 about", "tell me about
+  Spanish verbs", "can you help me understand X".
+- Reserve confidence="medium" / [[QUIZ_OFFER:...]] STRICTLY for requests where the
+  intent is genuinely unclear between "explain this to me" and "quiz me on this" —
+  i.e. there is NO quiz/test/exam/practice/questionnaire verb or noun anywhere in the
+  message (e.g. "help me study X", "I want to get better at X"). If the message
+  contains any such verb or noun, even in noun form or in a non-English language,
+  treat it as confidence="high" and call the tool — do NOT downgrade it to
+  [[QUIZ_OFFER:...]] just because the phrasing doesn't match a memorized example.
+  For these genuinely ambiguous cases, DO NOT call the tool. Instead:
+    1. Answer the underlying question/help request directly and concisely, per your
+       conciseness directive.
+    2. After your answer, on a NEW final line by itself, append exactly:
+       [[QUIZ_OFFER:<topic>]]
+       where <topic> is the subject, in the language the user wrote in. This marker
+       is invisible to the user — it is parsed and removed by the system. NEVER
+       mention this marker in your visible reply, and NEVER describe it to the user.
+- When you DO call start_quiz, do not also produce conversational text in the same
+  turn — the tool call is your entire turn; the handoff message is generated by the
+  system, not by you.
+- NEVER use both the tool call AND the [[QUIZ_OFFER:...]] marker in the same turn.
+  Pick exactly one path, or neither.
 """
 
 
@@ -1004,6 +969,7 @@ STYLE DIRECTIVES (highest priority — override default behavior):
 {conciseness_directive}
 {tone_directive}
 
+{SMALL_TALK_RULES}
 BEHAVIORAL RULES:
 - You are encouraging but honest — never give empty praise.
 - If the user is struggling with a concept, use a concrete analogy from their interests.
@@ -1011,6 +977,7 @@ BEHAVIORAL RULES:
 - React naturally: celebrate milestones, gently nudge after inactivity.
 
 {TUTOR_RULES}
+{QUIZ_TRIGGER_RULES}
 {tool_instructions}"""
     identity_block = ""
     if pet_name:
@@ -1231,8 +1198,72 @@ KNOWLEDGE_TOOLS = [
 ]
 
 
+# Quiz-triggering tool — always attached, independent of knowledge_access.
+# Mirrors the KNOWLEDGE_TOOLS Gemini Tool proto pattern above.
+QUIZ_TOOLS = [
+    genai.protos.Tool(
+        function_declarations=[
+            genai.protos.FunctionDeclaration(
+                name="start_quiz",
+                description=(
+                    "Launch an interactive quiz session for the user. Call this with "
+                    "confidence='high' whenever the user explicitly and unambiguously asks "
+                    "to be quizzed, tested, examined, or given practice questions/a "
+                    "questionnaire — in ANY phrasing or supported language. This includes "
+                    "both verb-imperative requests aimed at the assistant (e.g. 'quiz me on "
+                    "X', 'test me', 'let's practice Y', 'examine me on X') AND noun/imperative "
+                    "requests asking for an artifact or session (e.g. 'make/create/generate a "
+                    "quiz/questionnaire/test/exam about X', 'give me some practice questions on "
+                    "X', 'give me a questionary on X'). Judge intent, not exact wording — this "
+                    "applies equally to non-English requests (e.g. Spanish 'hazme un "
+                    "cuestionario sobre X' / 'ponme a prueba', French 'fais-moi un quiz sur X', "
+                    "German 'mach ein Quiz über X', Japanese 'Xのクイズを作って', Chinese "
+                    "'给我出一些关于X的题' / '考我', etc.). "
+                    "Do NOT call this for informational requests like 'explain X', "
+                    "'tell me about X', 'what is X', or 'help me understand X' — those "
+                    "are answered directly with text, never with this tool. "
+                    "Only if the user's phrasing contains NO quiz/test/exam/practice/"
+                    "questionnaire verb or noun at all, and is genuinely ambiguous between "
+                    "'explain this' and 'quiz me' (e.g. 'help me study X' could mean either), "
+                    "do NOT call this tool — instead, answer their question directly, then on "
+                    "a new final line append [[QUIZ_OFFER:<topic>]] so the UI can offer a quiz "
+                    "as a follow-up."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "mode": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="'ai' for a topic-based quiz, 'deck' if the user names one of their own decks by name.",
+                        ),
+                        "topic": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="The subject to quiz on, in the language the user wrote in. Required for mode='ai'. For mode='deck', the deck name.",
+                        ),
+                        "question_count": genai.protos.Schema(
+                            type=genai.protos.Type.INTEGER,
+                            description="Number of questions requested. Omit to use the configured default. Clamp 1-20 if the user specifies a number.",
+                        ),
+                        "confidence": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="'high' if the user's message contains ANY explicit request to be quizzed/tested/examined/practiced or to be given a quiz/questionnaire/test/exam/practice questions — in any phrasing (verb-imperative OR noun-form) and any supported language (auto-launch, no confirmation). 'medium' ONLY if the message has no such verb or noun at all and is genuinely ambiguous between an explanation and a quiz (e.g. 'help me study X') — do not actually call the tool in that case, use [[QUIZ_OFFER:...]] instead.",
+                        ),
+                    },
+                    required=["mode", "confidence"],
+                ),
+            ),
+        ]
+    )
+]
+
+
 async def _dispatch_tool_call(
-    fn_name: str, fn_args: dict, user_id: str, client=None
+    fn_name: str,
+    fn_args: dict,
+    user_id: str,
+    client=None,
+    default_question_count: int = 10,
+    quiz_result_holder: Optional[dict] = None,
 ) -> str:
     """
     Executes the tool function requested by the model and returns the
@@ -1242,6 +1273,11 @@ async def _dispatch_tool_call(
     nested `as_type="tool"` span that automatically nests under the calling
     chat()'s smart_pet_chat generation via OTel context — no manual parent-id
     wiring required.
+
+    `default_question_count` and `quiz_result_holder` support the `start_quiz`
+    tool (see `_dispatch_tool_call_inner`): the holder is a mutable side-channel
+    dict that `chat()` inspects after the LLM call returns, since the LLM call's
+    return signature itself is not changed.
     """
     span_cm = contextlib.nullcontext()
     if client:
@@ -1259,7 +1295,9 @@ async def _dispatch_tool_call(
 
     with span_cm as tool_span:
         # ── The ONE tool-execution call — executes exactly once ─────────────
-        result_str = await _dispatch_tool_call_inner(fn_name, fn_args, user_id)
+        result_str = await _dispatch_tool_call_inner(
+            fn_name, fn_args, user_id, default_question_count, quiz_result_holder
+        )
 
         if tool_span is not None:
             try:
@@ -1273,7 +1311,13 @@ async def _dispatch_tool_call(
         return result_str
 
 
-async def _dispatch_tool_call_inner(fn_name: str, fn_args: dict, user_id: str) -> str:
+async def _dispatch_tool_call_inner(
+    fn_name: str,
+    fn_args: dict,
+    user_id: str,
+    default_question_count: int = 10,
+    quiz_result_holder: Optional[dict] = None,
+) -> str:
     """
     Executes the tool function requested by the model and returns the
     result as a JSON string to feed back into the conversation.
@@ -1307,6 +1351,30 @@ async def _dispatch_tool_call_inner(fn_name: str, fn_args: dict, user_id: str) -
             result = await get_annual_plan_context(user_id)
         elif fn_name == "get_user_interests":
             result = await get_user_interests(user_id)
+        elif fn_name == "start_quiz":
+            mode = fn_args.get("mode", "ai")
+            confidence = fn_args.get("confidence", "medium")
+            if confidence != "high":
+                logger.warning(f"[start_quiz] Rejected non-high-confidence tool call: {fn_args}")
+                result = {
+                    "error": "Ambiguous quiz request. Do not call start_quiz; answer the "
+                             "question directly and append [[QUIZ_OFFER:<topic>]] instead."
+                }
+            else:
+                raw_count = fn_args.get("question_count", default_question_count)
+                try:
+                    q_count = max(1, min(20, int(raw_count)))
+                except (TypeError, ValueError):
+                    q_count = default_question_count
+                quiz_config_dict = {
+                    "mode": mode if mode in ("ai", "deck") else "ai",
+                    "topic": fn_args.get("topic") or None,
+                    "question_count": q_count,
+                    "deck_id": None,
+                }
+                if quiz_result_holder is not None:
+                    quiz_result_holder["quiz_config"] = quiz_config_dict
+                result = {"status": "launching", "quiz_config": quiz_config_dict}
         else:
             result = {"error": f"Unknown tool: {fn_name}"}
     except Exception as exc:
@@ -1338,6 +1406,27 @@ PERSONALITY_SAFETY_SETTINGS = {
 }
 
 _PERSONA_BREAK_SIGNALS = ("As an AI", "language model", "I am programmed", "I cannot assist as")
+
+
+def _build_quiz_handoff_message(topic_label: str, language: str) -> str:
+    """
+    Build the short handoff reply shown when the agent's `start_quiz` tool call
+    is accepted (confidence="high"). Mirrors the original per-language copy that
+    used to live inline in `chat()`.
+    """
+    lang_prefix: str = language.split("-")[0].lower()
+    handoff_messages: dict[str, str] = {
+        "es": f"¡Perfecto! Iniciando tu quiz sobre {topic_label}…",
+        "fr": f"Parfait ! Lancement du quiz sur {topic_label}…",
+        "de": f"Super! Ich starte dein Quiz über {topic_label}…",
+        "pt": f"Ótimo! Iniciando seu quiz sobre {topic_label}…",
+        "ja": f"{topic_label}のクイズを始めます！",
+        "zh": f"好的！正在启动关于{topic_label}的测验…",
+        "ko": f"좋아요! {topic_label} 퀴즈를 시작합니다…",
+        "it": f"Perfetto! Avvio il quiz su {topic_label}…",
+        "ar": f"رائع! جارٍ بدء الاختبار حول {topic_label}…",
+    }
+    return handoff_messages.get(lang_prefix, f"Let's go! Starting your quiz on {topic_label}…")
 
 
 # ---------------------------------------------------------------------------
@@ -2447,104 +2536,104 @@ async def chat(
     model_name = TIER_MODEL_NAMES.get(tier_value, TIER_MODEL_NAMES["free"])
     trace_metadata = {"feature": "smart_pet_chat", "tier": tier_value, "user_id": user_id, "model": model_name}
 
-    # ── Quiz intent detection (runs BEFORE the main LLM call) ────────────────
-    # Detect quiz intent first so we can skip the main LLM call entirely when
-    # the user wants a quiz. This prevents the main model from generating a
-    # conversational reply AND attempting a tool call simultaneously, which
-    # causes a Groq 400 error.
-    quiz_config: Optional[QuizConfig] = None
-    groq_key: str = os.environ.get("GROQ_API_KEY", "")
-    if groq_key:
-        from groq import Groq as _Groq
-        _groq_client = _Groq(api_key=groq_key)
-        agent_prefs_raw: dict = user.get("preferences", {}).get("agent", {})
-        configured_q_count: int = int(agent_prefs_raw.get("ai_quiz_question_count", 10))
-        default_q_count: int = configured_q_count if tier != SubscriptionTier.FREE else 10
-        quiz_config = _detect_quiz_intent(
-            message=body.message,
-            default_question_count=default_q_count,
-            groq_client=_groq_client,
-            history=history,
+    # ── Quiz trigger setup ────────────────────────────────────────────────────
+    # The `start_quiz` tool is always attached (independent of knowledge_access —
+    # quiz triggering is core functionality). Its default question count mirrors
+    # the same tier-aware computation the old pre-classifier used.
+    agent_prefs_raw: dict = user.get("preferences", {}).get("agent", {})
+    configured_q_count: int = int(agent_prefs_raw.get("ai_quiz_question_count", 10))
+    default_q_count: int = configured_q_count if tier != SubscriptionTier.FREE else 10
+
+    # Mutable side-channel: populated by _dispatch_tool_call_inner if the model
+    # calls start_quiz with confidence="high". Read after agent_llm.chat() returns.
+    quiz_result_holder: dict = {}
+
+    tools_for_call = (KNOWLEDGE_TOOLS if knowledge_access else []) + QUIZ_TOOLS
+
+    # ── The ONE LLM call for this turn ────────────────────────────────────────
+    turn_input = history + [{"role": "user", "content": body.message}]
+
+    # Set up Langfuse tracing context BEFORE the LLM call (fire-and-forget, TR-06).
+    # If construction fails, fall back to no-op context managers — the LLM call
+    # below executes exactly once either way, never retried for tracing reasons.
+    attrs_cm = contextlib.nullcontext()
+    gen_cm = contextlib.nullcontext()
+    if client:
+        try:
+            attrs_cm = propagate_attributes(
+                user_id=user_id,
+                session_id=user_id,  # D-10: stable per-user session across the pet relationship
+                trace_name="smart_pet_chat",
+                metadata=trace_metadata,
+                tags=["smart_pet_chat", tier_value],
+            )
+            gen_cm = client.start_as_current_observation(
+                name="smart_pet_chat",
+                as_type="generation",
+                model=model_name,
+                input=turn_input,
+            )
+        except Exception as langfuse_exc:
+            logger.warning(
+                f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+            )
+            attrs_cm = contextlib.nullcontext()
+            gen_cm = contextlib.nullcontext()
+
+    tool_dispatcher = functools.partial(
+        _dispatch_tool_call,
+        client=client,
+        default_question_count=default_q_count,
+        quiz_result_holder=quiz_result_holder,
+    )
+
+    try:
+        with attrs_cm, gen_cm as turn_generation:
+            # ── The ONE LLM call for this turn — executes exactly once ──────
+            reply = await agent_llm.chat(
+                message=body.message,
+                history=history,
+                system_prompt=system_prompt,
+                tools=tools_for_call,
+                tool_dispatcher=tool_dispatcher,
+                user_id=user_id,
+                tier=tier,
+            )
+
+            # Record the result on the Langfuse generation, if one is active.
+            # A failure here is a tracing-only failure: the reply is already in
+            # hand, so we log and continue — never re-invoke agent_llm.chat.
+            if turn_generation is not None:
+                try:
+                    turn_generation.update(output=reply)  # D-13: full reply, no truncation
+                except Exception as langfuse_exc:
+                    logger.warning(
+                        f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                    )
+    except Exception as exc:
+        logger.error(f"Agent Chat Error: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI service error: {str(exc)}",
         )
 
-    # When quiz intent was detected, return a short handoff message immediately
-    # without calling the main LLM at all — no risk of tool call conflicts.
-    if quiz_config is not None:
-        lang_prefix: str = body.language.split("-")[0].lower()
+    # ── Quiz result processing ──────────────────────────────────────────────
+    # Either the model called start_quiz (confidence="high" → quiz_config, and
+    # the canned handoff message replaces the reply), or it answered directly
+    # and may have appended a [[QUIZ_OFFER:<topic>]] marker for an ambiguous
+    # study/help request (→ quiz_offer, marker stripped from the visible reply).
+    quiz_config: Optional[QuizConfig] = None
+    quiz_offer: Optional[QuizOffer] = None
+
+    if quiz_result_holder.get("quiz_config"):
+        quiz_config = QuizConfig(**quiz_result_holder["quiz_config"])
         topic_label: str = quiz_config.topic or "this topic"
-        _HANDOFF_MESSAGES: dict[str, str] = {
-            "es": f"¡Perfecto! Iniciando tu quiz sobre {topic_label}…",
-            "fr": f"Parfait ! Lancement du quiz sur {topic_label}…",
-            "de": f"Super! Ich starte dein Quiz über {topic_label}…",
-            "pt": f"Ótimo! Iniciando seu quiz sobre {topic_label}…",
-            "ja": f"{topic_label}のクイズを始めます！",
-            "zh": f"好的！正在启动关于{topic_label}的测验…",
-            "ko": f"좋아요! {topic_label} 퀴즈를 시작합니다…",
-            "it": f"Perfetto! Avvio il quiz su {topic_label}…",
-            "ar": f"رائع! جارٍ بدء الاختبار حول {topic_label}…",
-        }
-        reply = _HANDOFF_MESSAGES.get(lang_prefix, f"Let's go! Starting your quiz on {topic_label}…")
+        reply = _build_quiz_handoff_message(topic_label, body.language)
     else:
-        # ── Normal LLM call ──────────────────────────────────────────────────
-        turn_input = history + [{"role": "user", "content": body.message}]
-
-        # Set up Langfuse tracing context BEFORE the LLM call (fire-and-forget, TR-06).
-        # If construction fails, fall back to no-op context managers — the LLM call
-        # below executes exactly once either way, never retried for tracing reasons.
-        attrs_cm = contextlib.nullcontext()
-        gen_cm = contextlib.nullcontext()
-        if client:
-            try:
-                attrs_cm = propagate_attributes(
-                    user_id=user_id,
-                    session_id=user_id,  # D-10: stable per-user session across the pet relationship
-                    trace_name="smart_pet_chat",
-                    metadata=trace_metadata,
-                    tags=["smart_pet_chat", tier_value],
-                )
-                gen_cm = client.start_as_current_generation(
-                    name="smart_pet_chat",
-                    model=model_name,
-                    input=turn_input,
-                )
-            except Exception as langfuse_exc:
-                logger.warning(
-                    f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
-                )
-                attrs_cm = contextlib.nullcontext()
-                gen_cm = contextlib.nullcontext()
-
-        tool_dispatcher = functools.partial(_dispatch_tool_call, client=client) if client else _dispatch_tool_call
-
-        try:
-            with attrs_cm, gen_cm as turn_generation:
-                # ── The ONE LLM call for this turn — executes exactly once ──────
-                reply = await agent_llm.chat(
-                    message=body.message,
-                    history=history,
-                    system_prompt=system_prompt,
-                    tools=KNOWLEDGE_TOOLS if knowledge_access else None,
-                    tool_dispatcher=tool_dispatcher,
-                    user_id=user_id,
-                    tier=tier,
-                )
-
-                # Record the result on the Langfuse generation, if one is active.
-                # A failure here is a tracing-only failure: the reply is already in
-                # hand, so we log and continue — never re-invoke agent_llm.chat.
-                if turn_generation is not None:
-                    try:
-                        turn_generation.update(output=reply)  # D-13: full reply, no truncation
-                    except Exception as langfuse_exc:
-                        logger.warning(
-                            f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
-                        )
-        except Exception as exc:
-            logger.error(f"Agent Chat Error: {exc}")
-            raise HTTPException(
-                status_code=502,
-                detail=f"AI service error: {str(exc)}",
-            )
+        offer_match = re.search(r'\[\[QUIZ_OFFER:(.+?)\]\]\s*$', reply)
+        if offer_match:
+            quiz_offer = QuizOffer(topic=offer_match.group(1).strip())
+            reply = reply[:offer_match.start()].rstrip()
 
     # Persona break detection (log + flag, do NOT block reply)
     persona_break_detected = any(signal in reply for signal in _PERSONA_BREAK_SIGNALS)
@@ -2582,6 +2671,7 @@ async def chat(
         new_stage=xp_result["new_stage"],
         avatar_regen_pending=xp_result.get("avatar_regen_pending", False),
         quiz_config=quiz_config,
+        quiz_offer=quiz_offer,
     )
 
 

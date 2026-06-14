@@ -161,3 +161,14 @@ class QuizConfig(BaseModel):
     topic: str | None = None
     question_count: int = 10
     deck_id: str | None = None
+
+
+class QuizOffer(BaseModel):
+    """
+    Returned when the agent's reply contains an ambiguous study/help request.
+    The frontend renders this as a "Want a quiz on <topic>?" follow-up prompt,
+    distinct from quiz_config (which triggers an immediate, automatic handoff).
+    """
+    topic: str
+    mode: Literal["ai", "deck"] = "ai"
+    question_count: int = 10

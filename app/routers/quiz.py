@@ -252,35 +252,49 @@ Respond ONLY with raw JSON (no markdown):
         messages.append({"role": msg.role, "content": msg.content})
     messages.append({"role": "user", "content": user_answer})
 
-    try:
-        completion = client.chat.completions.create(
-            model=_GROQ_MODEL,
-            max_tokens=512,
-            temperature=0.6,
-            messages=messages,
-        )
-        raw_text: str = (completion.choices[0].message.content or "").strip()
+    parsed: dict | None = None
+    for attempt in range(2):
+        try:
+            completion = client.chat.completions.create(
+                model=_GROQ_MODEL,
+                max_tokens=1024,
+                temperature=0.6,
+                messages=messages,
+            )
+            raw_text: str = (completion.choices[0].message.content or "").strip()
 
-        # Strip markdown code fences if present
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            raw_text = "\n".join(
-                line for line in lines if not line.startswith("```")
-            ).strip()
+            # Strip markdown code fences if present
+            if raw_text.startswith("```"):
+                lines = raw_text.splitlines()
+                raw_text = "\n".join(
+                    line for line in lines if not line.startswith("```")
+                ).strip()
 
-        parsed: dict = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        logger.error(f"[quiz] Claude evaluation returned malformed JSON: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail="AI evaluation returned an unexpected format. Please try again.",
-        )
-    except Exception as exc:
-        logger.error(f"[quiz] Claude evaluation call failed: {exc}")
-        raise HTTPException(
-            status_code=502,
-            detail="AI service error during answer evaluation.",
-        )
+            parsed = json.loads(raw_text)
+            break
+        except json.JSONDecodeError as exc:
+            logger.error(f"[quiz] Groq evaluation returned malformed JSON (attempt {attempt + 1}): {exc}")
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({
+                "role": "user",
+                "content": "Your previous response was not valid JSON. Return ONLY a single valid JSON object matching the required schema, no prose, no markdown.",
+            })
+        except Exception as exc:
+            logger.error(f"[quiz] Groq evaluation call failed: {exc}")
+            raise HTTPException(
+                status_code=502,
+                detail="AI service error during answer evaluation.",
+            )
+
+    if parsed is None:
+        logger.error("[quiz] Groq evaluation failed after retry — returning graceful fallback")
+        return {
+            "response_type": "followup",
+            "evaluation": None,
+            "feedback_message": "Sorry, I couldn't grade that answer just now. Please try submitting it again.",
+            "hint": None,
+            "revealed_answer": None,
+        }
 
     # Validate required keys with safe defaults
     response_type: str = parsed.get("response_type", "evaluation")
@@ -629,34 +643,63 @@ Respond ONLY with raw JSON (no markdown):
         messages.append({"role": msg.role, "content": msg.content})
     messages.append({"role": "user", "content": user_answer})
 
-    try:
-        completion = client.chat.completions.create(
-            model=_GROQ_MODEL,
-            max_tokens=512,
-            temperature=0.6,
-            messages=messages,
-        )
-        raw_text: str = (completion.choices[0].message.content or "").strip()
+    parsed: dict | None = None
+    for attempt in range(2):
+        try:
+            completion = client.chat.completions.create(
+                model=_GROQ_MODEL,
+                max_tokens=1024,
+                temperature=0.6,
+                messages=messages,
+            )
+            raw_text: str = (completion.choices[0].message.content or "").strip()
 
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            raw_text = "\n".join(
-                line for line in lines if not line.startswith("```")
-            ).strip()
+            if raw_text.startswith("```"):
+                lines = raw_text.splitlines()
+                raw_text = "\n".join(
+                    line for line in lines if not line.startswith("```")
+                ).strip()
 
-        parsed: dict = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        logger.error(f"[ai_quiz] Groq evaluation returned malformed JSON: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail="AI evaluation returned an unexpected format. Please try again.",
+            parsed = json.loads(raw_text)
+            break
+        except json.JSONDecodeError as exc:
+            logger.error(f"[ai_quiz] Groq evaluation returned malformed JSON (attempt {attempt + 1}): {exc}")
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({
+                "role": "user",
+                "content": "Your previous response was not valid JSON. Return ONLY a single valid JSON object matching the required schema, no prose, no markdown.",
+            })
+        except Exception as exc:
+            logger.error(f"[ai_quiz] Groq evaluation call failed: {exc}")
+            raise HTTPException(
+                status_code=502,
+                detail="AI service error during answer evaluation.",
+            )
+
+    if parsed is None:
+        logger.error("[ai_quiz] Groq evaluation failed after retry — returning graceful fallback")
+        _FALLBACK_MESSAGES: dict[str, str] = {
+            "es": "Lo siento, no pude evaluar esa respuesta. Inténtalo de nuevo.",
+            "fr": "Désolé, je n'ai pas pu évaluer cette réponse. Veuillez réessayer.",
+            "de": "Entschuldigung, ich konnte diese Antwort nicht bewerten. Bitte versuche es erneut.",
+            "pt": "Desculpe, não consegui avaliar essa resposta. Tente novamente.",
+            "ja": "申し訳ありませんが、その回答を評価できませんでした。もう一度お試しください。",
+            "zh": "抱歉,无法评估该答案,请重试。",
+            "ko": "죄송합니다. 해당 답변을 평가할 수 없었습니다. 다시 시도해 주세요.",
+            "it": "Spiacenti, non sono riuscito a valutare questa risposta. Riprova.",
+            "ar": "عذرًا، لم أتمكن من تقييم هذه الإجابة. حاول مرة أخرى.",
+        }
+        fallback_message: str = _FALLBACK_MESSAGES.get(
+            language.split("-")[0].lower(),
+            "Sorry, I couldn't grade that answer just now. Please try submitting it again.",
         )
-    except Exception as exc:
-        logger.error(f"[ai_quiz] Groq evaluation call failed: {exc}")
-        raise HTTPException(
-            status_code=502,
-            detail="AI service error during answer evaluation.",
-        )
+        return {
+            "response_type": "followup",
+            "evaluation": None,
+            "feedback_message": fallback_message,
+            "hint": None,
+            "revealed_answer": None,
+        }
 
     response_type: str = parsed.get("response_type", "evaluation")
     if response_type not in ("followup", "evaluation"):
