@@ -438,8 +438,9 @@ async def ai_expand_text(
                         metadata=trace_metadata,
                         tags=["book_expand", tier],
                     ):
-                        with client.start_as_current_generation(
+                        with client.start_as_current_observation(
                             name="book_expand",
+                            as_type="generation",
                             model=model_name,
                             input=[
                                 {"role": "system", "content": system_prompt},

@@ -186,11 +186,11 @@ import pytest
 @pytest.fixture
 def mock_langfuse_client():
     """MagicMock Langfuse client with context-manager-compatible
-    start_as_current_observation / start_as_current_generation that record
-    calls for assertion (propagate_attributes kwargs, nesting, etc.)."""
+    start_as_current_observation (used for both spans and generations via
+    as_type="generation") that records calls for assertion
+    (propagate_attributes kwargs, nesting, etc.)."""
     client = MagicMock()
     client.start_as_current_observation.return_value.__enter__.return_value = MagicMock()
-    client.start_as_current_generation.return_value.__enter__.return_value = MagicMock()
     return client
 
 
@@ -199,7 +199,6 @@ def broken_langfuse_client():
     """Simulates an unreachable Langfuse — every SDK method raises."""
     client = MagicMock()
     client.start_as_current_observation.side_effect = ConnectionError("Langfuse unreachable")
-    client.start_as_current_generation.side_effect = ConnectionError("Langfuse unreachable")
     return client
 
 
@@ -354,11 +353,12 @@ async def test_ai_expand_text_happy_path_traces_book_expand(mock_langfuse_client
 
     assert response.expanded_text == "Expanded text here."
 
-    mock_langfuse_client.start_as_current_generation.assert_called_once()
-    _, gen_kwargs = mock_langfuse_client.start_as_current_generation.call_args
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_observation.call_args
     assert gen_kwargs["name"] == "book_expand"
+    assert gen_kwargs["as_type"] == "generation"
 
-    generation_ctx = mock_langfuse_client.start_as_current_generation.return_value.__enter__.return_value
+    generation_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
     generation_ctx.update.assert_called_once()
     _, update_kwargs = generation_ctx.update.call_args
     assert update_kwargs["output"] == "Expanded text here."
@@ -431,11 +431,12 @@ async def test_generate_cards_from_book_happy_path_traces_book_cards(mock_langfu
     assert len(response.cards) == 1
     assert response.cards[0].title == "Q1"
 
-    mock_langfuse_client.start_as_current_generation.assert_called_once()
-    _, gen_kwargs = mock_langfuse_client.start_as_current_generation.call_args
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_observation.call_args
     assert gen_kwargs["name"] == "book_cards"
+    assert gen_kwargs["as_type"] == "generation"
 
-    generation_ctx = mock_langfuse_client.start_as_current_generation.return_value.__enter__.return_value
+    generation_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
     generation_ctx.update.assert_called_once()
     _, update_kwargs = generation_ctx.update.call_args
     assert update_kwargs["usage_details"] is None
@@ -499,14 +500,15 @@ async def test_generate_questions_retries_traced_separately(mock_langfuse_client
     import app.routers.quiz_ai as quiz_ai_module
 
     # Attempt 1 returns EMPTY content (not an exception) — this lets attempt 1's
-    # start_as_current_generation span complete normally (generation.update is called
-    # with output=""), the "[ai_quiz] LLM returned empty content on attempt 1...
-    # Retrying" branch fires, and the loop proceeds to attempt 2, which opens its OWN
-    # span and succeeds. This is Known Failure Mode 1: both attempts are visible as
-    # separate Langfuse traces, not just the winner. (An exception on attempt 1 would
-    # instead be caught by the inner "Langfuse tracing failed" except — misattributing
-    # a genuine LLM error — and its same-attempt fallback retry would consume the
-    # second side_effect item, producing only ONE start_as_current_generation call.)
+    # start_as_current_observation (as_type="generation") span complete normally
+    # (generation.update is called with output=""), the "[ai_quiz] LLM returned
+    # empty content on attempt 1... Retrying" branch fires, and the loop proceeds
+    # to attempt 2, which opens its OWN span and succeeds. This is Known Failure
+    # Mode 1: both attempts are visible as separate Langfuse traces, not just the
+    # winner. (An exception on attempt 1 would instead be caught by the inner
+    # "Langfuse tracing failed" except — misattributing a genuine LLM error — and
+    # its same-attempt fallback retry would consume the second side_effect item,
+    # producing only ONE start_as_current_observation call.)
     fake_groq_client = MagicMock()
     fake_groq_client.chat.completions.create.side_effect = [
         _fake_groq_completion(""),
@@ -527,11 +529,12 @@ async def test_generate_questions_retries_traced_separately(mock_langfuse_client
     assert len(questions) == 1
     assert questions[0].question_text == "Q0"
 
-    # Both attempts must produce their own start_as_current_generation span (Known Failure Mode 1)
-    assert mock_langfuse_client.start_as_current_generation.call_count == 2
-    for call in mock_langfuse_client.start_as_current_generation.call_args_list:
+    # Both attempts must produce their own start_as_current_observation span (Known Failure Mode 1)
+    assert mock_langfuse_client.start_as_current_observation.call_count == 2
+    for call in mock_langfuse_client.start_as_current_observation.call_args_list:
         _, kwargs = call
         assert kwargs["name"] == "quiz_from_deck"
+        assert kwargs["as_type"] == "generation"
 
 
 @pytest.mark.asyncio
@@ -627,11 +630,12 @@ async def test_generate_quiz_from_book_happy_path_traces_quiz_from_book(mock_lan
 
     assert len(result["questions"]) == 2
 
-    mock_langfuse_client.start_as_current_generation.assert_called_once()
-    _, gen_kwargs = mock_langfuse_client.start_as_current_generation.call_args
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_observation.call_args
     assert gen_kwargs["name"] == "quiz_from_book"
+    assert gen_kwargs["as_type"] == "generation"
 
-    generation_ctx = mock_langfuse_client.start_as_current_generation.return_value.__enter__.return_value
+    generation_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
     generation_ctx.update.assert_called_once()
     _, update_kwargs = generation_ctx.update.call_args
     assert update_kwargs["usage_details"] is None
@@ -693,7 +697,8 @@ def _ensure_agent_importable() -> None:
     # a MagicMock (hasattr is always True), which breaks Pydantic's `QuizConfig | None`
     # schema generation in agent.py's ChatResponse. Unconditionally overwrite
     # .QuizConfig with a real Pydantic model (same unconditional-overwrite pattern
-    # as the gemini_client/limiter stubs above).
+    # as the gemini_client/limiter stubs above). The same applies to .QuizOffer,
+    # used by ChatResponse.quiz_offer.
     from typing import Optional as _Optional
     from pydantic import BaseModel as _BM
 
@@ -703,11 +708,17 @@ def _ensure_agent_importable() -> None:
         question_count: int = 10
         deck_id: _Optional[str] = None
 
+    class _QuizOffer(_BM):
+        topic: str
+        mode: str = "ai"
+        question_count: int = 10
+
     quiz_mod = sys.modules.get("app.models.quiz")
     if quiz_mod is None:
         quiz_mod = MagicMock()
         sys.modules["app.models.quiz"] = quiz_mod
     quiz_mod.QuizConfig = _QuizConfig
+    quiz_mod.QuizOffer = _QuizOffer
 
     # _ensure_cards_importable() registers app.config.subscription_plans as a bare
     # MagicMock() (since cards.py only needs it importable, not functionally correct).
@@ -762,7 +773,6 @@ async def test_chat_happy_path_traces_smart_pet_chat_with_session_id(mock_langfu
 
     with patch.object(agent_module, "users_collection") as mock_users, \
          patch.object(agent_module, "get_langfuse_client", return_value=mock_langfuse_client), \
-         patch.object(agent_module, "_detect_quiz_intent", return_value=None), \
          patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock) as mock_append, \
          patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=[]), \
          patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock) as mock_agent_chat, \
@@ -783,14 +793,79 @@ async def test_chat_happy_path_traces_smart_pet_chat_with_session_id(mock_langfu
     assert response.reply == "Hello! How can I help you study today?"
     assert mock_agent_chat.call_count == 1  # TR-06: single LLM invocation
 
-    mock_langfuse_client.start_as_current_generation.assert_called_once()
-    _, gen_kwargs = mock_langfuse_client.start_as_current_generation.call_args
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_observation.call_args
     assert gen_kwargs["name"] == "smart_pet_chat"
+    assert gen_kwargs["as_type"] == "generation"
 
-    generation_ctx = mock_langfuse_client.start_as_current_generation.return_value.__enter__.return_value
+    generation_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
     generation_ctx.update.assert_called_once_with(output="Hello! How can I help you study today?")
 
     mock_append.assert_not_called()  # free tier — agent_persistent_memory feature is False
+
+
+@pytest.mark.asyncio
+async def test_chat_system_prompt_includes_small_talk_rules(mock_langfuse_client):
+    """Bug fix regression test: the system prompt sent to the LLM must always include
+    SMALL_TALK_RULES, instructing it not to pivot a bare greeting into a lesson on the
+    user's primary_topic/interests and not to call start_quiz / append [[QUIZ_OFFER:...]]
+    for greetings — regardless of injected persistent history."""
+    import app.routers.agent as agent_module
+
+    fake_user = {
+        "_id": "u1",
+        "subscription": {"tier": "plus"},
+        "agent": {"xp": 0},
+        "preferences": {
+            "general": {
+                "primary_topic": "Japanese",
+                "interests": ["keigo", "anime"],
+            }
+        },
+    }
+
+    # Simulate a Plus user whose persistent history contains an unrelated keigo lesson.
+    old_history = [
+        {"role": "user", "content": "Help me with keigo"},
+        {"role": "model", "content": "Here is a keigo mini-lesson... [[QUIZ_OFFER:keigo]]"},
+    ]
+
+    with patch.object(agent_module, "users_collection") as mock_users, \
+         patch.object(agent_module, "get_langfuse_client", return_value=mock_langfuse_client), \
+         patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock), \
+         patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=old_history), \
+         patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock) as mock_agent_chat, \
+         patch.object(agent_module, "grant_xp", new_callable=AsyncMock,
+                       return_value={"level_up": False, "new_level": 1, "new_stage": 1}), \
+         patch.object(agent_module, "ObjectId", side_effect=lambda x: x):
+        mock_users.find_one = AsyncMock(return_value=fake_user)
+        mock_users.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+        # Model behaves correctly post-fix: replies to the greeting, no marker.
+        mock_agent_chat.return_value = "¡Hola! ¿Cómo estás hoy?"
+
+        body = _make_chat_request_body("Hola")
+        fake_request = MagicMock()
+
+        response = await agent_module.chat(
+            request=fake_request, body=body, current_user={"user_id": "u1"}
+        )
+
+    # The system prompt actually sent to the LLM must contain the new directive.
+    _, call_kwargs = mock_agent_chat.call_args
+    system_prompt = call_kwargs["system_prompt"]
+    assert "SMALL TALK & GREETINGS" in system_prompt
+    assert "start_quiz" in system_prompt and "QUIZ_OFFER" in system_prompt
+
+    # The injected history is still passed through (so we know the model genuinely
+    # has the old keigo conversation available and the directive is what should
+    # prevent it from resuming that topic).
+    history_passed = call_kwargs["history"]
+    assert any("keigo" in turn["content"] for turn in history_passed)
+
+    # And the resulting reply/quiz_offer stays on-topic for the greeting.
+    assert response.reply == "¡Hola! ¿Cómo estás hoy?"
+    assert response.quiz_offer is None
+    assert response.quiz_config is None
 
 
 @pytest.mark.asyncio
@@ -816,7 +891,6 @@ async def test_chat_session_id_stable_across_two_turns(mock_langfuse_client):
     with patch.object(agent_module, "users_collection") as mock_users, \
          patch.object(agent_module, "get_langfuse_client", return_value=mock_langfuse_client), \
          patch.object(agent_module, "propagate_attributes", side_effect=_capture_propagate), \
-         patch.object(agent_module, "_detect_quiz_intent", return_value=None), \
          patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock), \
          patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=[]), \
          patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock, return_value="Reply"), \
@@ -869,7 +943,6 @@ async def test_chat_langfuse_unreachable(broken_langfuse_client, caplog):
 
     with patch.object(agent_module, "users_collection") as mock_users, \
          patch.object(agent_module, "get_langfuse_client", return_value=broken_langfuse_client), \
-         patch.object(agent_module, "_detect_quiz_intent", return_value=None), \
          patch.object(agent_module, "_append_to_persistent_history", new_callable=AsyncMock) as mock_append, \
          patch.object(agent_module, "_load_persistent_history", new_callable=AsyncMock, return_value=[]), \
          patch.object(agent_module.agent_llm, "chat", new_callable=AsyncMock, return_value="Hello there!") as mock_agent_chat, \

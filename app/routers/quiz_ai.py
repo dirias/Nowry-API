@@ -177,8 +177,9 @@ async def _generate_questions(
                         metadata=trace_metadata,
                         tags=[feature, tier],
                     ):
-                        with client.start_as_current_generation(
+                        with client.start_as_current_observation(
                             name=feature,
+                            as_type="generation",
                             model=model_name,
                             input=[
                                 {"role": "system", "content": system_prompt},
@@ -518,8 +519,9 @@ async def generate_quiz_from_book(
                         metadata=trace_metadata,
                         tags=["quiz_from_book", tier],
                     ):
-                        with client.start_as_current_generation(
+                        with client.start_as_current_observation(
                             name="quiz_from_book",
+                            as_type="generation",
                             model=model_name,
                             input=[{"role": "user", "content": combined_prompt}],
                             model_parameters={"question_limit": question_limit},

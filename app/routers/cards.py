@@ -194,8 +194,9 @@ async def generate_cards_from_book(
                         metadata=trace_metadata,
                         tags=["book_cards", tier],
                     ):
-                        with client.start_as_current_generation(
+                        with client.start_as_current_observation(
                             name="book_cards",
+                            as_type="generation",
                             model=model_name,
                             input=[{"role": "user", "content": combined_prompt}],
                             model_parameters={"card_limit": card_limit},
