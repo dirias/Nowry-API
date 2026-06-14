@@ -359,3 +359,214 @@ def test_dry_run_makes_no_writes(monkeypatch, tmp_path, capsys):
     assert len(dry_run_lines) >= 2
     tally_lines = [line for line in out.splitlines() if "cache NOT regenerated" in line]
     assert len(tally_lines) == 1
+
+
+# ---------------------------------------------------------------------------
+# Gap-fix regression tests: first-sync bootstrap when get_prompt 404s
+# (LangfuseNotFoundError) -- a 404 on the existence check must NOT be
+# treated as a fatal error; it means the prompt/config simply hasn't been
+# pushed to this Langfuse project yet and create_prompt() should run.
+# ---------------------------------------------------------------------------
+
+def _not_found_error(name):
+    """Build a stand-in for the langfuse SDK's NotFoundError: any Exception
+    with `.status_code == 404` set, matching the real SDK's ApiError base
+    class shape (see _is_not_found_error's docstring for why duck-typing on
+    status_code is used instead of isinstance against the real SDK class)."""
+    exc = Exception(
+        f"headers: {{}}, status_code: 404, body: {{'message': \"Prompt not found: '{name}' "
+        f"with label 'production'\", 'error': 'LangfuseNotFoundError'}}"
+    )
+    exc.status_code = 404
+    return exc
+
+
+def test_compare_before_push_not_found_bootstraps_new_prompt(monkeypatch):
+    """Gap-fix regression: a 404 'not found' on get_prompt (first-time sync
+    -- the prompt has never been pushed to this Langfuse project) must NOT
+    be reported as 'error'. compare_and_push_prompt should fall through to
+    create_prompt (labeled 'production') and return 'pushed'."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    from scripts import sync_langfuse
+
+    name = "nowry-cards-magic"
+    local_content = _FALLBACKS[name]
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = _not_found_error(name)
+
+    result = sync_langfuse.compare_and_push_prompt(
+        fake_client, name, local_content, dry_run=False
+    )
+
+    assert result == "pushed"
+    assert fake_client.create_prompt.call_count == 1
+    _, kwargs = fake_client.create_prompt.call_args
+    assert kwargs["name"] == name
+    assert kwargs["prompt"] == local_content
+    assert kwargs["labels"] == ["production"]
+
+
+def test_compare_before_push_not_found_dry_run_does_not_push(monkeypatch):
+    """Gap-fix regression: in --dry-run, a 404 'not found' is still reported
+    as 'pushed' (so the dry-run tally reflects the bootstrap that WOULD
+    happen) but create_prompt must NOT actually be called."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    from scripts import sync_langfuse
+
+    name = "nowry-cards-magic"
+    local_content = _FALLBACKS[name]
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = _not_found_error(name)
+
+    result = sync_langfuse.compare_and_push_prompt(
+        fake_client, name, local_content, dry_run=True
+    )
+
+    assert result == "pushed"
+    assert fake_client.create_prompt.call_count == 0
+
+
+def test_compare_before_push_genuine_error_still_errors(monkeypatch):
+    """A non-404 exception (network error, 401, 5xx, etc.) from get_prompt
+    must still be reported as 'error' and must NOT trigger create_prompt --
+    only a 404 'not found' is treated as a bootstrap case."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    from scripts import sync_langfuse
+
+    name = "nowry-cards-magic"
+    local_content = _FALLBACKS[name]
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = Exception("network error: connection refused")
+
+    result = sync_langfuse.compare_and_push_prompt(
+        fake_client, name, local_content, dry_run=False
+    )
+
+    assert result == "error"
+    assert fake_client.create_prompt.call_count == 0
+
+
+def test_model_config_not_found_bootstraps_new_config(monkeypatch, tmp_path):
+    """Gap-fix regression (nowry-model-config block in main()): a 404 'not
+    found' on get_prompt(MODEL_CONFIG_NAME) is the same first-sync bootstrap
+    case -- main() must push the derived model config via create_prompt,
+    NOT increment failed_count, and (since this is the only prompt and it's
+    the success path) regenerate the cache."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    expected_model_config = _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    def fake_get_prompt(name, type="text"):
+        if name == MODEL_CONFIG_NAME_FOR_TEST:
+            raise _not_found_error(name)
+        return MagicMock(prompt=_FALLBACKS[name], config=None)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main([])
+
+    assert exc_info.value.code == 0
+
+    create_calls = [
+        call for call in fake_client.create_prompt.call_args_list
+        if call.kwargs.get("name") == MODEL_CONFIG_NAME_FOR_TEST
+    ]
+    assert len(create_calls) == 1
+    assert create_calls[0].kwargs["config"] == expected_model_config
+    assert create_calls[0].kwargs["labels"] == ["production"]
+
+    data = json.loads(cache_path.read_text())
+    assert data["model_config"] == expected_model_config
+
+
+def test_dry_run_summary_reports_failures(monkeypatch, tmp_path, capsys):
+    """Gap-fix regression: a GENUINE (non-404) fetch error during --dry-run
+    must surface in the dry-run summary's failed count and cause a non-zero
+    exit -- dry-run must never silently report 'Would push: 0, unchanged: 0'
+    while hiding real fetch failures."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    expected_model_config = _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    FAILING_NAME = "nowry-quiz-from-deck"
+
+    def fake_get_prompt(name, type="text"):
+        if name == MODEL_CONFIG_NAME_FOR_TEST:
+            return MagicMock(prompt="Model configuration", config=expected_model_config)
+        if name == FAILING_NAME:
+            raise Exception("network error: connection refused")
+        return MagicMock(prompt=_FALLBACKS[name], config=None)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main(["--dry-run"])
+
+    assert exc_info.value.code != 0
+    assert fake_client.create_prompt.call_count == 0
+
+    out = capsys.readouterr().out
+    tally_lines = [line for line in out.splitlines() if "Would push" in line]
+    assert len(tally_lines) == 1
+    assert "failed: 1" in tally_lines[0]
+
+
+def test_dry_run_first_sync_all_not_found_reports_pushed(monkeypatch, tmp_path, capsys):
+    """End-to-end regression for the originally reported bug: on a fresh
+    Langfuse project where NONE of the 9 sync targets exist yet, --dry-run
+    must report them all as 'would push' (bootstrap), with zero failures
+    and exit 0 -- NOT 'Would push: 0, unchanged: 0' while every fetch 404s."""
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk_lf_test_key")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk_lf_test_key")
+
+    _patch_model_config(monkeypatch)
+    cache_path = _write_tmp_cache(tmp_path)
+
+    from scripts import sync_langfuse
+
+    monkeypatch.setattr(sync_langfuse, "CACHE_PATH", cache_path)
+
+    def fake_get_prompt(name, type="text"):
+        raise _not_found_error(name)
+
+    fake_client = MagicMock()
+    fake_client.get_prompt.side_effect = fake_get_prompt
+
+    with patch("scripts.sync_langfuse.Langfuse", MagicMock(return_value=fake_client), create=True):
+        with pytest.raises(SystemExit) as exc_info:
+            sync_langfuse.main(["--dry-run"])
+
+    assert exc_info.value.code == 0
+    assert fake_client.create_prompt.call_count == 0
+
+    out = capsys.readouterr().out
+    tally_lines = [line for line in out.splitlines() if "Would push" in line]
+    assert len(tally_lines) == 1
+    assert f"Would push: {len(_FALLBACKS)}" in tally_lines[0]
+    assert "failed: 0" in tally_lines[0]

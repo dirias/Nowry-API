@@ -103,17 +103,61 @@ def _build_client(secret, public, base_url):
     return Langfuse(secret_key=secret, public_key=public, base_url=base_url)
 
 
+def _is_not_found_error(exc):
+    """True if `exc` represents a 404 'prompt not found' response from
+    Langfuse (i.e. the prompt/config simply doesn't exist yet -- first-sync
+    bootstrap case, not a real error).
+
+    Checks `exc.status_code == 404` rather than `isinstance(exc,
+    langfuse.api.commons.errors.NotFoundError)`: the langfuse v4 SDK raises
+    that NotFoundError (a subclass of its ApiError base, which always sets
+    `.status_code`) for a missing prompt, but importing the specific
+    exception class would require the real SDK to be installed/importable
+    at test time (it's only available inside the Docker container -- see
+    module docstring for `Langfuse` above) and would be brittle across SDK
+    versions. Checking the duck-typed `.status_code` attribute works for
+    the real SDK exception and for any MagicMock/stub that sets it,
+    without an import. A bare exception with no `.status_code` (e.g. a
+    network error) returns False here and is still treated as a genuine
+    error."""
+    return getattr(exc, "status_code", None) == 404
+
+
 def compare_and_push_prompt(client, name, local_content, dry_run=False):
     """Compare-before-push for a single prompt (D-05, makes SY-04 true by
     construction). Returns one of: "pushed", "unchanged", "error".
     NEVER calls create_prompt when dry_run=True or content is unchanged --
     this is what makes re-runs idempotent and dry-run side-effect-free.
     T-11-03: only the caught exception's string representation is surfaced
-    (no raw tracebacks) -- the Langfuse SDK's str(exc) does not leak credentials."""
+    (no raw tracebacks) -- the Langfuse SDK's str(exc) does not leak credentials.
+
+    First-sync bootstrap (gap fix): if the prompt does not exist yet in this
+    Langfuse project, client.get_prompt() raises a 404 NotFoundError
+    (surfaced as `status_code == 404` on the SDK's ApiError base class --
+    see _is_not_found_error). That is NOT an error for this script's
+    purposes -- it just means there is nothing to compare against yet, so
+    we fall through to the create_prompt path exactly as if the content had
+    changed (respecting dry_run) and return "pushed"."""
     try:
         current = client.get_prompt(name, type="text")
         remote_content = current.prompt
     except Exception as exc:
+        if _is_not_found_error(exc):
+            if dry_run:
+                print(f"[DRY RUN] {name}: not found in Langfuse -- would push as new prompt")
+                return "pushed"
+            try:
+                client.create_prompt(
+                    name=name,
+                    type="text",
+                    prompt=local_content,
+                    labels=[PRODUCTION_LABEL],
+                )
+                print(f"{name}: not found in Langfuse -- pushed as new prompt")
+                return "pushed"
+            except Exception as create_exc:
+                print(f"ERROR pushing {name}: {create_exc}")
+                return "error"
         print(f"ERROR fetching {name}: {exc}")
         return "error"
 
@@ -288,10 +332,18 @@ def main(argv=None):
         current_cfg = client.get_prompt(MODEL_CONFIG_NAME, type="text")
         remote_model_config = getattr(current_cfg, "config", None)
     except Exception as exc:
-        print(f"ERROR fetching {MODEL_CONFIG_NAME}: {exc}")
-        remote_model_config = None
-        failed_count += 1
-        model_config_status = "error"
+        if _is_not_found_error(exc):
+            # First-sync bootstrap (same gap fix as compare_and_push_prompt):
+            # nowry-model-config doesn't exist yet in this Langfuse project.
+            # Treat as "no remote config" -- _config_dicts_equal(None, ...)
+            # is False for any non-empty local_model_config, so this falls
+            # through to the create_prompt ("changed"/push) branch below.
+            remote_model_config = None
+        else:
+            print(f"ERROR fetching {MODEL_CONFIG_NAME}: {exc}")
+            remote_model_config = None
+            failed_count += 1
+            model_config_status = "error"
 
     if model_config_status != "error":
         if _config_dicts_equal(remote_model_config, local_model_config):
@@ -323,9 +375,12 @@ def main(argv=None):
         cfg_word = "would update" if model_config_status == "changed" else "unchanged"
         print(
             f"[DRY RUN] Would push: {pushed_count}, unchanged: {unchanged_count}, "
-            f"model config {cfg_word}, cache NOT regenerated"
+            f"failed: {failed_count}, model config {cfg_word}, cache NOT regenerated"
         )
-        sys.exit(0)
+        # A "not found" prompt is reported as "pushed" (bootstrap), so
+        # failed_count here only reflects genuine errors (network, auth,
+        # 5xx, etc.) -- never silently report success when fetches failed.
+        sys.exit(1 if failed_count > 0 else 0)
 
     # --- gate cache regeneration on FULL success (D-10 / T-11-02) ---
     if failed_count == 0:
