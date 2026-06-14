@@ -5,6 +5,8 @@ firebase-service-account.json
 *-service-account*.json
 *-credentials*.json
 gcp-key*.json
+# Default Firebase/GCP console download naming: <project-id>-<random-hash>.json
+nowry-88f05-*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
