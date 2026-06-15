@@ -1,6 +1,7 @@
 import json
 from fastapi import HTTPException
 from app.core import prompt_manager
+from app.core.evaluation_helper import score_trace
 
 
 def text_node(state):
@@ -32,7 +33,16 @@ def text_node(state):
     try:
         cards_json = raw_output[raw_output.find("[") : raw_output.rfind("]") + 1]
         study_cards = json.loads(cards_json)
+        # D-04: no comment on success
+        score_trace(name="format-valid", value=True)
         return {"generated_cards": study_cards}
     except json.JSONDecodeError as e:
+        # D-03: truncated error + raw-output snippet (~300 chars)
+        snippet = raw_output[:300]
+        score_trace(
+            name="format-valid",
+            value=False,
+            comment=f"{e}\nRaw output (truncated): {snippet}",
+        )
         print(f"JSON parse error: {e}")
         return {"generated_cards": []}

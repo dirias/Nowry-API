@@ -8,6 +8,7 @@ import json
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from app.core import prompt_manager
+from app.core.evaluation_helper import score_trace
 
 
 class VisualizerOutput(BaseModel):
@@ -44,12 +45,21 @@ def generate_visual_node(state):
 
         # Parse JSON response (model is instructed to return JSON)
         result = json.loads(raw_text)
+        # D-04: no comment on success
+        score_trace(name="format-valid", value=True)
         return {
             "mermaid_code": result.get("mermaid_code", ""),
             "explanation": result.get("explanation", ""),
         }
     except json.JSONDecodeError as e:
-        # Return error dict matching existing fallback pattern
+        # D-03: truncated error + raw-output snippet (~300 chars)
+        snippet = raw_text[:300]
+        score_trace(
+            name="format-valid",
+            value=False,
+            comment=f"{e}\nRaw output (truncated): {snippet}",
+        )
+        # Keep existing soft-failure behavior
         return {"error": f"Failed to parse visualizer response: {e}"}
     except Exception as e:
         print(f"Error generating visual: {e}")
