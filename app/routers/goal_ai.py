@@ -3,6 +3,7 @@ import asyncio
 import json
 import re
 import logging
+from typing import Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
@@ -59,6 +60,35 @@ def _serialize_plan(areas: list, priorities: list, goal_lists: list) -> str:
             f"completed={p.get('is_completed', False)}"
         )
     return "\n".join(lines)
+
+
+def _parse_goal_analysis(raw_text: str) -> tuple[GoalAnalysisResponse, Optional[Exception]]:
+    """Parse a Gemini JSON response into a GoalAnalysisResponse.
+
+    Returns (response, error). error is None on success. On failure (malformed
+    JSON, missing/wrong-typed fields, or a syntactically-valid-but-schema-mismatched
+    payload), response is the soft-failure GoalAnalysisResponse([], [], []) and
+    error is the json.JSONDecodeError / KeyError / TypeError / pydantic
+    ValidationError that was caught.
+    """
+    try:
+        data = json.loads(raw_text)
+        return (
+            GoalAnalysisResponse(
+                suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
+                conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
+                archiving_recommendations=[
+                    ArchivingRecommendation(**r)
+                    for r in data.get("archiving_recommendations", [])
+                ],
+            ),
+            None,
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
+        return (
+            GoalAnalysisResponse(suggestions=[], conflicts=[], archiving_recommendations=[]),
+            exc,
+        )
 
 
 @router.post("/analyze", response_model=GoalAnalysisResponse)
@@ -142,31 +172,21 @@ async def analyze_goals(
 
                 # D-07: format-valid scoring -- still inside propagate_attributes,
                 # outside the closed start_as_current_observation span
-                try:
-                    data = json.loads(raw_text)
+                result, parse_err = _parse_goal_analysis(raw_text)
+                if parse_err is None:
                     # D-04: no comment on success
                     score_trace(name="format-valid", value=True)
-                    return GoalAnalysisResponse(
-                        suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
-                        conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
-                        archiving_recommendations=[
-                            ArchivingRecommendation(**r)
-                            for r in data.get("archiving_recommendations", [])
-                        ],
-                    )
-                except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
+                else:
                     # D-03: truncated error + raw-output snippet
                     snippet = raw_text[:300]
                     score_trace(
                         name="format-valid",
                         value=False,
-                        comment=f"{exc}\nRaw output (truncated): {snippet}",
+                        comment=f"{parse_err}\nRaw output (truncated): {snippet}",
                     )
-                    logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
-                    # D-07: existing soft-failure behavior unchanged
-                    return GoalAnalysisResponse(
-                        suggestions=[], conflicts=[], archiving_recommendations=[]
-                    )
+                    logger.warning("goal_ai: Failed to parse Gemini response: %s", parse_err)
+                # D-07: existing soft-failure behavior unchanged on error
+                return result
         except Exception as langfuse_exc:
             logger.warning(
                 f"goal_ai: Langfuse tracing failed, continuing without trace: {langfuse_exc}"
@@ -176,39 +196,17 @@ async def analyze_goals(
             raw_text = re.sub(
                 r"^```json\n?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE
             )
-            try:
-                data = json.loads(raw_text)
-                return GoalAnalysisResponse(
-                    suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
-                    conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
-                    archiving_recommendations=[
-                        ArchivingRecommendation(**r)
-                        for r in data.get("archiving_recommendations", [])
-                    ],
-                )
-            except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
-                logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
-                return GoalAnalysisResponse(
-                    suggestions=[], conflicts=[], archiving_recommendations=[]
-                )
+            result, parse_err = _parse_goal_analysis(raw_text)
+            if parse_err is not None:
+                logger.warning("goal_ai: Failed to parse Gemini response: %s", parse_err)
+            return result
     else:
         # client is None -- Langfuse disabled (untraced path, identical to pre-Phase-13 behavior)
         response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
         raw_text = re.sub(
             r"^```json\n?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE
         )
-        try:
-            data = json.loads(raw_text)
-            return GoalAnalysisResponse(
-                suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
-                conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
-                archiving_recommendations=[
-                    ArchivingRecommendation(**r)
-                    for r in data.get("archiving_recommendations", [])
-                ],
-            )
-        except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
-            logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
-            return GoalAnalysisResponse(
-                suggestions=[], conflicts=[], archiving_recommendations=[]
-            )
+        result, parse_err = _parse_goal_analysis(raw_text)
+        if parse_err is not None:
+            logger.warning("goal_ai: Failed to parse Gemini response: %s", parse_err)
+        return result
