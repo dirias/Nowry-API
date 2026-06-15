@@ -20,6 +20,9 @@ from app.models.goal_ai import (
     GoalConflict,
     ArchivingRecommendation,
 )
+from app.core.evaluation_helper import score_trace
+from app.core.langfuse_client import get_langfuse_client
+from langfuse import propagate_attributes
 
 logger = logging.getLogger(__name__)
 
@@ -108,20 +111,103 @@ async def analyze_goals(
     plan_summary = _serialize_plan(areas, priorities, goal_lists)
     combined_prompt = f"{_SYSTEM_PROMPT}\n\n{plan_summary}"
 
-    try:
+    client = get_langfuse_client()
+    model_name = "models/gemini-pro-latest"  # Goal AI is Pro-only (D-06)
+    trace_metadata = {
+        "feature": "goal_ai",
+        "tier": "pro",
+        "user_id": str(user_id),
+        "model": model_name,
+    }
+
+    if client:
+        try:
+            with propagate_attributes(
+                user_id=str(user_id),
+                trace_name="goal_ai",
+                metadata=trace_metadata,
+                tags=["goal_ai", "pro"],
+            ):
+                with client.start_as_current_observation(
+                    name="goal_ai",
+                    as_type="generation",
+                    model=model_name,
+                    input=[{"role": "user", "content": combined_prompt}],
+                ) as generation:
+                    response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
+                    raw_text = response.choices[0].message.content
+                    raw_text = re.sub(r"^```json\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
+                    generation.update(output=raw_text, usage_details=None)
+
+                # D-07: format-valid scoring -- still inside propagate_attributes,
+                # outside the closed start_as_current_observation span
+                try:
+                    data = json.loads(raw_text)
+                    # D-04: no comment on success
+                    score_trace(name="format-valid", value=True)
+                    return GoalAnalysisResponse(
+                        suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
+                        conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
+                        archiving_recommendations=[
+                            ArchivingRecommendation(**r)
+                            for r in data.get("archiving_recommendations", [])
+                        ],
+                    )
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    # D-03: truncated error + raw-output snippet
+                    snippet = raw_text[:300]
+                    score_trace(
+                        name="format-valid",
+                        value=False,
+                        comment=f"{exc}\nRaw output (truncated): {snippet}",
+                    )
+                    logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
+                    # D-07: existing soft-failure behavior unchanged
+                    return GoalAnalysisResponse(
+                        suggestions=[], conflicts=[], archiving_recommendations=[]
+                    )
+        except Exception as langfuse_exc:
+            logger.warning(
+                f"goal_ai: Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+            )
+            # Fallback: untraced path
+            response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
+            raw_text = re.sub(
+                r"^```json\n?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE
+            )
+            try:
+                data = json.loads(raw_text)
+                return GoalAnalysisResponse(
+                    suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
+                    conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
+                    archiving_recommendations=[
+                        ArchivingRecommendation(**r)
+                        for r in data.get("archiving_recommendations", [])
+                    ],
+                )
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
+                return GoalAnalysisResponse(
+                    suggestions=[], conflicts=[], archiving_recommendations=[]
+                )
+    else:
+        # client is None -- Langfuse disabled (untraced path, identical to pre-Phase-13 behavior)
         response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
-        raw_text = response.choices[0].message.content
-        # Strip markdown fences if present
-        raw_text = re.sub(r"^```json\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
-        data = json.loads(raw_text)
-        return GoalAnalysisResponse(
-            suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
-            conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
-            archiving_recommendations=[
-                ArchivingRecommendation(**r)
-                for r in data.get("archiving_recommendations", [])
-            ],
+        raw_text = re.sub(
+            r"^```json\n?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE
         )
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
-        return GoalAnalysisResponse(suggestions=[], conflicts=[], archiving_recommendations=[])
+        try:
+            data = json.loads(raw_text)
+            return GoalAnalysisResponse(
+                suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
+                conflicts=[GoalConflict(**c) for c in data.get("conflicts", [])],
+                archiving_recommendations=[
+                    ArchivingRecommendation(**r)
+                    for r in data.get("archiving_recommendations", [])
+                ],
+            )
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
+            return GoalAnalysisResponse(
+                suggestions=[], conflicts=[], archiving_recommendations=[]
+            )
