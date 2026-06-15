@@ -1075,6 +1075,106 @@ def test_no_observe_decorator_on_tts():
     assert 'as_type="span"' in content
 
 
+# ---------------------------------------------------------------------------
+# Phase 13 -- evaluation_helper.score_trace() unit tests (EV-01/EV-02)
+# ---------------------------------------------------------------------------
+
+
+def test_infer_data_type_bool_before_int():
+    """bool MUST classify as BOOLEAN, never NUMERIC -- isinstance(True, int) is True
+    in Python, so the bool check must run first."""
+    from app.core.evaluation_helper import _infer_data_type
+
+    assert _infer_data_type(True) == "BOOLEAN"
+    assert _infer_data_type(False) == "BOOLEAN"
+    assert _infer_data_type(42) == "NUMERIC"
+    assert _infer_data_type(3.14) == "NUMERIC"
+    assert _infer_data_type("category") == "CATEGORICAL"
+
+
+def test_score_trace_current_trace_happy_path():
+    """trace_id=None -> client.score_current_trace(...) called with inferred
+    data_type='BOOLEAN' and comment=None (D-04: no comment on success)."""
+    from app.core.evaluation_helper import score_trace
+
+    mock_client = MagicMock()
+    with patch(
+        "app.core.evaluation_helper.get_langfuse_client",
+        return_value=mock_client,
+    ):
+        score_trace(name="format-valid", value=True)
+
+    mock_client.score_current_trace.assert_called_once_with(
+        name="format-valid", value=True, data_type="BOOLEAN", comment=None
+    )
+    mock_client.create_score.assert_not_called()
+
+
+def test_score_trace_explicit_trace_id():
+    """trace_id='abc123' -> client.create_score(trace_id='abc123', ...) called,
+    score_current_trace NOT called (D-05 explicit-trace path)."""
+    from app.core.evaluation_helper import score_trace
+
+    mock_client = MagicMock()
+    with patch(
+        "app.core.evaluation_helper.get_langfuse_client",
+        return_value=mock_client,
+    ):
+        score_trace(
+            trace_id="abc123",
+            name="format-valid",
+            value=False,
+            comment="JSONDecodeError: Expecting value: line 1 column 1",
+        )
+
+    mock_client.create_score.assert_called_once_with(
+        trace_id="abc123",
+        name="format-valid",
+        value=False,
+        data_type="BOOLEAN",
+        comment="JSONDecodeError: Expecting value: line 1 column 1",
+    )
+    mock_client.score_current_trace.assert_not_called()
+
+
+def test_score_trace_langfuse_disabled():
+    """client is None (Phase 9 D-08 disabled state) -> returns silently,
+    no exception, no log."""
+    from app.core.evaluation_helper import score_trace
+
+    with patch(
+        "app.core.evaluation_helper.get_langfuse_client",
+        return_value=None,
+    ):
+        result = score_trace(name="format-valid", value=True)
+
+    assert result is None
+
+
+def test_score_trace_sdk_failure_logs_warning(caplog):
+    """client.score_current_trace raises -> score_trace logs exactly one
+    WARNING containing 'score_trace failed' and does not propagate."""
+    import logging
+
+    from app.core.evaluation_helper import score_trace
+
+    mock_client = MagicMock()
+    mock_client.score_current_trace.side_effect = ConnectionError("Langfuse unreachable")
+
+    with patch(
+        "app.core.evaluation_helper.get_langfuse_client",
+        return_value=mock_client,
+    ):
+        with caplog.at_level(logging.WARNING):
+            score_trace(name="format-valid", value=True)
+
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "score_trace failed" in r.message
+    ]
+    assert len(warning_records) == 1
+
+
 # D-08 taxonomy — the 9 canonical feature/trace_name values, one per instrumented call path
 _D08_FEATURE_TAXONOMY = [
     "cards_magic",
