@@ -1,6 +1,7 @@
 import json
 from fastapi import HTTPException
 from app.core import prompt_manager
+from app.core.evaluation_helper import score_trace
 
 
 def quiz_node(state):
@@ -55,11 +56,22 @@ def quiz_node(state):
         if start_idx != -1 and end_idx != -1:
             json_str = raw_output[start_idx : end_idx + 1]
             quiz_data = json.loads(json_str)
+            # D-04: no comment on success
+            score_trace(name="format-valid", value=True)
             return {"generated_quiz": quiz_data}
         else:
             raise ValueError("No JSON array found in response")
 
     except json.JSONDecodeError as e:
+        # D-02 CRITICAL: record the failure score BEFORE raising -- the trace
+        # context (propagate_attributes) is still active here, but NOT after
+        # the HTTPException propagates out of graph.invoke().
+        snippet = raw_output[:300]
+        score_trace(
+            name="format-valid",
+            value=False,
+            comment=f"{e}\nRaw output (truncated): {snippet}",
+        )
         print(f"Quiz JSON Generation failed: {e}")
         print(f"Raw Output: {raw_output}")
         # Fallback or error

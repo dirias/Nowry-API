@@ -1175,6 +1175,171 @@ def test_score_trace_sdk_failure_logs_warning(caplog):
     assert len(warning_records) == 1
 
 
+# ---------------------------------------------------------------------------
+# Phase 13 -- format-valid scoring on LangGraph orchestrator nodes (D-01/D-02)
+# ---------------------------------------------------------------------------
+
+
+def _fake_llm_response(content: str):
+    """Build a MagicMock mimicking llm_client.request(...) -> response shape
+    (response.choices[0].message.content)."""
+    return MagicMock(choices=[MagicMock(message=MagicMock(content=content))])
+
+
+def test_text_node_format_valid_true_on_json_success():
+    """text_node: valid JSON array -> format-valid=True, comment=None,
+    unchanged {'generated_cards': [...]} return."""
+    from app.ai_orchestrator.rag import text_node as text_node_module
+
+    state = {
+        "prompt": "make cards",
+        "sampleText": "some source text",
+        "sampleNumber": 1,
+        "llm_client": MagicMock(
+            request=MagicMock(
+                return_value=_fake_llm_response('[{"front": "Q1", "back": "A1"}]')
+            )
+        ),
+    }
+
+    with patch.object(text_node_module, "score_trace") as mock_score:
+        result = text_node_module.text_node(state)
+
+    assert result == {"generated_cards": [{"front": "Q1", "back": "A1"}]}
+    mock_score.assert_called_once_with(name="format-valid", value=True)
+
+
+def test_text_node_format_valid_false_on_json_error():
+    """text_node: malformed JSON -> format-valid=False with non-None comment,
+    unchanged {'generated_cards': []} soft-failure return."""
+    from app.ai_orchestrator.rag import text_node as text_node_module
+
+    state = {
+        "prompt": "make cards",
+        "sampleText": "some source text",
+        "sampleNumber": 1,
+        "llm_client": MagicMock(
+            request=MagicMock(return_value=_fake_llm_response("not json at all"))
+        ),
+    }
+
+    with patch.object(text_node_module, "score_trace") as mock_score:
+        result = text_node_module.text_node(state)
+
+    assert result == {"generated_cards": []}
+    mock_score.assert_called_once()
+    _, score_kwargs = mock_score.call_args
+    assert score_kwargs["name"] == "format-valid"
+    assert score_kwargs["value"] is False
+    assert score_kwargs["comment"] is not None
+    assert "Raw output (truncated)" in score_kwargs["comment"]
+
+
+def test_quiz_node_format_valid_true_on_json_success():
+    """quiz_node: valid JSON array -> format-valid=True, comment=None,
+    unchanged {'generated_quiz': [...]} return."""
+    from app.ai_orchestrator.quiz import quiz_node as quiz_node_module
+
+    state = {
+        "sampleText": "some source text",
+        "numQuestions": 1,
+        "difficulty": "Medium",
+        "llm_client": MagicMock(
+            request=MagicMock(
+                return_value=_fake_llm_response(
+                    '[{"question": "Q1", "options": ["A", "B"], "correct_answer": "A"}]'
+                )
+            )
+        ),
+    }
+
+    with patch.object(quiz_node_module, "score_trace") as mock_score:
+        result = quiz_node_module.quiz_node(state)
+
+    assert result["generated_quiz"][0]["question"] == "Q1"
+    mock_score.assert_called_once_with(name="format-valid", value=True)
+
+
+def test_quiz_node_format_valid_false_before_raise():
+    """quiz_node D-02: malformed JSON inside [...] bounds -> format-valid=False
+    recorded BEFORE the existing HTTPException(500, ...) is raised."""
+    from fastapi import HTTPException
+
+    from app.ai_orchestrator.quiz import quiz_node as quiz_node_module
+
+    state = {
+        "sampleText": "some source text",
+        "numQuestions": 1,
+        "difficulty": "Medium",
+        "llm_client": MagicMock(
+            request=MagicMock(
+                return_value=_fake_llm_response('[{"question": "Q1", invalid}]')
+            )
+        ),
+    }
+
+    with patch.object(quiz_node_module, "score_trace") as mock_score:
+        with pytest.raises(HTTPException) as exc_info:
+            quiz_node_module.quiz_node(state)
+
+    assert exc_info.value.status_code == 500
+    mock_score.assert_called_once()
+    _, score_kwargs = mock_score.call_args
+    assert score_kwargs["name"] == "format-valid"
+    assert score_kwargs["value"] is False
+    assert score_kwargs["comment"] is not None
+    assert "Raw output (truncated)" in score_kwargs["comment"]
+
+
+def test_visualizer_node_format_valid_true_on_json_success():
+    """generate_visual_node: valid JSON object -> format-valid=True, comment=None,
+    unchanged {'mermaid_code': ..., 'explanation': ...} return."""
+    from app.ai_orchestrator.visualizer import visualizer_node as visualizer_node_module
+
+    state = {
+        "text": "some source text",
+        "viz_type": "mindmap",
+        "llm_client": MagicMock(
+            request=MagicMock(
+                return_value=_fake_llm_response(
+                    '{"mermaid_code": "graph TD", "explanation": "test"}'
+                )
+            )
+        ),
+    }
+
+    with patch.object(visualizer_node_module, "score_trace") as mock_score:
+        result = visualizer_node_module.generate_visual_node(state)
+
+    assert result == {"mermaid_code": "graph TD", "explanation": "test"}
+    mock_score.assert_called_once_with(name="format-valid", value=True)
+
+
+def test_visualizer_node_format_valid_false_on_json_error():
+    """generate_visual_node: malformed JSON -> format-valid=False with
+    non-None comment, unchanged {'error': ...} soft-failure return."""
+    from app.ai_orchestrator.visualizer import visualizer_node as visualizer_node_module
+
+    state = {
+        "text": "some source text",
+        "viz_type": "mindmap",
+        "llm_client": MagicMock(
+            request=MagicMock(return_value=_fake_llm_response("not json at all"))
+        ),
+    }
+
+    with patch.object(visualizer_node_module, "score_trace") as mock_score:
+        result = visualizer_node_module.generate_visual_node(state)
+
+    assert "error" in result
+    assert "Failed to parse visualizer response" in result["error"]
+    mock_score.assert_called_once()
+    _, score_kwargs = mock_score.call_args
+    assert score_kwargs["name"] == "format-valid"
+    assert score_kwargs["value"] is False
+    assert score_kwargs["comment"] is not None
+
+
 # D-08 taxonomy — the 9 canonical feature/trace_name values, one per instrumented call path
 _D08_FEATURE_TAXONOMY = [
     "cards_magic",
