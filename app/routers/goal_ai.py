@@ -3,6 +3,7 @@ import asyncio
 import json
 import re
 import logging
+from contextlib import ExitStack
 from typing import Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
@@ -155,27 +156,67 @@ async def analyze_goals(
     }
 
     if client:
+        # Phase 1: Langfuse instrumentation setup ONLY (propagate_attributes +
+        # start_as_current_observation). The actual Gemini call is deliberately
+        # OUTSIDE this try/except -- a genuine LLM failure must never be
+        # misattributed as "Langfuse tracing failed" nor trigger a duplicate
+        # paid call (WR-04).
+        propagate_stack = ExitStack()
+        generation_stack = ExitStack()
+        generation = None
         try:
-            with propagate_attributes(
-                user_id=str(user_id),
-                trace_name="goal_ai",
-                metadata=trace_metadata,
-                tags=["goal_ai", "pro"],
-            ):
-                with client.start_as_current_observation(
+            propagate_stack.enter_context(
+                propagate_attributes(
+                    user_id=str(user_id),
+                    trace_name="goal_ai",
+                    metadata=trace_metadata,
+                    tags=["goal_ai", "pro"],
+                )
+            )
+            generation = generation_stack.enter_context(
+                client.start_as_current_observation(
                     name="goal_ai",
                     as_type="generation",
                     model=model_name,
                     input=[{"role": "user", "content": combined_prompt}],
-                ) as generation:
-                    response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
-                    raw_text = response.choices[0].message.content
-                    raw_text = re.sub(r"^```json\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
-                    generation.update(output=raw_text, usage_details=None)
+                )
+            )
+        except Exception as langfuse_exc:
+            logger.warning(
+                f"goal_ai: Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+            )
+            generation_stack.close()
+            propagate_stack.close()
+            generation = None
 
-                # D-07: format-valid scoring -- still inside propagate_attributes,
-                # outside the closed start_as_current_observation span
-                result, parse_err = _parse_goal_analysis(raw_text)
+        try:
+            # Phase 2: the actual LLM call + response extraction. Not covered by
+            # the Langfuse except above -- a real Gemini error propagates as-is
+            # (unhandled 500), matching the untraced/disabled-client paths below,
+            # instead of being logged as a Langfuse failure and re-issuing a
+            # second paid call.
+            response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
+            raw_text = response.choices[0].message.content
+            raw_text = re.sub(r"^```json\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
+
+            if generation is not None:
+                try:
+                    generation.update(output=raw_text, usage_details=None)
+                except Exception as langfuse_exc:
+                    logger.warning(
+                        f"goal_ai: Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                    )
+        finally:
+            generation_stack.close()
+
+        # D-07: format-valid scoring -- still inside propagate_attributes
+        # (closed below), outside the closed start_as_current_observation span.
+        # score_trace() is fire-and-forget and never raises; if Langfuse setup
+        # failed above, it silently no-ops (matching the prior
+        # untraced-fallback behavior, which never called score_trace).
+        try:
+            result, parse_err = _parse_goal_analysis(raw_text)
+            if generation is not None:
                 if parse_err is None:
                     # D-04: no comment on success
                     score_trace(name="format-valid", value=True)
@@ -187,22 +228,12 @@ async def analyze_goals(
                         value=False,
                         comment=f"{parse_err}\nRaw output (truncated): {snippet}",
                     )
-                    logger.warning("goal_ai: Failed to parse Gemini response: %s", parse_err)
-                # D-07: existing soft-failure behavior unchanged on error
-                return result
-        except Exception as langfuse_exc:
-            logger.warning(
-                f"goal_ai: Langfuse tracing failed, continuing without trace: {langfuse_exc}"
-            )
-            # Fallback: untraced path
-            response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
-            raw_text = re.sub(
-                r"^```json\n?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE
-            )
-            result, parse_err = _parse_goal_analysis(raw_text)
             if parse_err is not None:
                 logger.warning("goal_ai: Failed to parse Gemini response: %s", parse_err)
-            return result
+        finally:
+            propagate_stack.close()
+        # D-07: existing soft-failure behavior unchanged on error
+        return result
     else:
         # client is None -- Langfuse disabled (untraced path, identical to pre-Phase-13 behavior)
         response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
