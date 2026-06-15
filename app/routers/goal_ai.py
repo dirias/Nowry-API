@@ -5,6 +5,7 @@ import re
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
 from app.auth.dependencies import get_subscription_tier, track_ai_usage
 from app.config.database import (
     annual_plans_collection,
@@ -153,7 +154,7 @@ async def analyze_goals(
                             for r in data.get("archiving_recommendations", [])
                         ],
                     )
-                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
                     # D-03: truncated error + raw-output snippet
                     snippet = raw_text[:300]
                     score_trace(
@@ -185,7 +186,7 @@ async def analyze_goals(
                         for r in data.get("archiving_recommendations", [])
                     ],
                 )
-            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
                 logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
                 return GoalAnalysisResponse(
                     suggestions=[], conflicts=[], archiving_recommendations=[]
@@ -206,7 +207,7 @@ async def analyze_goals(
                     for r in data.get("archiving_recommendations", [])
                 ],
             )
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
             logger.warning("goal_ai: Failed to parse Gemini response: %s", exc)
             return GoalAnalysisResponse(
                 suggestions=[], conflicts=[], archiving_recommendations=[]
