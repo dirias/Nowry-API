@@ -66,13 +66,16 @@ def _parse_goal_analysis(raw_text: str) -> tuple[GoalAnalysisResponse, Optional[
     """Parse a Gemini JSON response into a GoalAnalysisResponse.
 
     Returns (response, error). error is None on success. On failure (malformed
-    JSON, missing/wrong-typed fields, or a syntactically-valid-but-schema-mismatched
-    payload), response is the soft-failure GoalAnalysisResponse([], [], []) and
-    error is the json.JSONDecodeError / KeyError / TypeError / pydantic
+    JSON, missing/wrong-typed fields, a non-dict top-level JSON value, or a
+    syntactically-valid-but-schema-mismatched payload), response is the
+    soft-failure GoalAnalysisResponse([], [], []) and error is the
+    json.JSONDecodeError / KeyError / TypeError / AttributeError / pydantic
     ValidationError that was caught.
     """
     try:
         data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected a JSON object, got {type(data).__name__}")
         return (
             GoalAnalysisResponse(
                 suggestions=[GoalSuggestion(**s) for s in data.get("suggestions", [])],
@@ -84,7 +87,7 @@ def _parse_goal_analysis(raw_text: str) -> tuple[GoalAnalysisResponse, Optional[
             ),
             None,
         )
-    except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValidationError) as exc:
         return (
             GoalAnalysisResponse(suggestions=[], conflicts=[], archiving_recommendations=[]),
             exc,

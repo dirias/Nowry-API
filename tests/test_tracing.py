@@ -1485,6 +1485,44 @@ async def test_analyze_goals_format_valid_false_on_parse_error(mock_langfuse_cli
 
 
 @pytest.mark.asyncio
+async def test_analyze_goals_format_valid_false_on_non_dict_json(mock_langfuse_client):
+    """D-07/CR-02: Gemini returns syntactically valid JSON whose top-level value is
+    not an object (e.g. a bare array) -> format-valid=False with non-None comment,
+    existing soft-failure GoalAnalysisResponse([], [], []) unchanged, no unhandled
+    exception."""
+    goal_ai_module = _import_fresh_goal_ai()
+
+    fake_plan, fake_areas, fake_priorities, fake_goals = _build_goal_ai_fixtures()
+    col_patches = _patch_goal_ai_collections(
+        goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
+    )
+
+    goal_ai_module._gemini_client.request = MagicMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="[1, 2, 3]"))])
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_langfuse_client", return_value=mock_langfuse_client)
+        )
+        mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
+        for p in col_patches:
+            stack.enter_context(p)
+        result = await goal_ai_module.analyze_goals(current_user={"user_id": "u1"}, tier="pro")
+
+    assert result.suggestions == []
+    assert result.conflicts == []
+    assert result.archiving_recommendations == []
+
+    mock_score.assert_called_once()
+    _, score_kwargs = mock_score.call_args
+    assert score_kwargs["name"] == "format-valid"
+    assert score_kwargs["value"] is False
+    assert score_kwargs["comment"] is not None
+    assert "Raw output (truncated)" in score_kwargs["comment"]
+
+
+@pytest.mark.asyncio
 async def test_analyze_goals_langfuse_unreachable_falls_back(broken_langfuse_client, caplog):
     """D-06/D-07: Langfuse start_as_current_observation raises -> analyze_goals()
     falls back to the untraced path, still returns a valid response, logs WARNING."""
