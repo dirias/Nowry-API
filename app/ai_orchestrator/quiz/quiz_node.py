@@ -62,7 +62,7 @@ def quiz_node(state):
         else:
             raise ValueError("No JSON array found in response")
 
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         # D-02 CRITICAL: record the failure score BEFORE raising -- the trace
         # context (propagate_attributes) is still active here, but NOT after
         # the HTTPException propagates out of graph.invoke().
