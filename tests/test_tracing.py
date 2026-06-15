@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Prevent SDK import errors on Python 3.9 test runner (langfuse>=4.7.0 requires Python >=3.10;
@@ -1340,7 +1341,218 @@ def test_visualizer_node_format_valid_false_on_json_error():
     assert score_kwargs["comment"] is not None
 
 
-# D-08 taxonomy — the 9 canonical feature/trace_name values, one per instrumented call path
+# ---------------------------------------------------------------------------
+# Phase 13 -- goal_ai.py Langfuse instrumentation (D-06) + format-valid scoring (D-07)
+# ---------------------------------------------------------------------------
+
+
+def _build_goal_ai_fixtures():
+    """Common fixtures for goal_ai tests: fake annual plan + focus areas/priorities/goals,
+    each collection's find/find_one mocked as AsyncMock returning small bounded lists."""
+    fake_plan = {"_id": "plan123", "user_id": "u1", "year": 2026, "deleted_at": None}
+    fake_areas = [{"_id": "area1", "name": "Health", "annual_plan_id": "plan123"}]
+    fake_priorities = []
+    fake_goals = [
+        [
+            {
+                "_id": "goal1",
+                "title": "Run a 10k",
+                "quarter": 2,
+                "status": "active",
+                "progress": 30,
+                "milestones": [],
+            }
+        ]
+    ]
+    return fake_plan, fake_areas, fake_priorities, fake_goals
+
+
+def _patch_goal_ai_collections(goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals):
+    """Returns a list of patch context managers for goal_ai_module's MongoDB collections."""
+    patches = []
+
+    mock_plans = MagicMock()
+    mock_plans.find_one = AsyncMock(return_value=fake_plan)
+    patches.append(patch.object(goal_ai_module, "annual_plans_collection", mock_plans))
+
+    mock_areas_col = MagicMock()
+    mock_areas_col.find.return_value.to_list = AsyncMock(return_value=fake_areas)
+    patches.append(patch.object(goal_ai_module, "focus_areas_collection", mock_areas_col))
+
+    mock_priorities_col = MagicMock()
+    mock_priorities_col.find.return_value.to_list = AsyncMock(return_value=fake_priorities)
+    patches.append(patch.object(goal_ai_module, "priorities_collection", mock_priorities_col))
+
+    mock_goals_col = MagicMock()
+    mock_goals_col.find.return_value.to_list = AsyncMock(return_value=fake_goals[0])
+    patches.append(patch.object(goal_ai_module, "goals_collection", mock_goals_col))
+
+    return patches
+
+
+def _import_fresh_goal_ai():
+    """Re-import app.routers.goal_ai fresh -- _ensure_cards_importable() (called at
+    module level above) already stubs app.ai_orchestrator.llm_clients.gemini_client as a
+    MagicMock whose .Gemini_client(...) call returns a MagicMock without raising, so
+    goal_ai.py's module-level `_gemini_client = Gemini_client("models/gemini-pro-latest")`
+    succeeds without GEMINI_API_KEY."""
+    sys.modules.pop("app.routers.goal_ai", None)
+    import app.routers.goal_ai as goal_ai_module
+
+    return goal_ai_module
+
+
+@pytest.mark.asyncio
+async def test_analyze_goals_happy_path_traces_goal_ai(mock_langfuse_client):
+    """D-06: successful analyze_goals() traces under trace_name='goal_ai',
+    as_type='generation', model='models/gemini-pro-latest'; D-07: format-valid=True."""
+    goal_ai_module = _import_fresh_goal_ai()
+
+    fake_plan, fake_areas, fake_priorities, fake_goals = _build_goal_ai_fixtures()
+    col_patches = _patch_goal_ai_collections(
+        goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
+    )
+
+    valid_json = (
+        '{"suggestions": [{"goal_title": "Run a marathon", "quarter": 3, '
+        '"milestones": ["Run 15k"], "rationale": "Build on 10k progress"}], '
+        '"conflicts": [], "archiving_recommendations": []}'
+    )
+    goal_ai_module._gemini_client.request = MagicMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=valid_json))])
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_langfuse_client", return_value=mock_langfuse_client)
+        )
+        mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
+        for p in col_patches:
+            stack.enter_context(p)
+        result = await goal_ai_module.analyze_goals(current_user={"user_id": "u1"}, tier="pro")
+
+    assert len(result.suggestions) == 1
+    assert result.suggestions[0].goal_title == "Run a marathon"
+
+    mock_langfuse_client.start_as_current_observation.assert_called_once()
+    _, gen_kwargs = mock_langfuse_client.start_as_current_observation.call_args
+    assert gen_kwargs["name"] == "goal_ai"
+    assert gen_kwargs["as_type"] == "generation"
+    assert gen_kwargs["model"] == "models/gemini-pro-latest"
+
+    generation_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
+    generation_ctx.update.assert_called_once()
+    _, update_kwargs = generation_ctx.update.call_args
+    assert update_kwargs["usage_details"] is None
+
+    mock_score.assert_called_once_with(name="format-valid", value=True)
+
+
+@pytest.mark.asyncio
+async def test_analyze_goals_format_valid_false_on_parse_error(mock_langfuse_client):
+    """D-07: malformed Gemini JSON -> format-valid=False with non-None comment,
+    existing soft-failure GoalAnalysisResponse([], [], []) unchanged."""
+    goal_ai_module = _import_fresh_goal_ai()
+
+    fake_plan, fake_areas, fake_priorities, fake_goals = _build_goal_ai_fixtures()
+    col_patches = _patch_goal_ai_collections(
+        goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
+    )
+
+    goal_ai_module._gemini_client.request = MagicMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="not json at all"))])
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_langfuse_client", return_value=mock_langfuse_client)
+        )
+        mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
+        for p in col_patches:
+            stack.enter_context(p)
+        result = await goal_ai_module.analyze_goals(current_user={"user_id": "u1"}, tier="pro")
+
+    assert result.suggestions == []
+    assert result.conflicts == []
+    assert result.archiving_recommendations == []
+
+    mock_score.assert_called_once()
+    _, score_kwargs = mock_score.call_args
+    assert score_kwargs["name"] == "format-valid"
+    assert score_kwargs["value"] is False
+    assert score_kwargs["comment"] is not None
+    assert "Raw output (truncated)" in score_kwargs["comment"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_goals_langfuse_unreachable_falls_back(broken_langfuse_client, caplog):
+    """D-06/D-07: Langfuse start_as_current_observation raises -> analyze_goals()
+    falls back to the untraced path, still returns a valid response, logs WARNING."""
+    goal_ai_module = _import_fresh_goal_ai()
+
+    fake_plan, fake_areas, fake_priorities, fake_goals = _build_goal_ai_fixtures()
+    col_patches = _patch_goal_ai_collections(
+        goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
+    )
+
+    valid_json = (
+        '{"suggestions": [], "conflicts": [], "archiving_recommendations": []}'
+    )
+    goal_ai_module._gemini_client.request = MagicMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=valid_json))])
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_langfuse_client", return_value=broken_langfuse_client)
+        )
+        for p in col_patches:
+            stack.enter_context(p)
+        with caplog.at_level(logging.WARNING):
+            result = await goal_ai_module.analyze_goals(current_user={"user_id": "u1"}, tier="pro")
+
+    assert result.suggestions == []
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message
+    ]
+    assert len(warning_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_analyze_goals_langfuse_disabled_untraced():
+    """D-06: get_langfuse_client() returns None -> no propagate_attributes /
+    start_as_current_observation / score_trace calls; behavior identical to
+    pre-Phase-13 (returns a valid GoalAnalysisResponse)."""
+    goal_ai_module = _import_fresh_goal_ai()
+
+    fake_plan, fake_areas, fake_priorities, fake_goals = _build_goal_ai_fixtures()
+    col_patches = _patch_goal_ai_collections(
+        goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
+    )
+
+    valid_json = (
+        '{"suggestions": [], "conflicts": [], "archiving_recommendations": []}'
+    )
+    goal_ai_module._gemini_client.request = MagicMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=valid_json))])
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(goal_ai_module, "get_langfuse_client", return_value=None))
+        mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
+        for p in col_patches:
+            stack.enter_context(p)
+        result = await goal_ai_module.analyze_goals(current_user={"user_id": "u1"}, tier="pro")
+
+    assert result.suggestions == []
+    assert result.conflicts == []
+    assert result.archiving_recommendations == []
+    mock_score.assert_not_called()
+
+
+# D-08 taxonomy -- the 10 canonical feature/trace_name values, one per instrumented call path
+# (Phase 13 D-06 adds "goal_ai" as the 10th entry)
 _D08_FEATURE_TAXONOMY = [
     "cards_magic",
     "quiz_magic",
@@ -1351,13 +1563,15 @@ _D08_FEATURE_TAXONOMY = [
     "quiz_from_book",
     "smart_pet_chat",
     "tts_amagic",
+    "goal_ai",
 ]
 
 
-def test_d08_taxonomy_has_nine_unique_features():
-    """Guardrail 2a (TR-05): the D-08 taxonomy has exactly 9 unique feature strings."""
-    assert len(_D08_FEATURE_TAXONOMY) == 9
-    assert len(set(_D08_FEATURE_TAXONOMY)) == 9
+def test_d08_taxonomy_has_ten_unique_features():
+    """Guardrail 2a (TR-05, extended Phase 13 D-06): the D-08 taxonomy has exactly
+    10 unique feature strings."""
+    assert len(_D08_FEATURE_TAXONOMY) == 10
+    assert len(set(_D08_FEATURE_TAXONOMY)) == 10
 
 
 @pytest.mark.parametrize(
@@ -1369,12 +1583,13 @@ def test_d08_taxonomy_has_nine_unique_features():
         ("app/routers/quiz_ai.py", ["quiz_from_deck", "quiz_from_book"]),
         ("app/routers/agent.py", ["smart_pet_chat"]),
         ("app/routers/tts.py", ["tts_amagic"]),
+        ("app/routers/goal_ai.py", ["goal_ai"]),
     ],
 )
 def test_all_call_sites_use_d08_taxonomy_features(file_path, expected_features):
     """Guardrail 2b (TR-05): every instrumented file's trace_name/feature literals are drawn
-    from the 9-value D-08 taxonomy — no renamed/drifted feature strings. This test is
-    parametrized over 6 cases (one per instrumented file) and collects as 6 separate
+    from the 10-value D-08 taxonomy -- no renamed/drifted feature strings. This test is
+    parametrized over 7 cases (one per instrumented file) and collects as 7 separate
     pytest items."""
     from pathlib import Path
 
