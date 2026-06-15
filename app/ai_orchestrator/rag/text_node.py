@@ -31,12 +31,16 @@ def text_node(state):
     raw_output = ai_response.choices[0].message.content
 
     try:
-        cards_json = raw_output[raw_output.find("[") : raw_output.rfind("]") + 1]
+        start_idx = raw_output.find("[")
+        end_idx = raw_output.rfind("]")
+        if start_idx == -1 or end_idx == -1:
+            raise ValueError("No JSON array found in response")
+        cards_json = raw_output[start_idx : end_idx + 1]
         study_cards = json.loads(cards_json)
         # D-04: no comment on success
         score_trace(name="format-valid", value=True)
         return {"generated_cards": study_cards}
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         # D-03: truncated error + raw-output snippet (~300 chars)
         snippet = raw_output[:300]
         score_trace(
