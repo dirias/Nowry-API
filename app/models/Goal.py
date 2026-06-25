@@ -3,7 +3,14 @@ from bson import ObjectId
 from .types import PyObjectId
 from .mixins import SoftDeleteMixin
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
+
+class Milestone(BaseModel):
+    id: Optional[str] = None  # assigned on creation via str(ObjectId())
+    title: str
+    due_date: Optional[str] = None
+    completed: bool = False
+    is_key_result: bool = False
 
 class Goal(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
@@ -19,9 +26,9 @@ class Goal(BaseModel, SoftDeleteMixin):
     type: str = "quarterly"
     progress: int = 0
     status: str = "not_started"
-    milestones: List[dict] = []
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    milestones: List[Milestone] = []
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
     migration_count: int = 0
 

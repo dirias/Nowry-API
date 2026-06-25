@@ -21,7 +21,9 @@ from app.models.Priority import Priority
 from app.models.Goal import Goal
 from app.models.Activity import Activity
 from app.models.DailyRoutine import DailyRoutineTemplate
+from app.models.Goal import Milestone
 from app.models.QuarterReport import QuarterReport
+from pydantic import BaseModel
 
 async def verify_annual_plan_ownership(plan_id: str, user_id: str):
     from bson.errors import InvalidId
@@ -1089,6 +1091,221 @@ async def delete_activity(id: str, current_user: dict = Depends(get_firebase_use
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Activity not found")
     return {"message": "Activity deleted"}
+
+
+# --- Milestones ---
+
+class MilestoneCreate(BaseModel):
+    title: str
+    due_date: Optional[str] = None
+    is_key_result: bool = False
+
+
+class MilestonePatch(BaseModel):
+    title: Optional[str] = None
+    due_date: Optional[str] = None
+    completed: Optional[bool] = None
+    is_key_result: Optional[bool] = None
+
+
+class MilestoneResponse(BaseModel):
+    id: str
+    title: str
+    due_date: Optional[str] = None
+    completed: bool
+    is_key_result: bool
+
+
+def _resolve_goal_id(goal_id: str):
+    """Return an ObjectId when the string is a valid 24-hex ObjectId, otherwise return the raw string."""
+    from bson.errors import InvalidId
+    try:
+        return ObjectId(goal_id)
+    except InvalidId:
+        return goal_id
+
+
+async def _fetch_goal_doc(goal_id: str) -> dict:
+    """Fetch goal document by ObjectId or string fallback. Raises 404 if not found."""
+    obj_id = _resolve_goal_id(goal_id)
+    goal = await goals_collection.find_one({"_id": obj_id, "deleted_at": None})
+    if not goal and isinstance(obj_id, ObjectId):
+        # Fallback: some legacy docs may be stored with string _id
+        goal = await goals_collection.find_one({"_id": goal_id, "deleted_at": None})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return goal
+
+
+@router.post(
+    "/goals/{goal_id}/milestones",
+    response_model=MilestoneResponse,
+    status_code=201,
+)
+async def create_milestone(
+    goal_id: str,
+    payload: MilestoneCreate,
+    current_user: dict = Depends(get_firebase_user),
+) -> MilestoneResponse:
+    """
+    Append a new milestone to a goal's milestones array.
+
+    Ownership is verified by tracing: goal → focus_area → annual_plan → user_id.
+    Each milestone receives a stable `id` (str(ObjectId())) so it can be
+    addressed by subsequent PATCH / DELETE calls.
+    """
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+
+    new_milestone = Milestone(
+        id=str(ObjectId()),
+        title=payload.title,
+        due_date=payload.due_date,
+        is_key_result=payload.is_key_result,
+        completed=False,
+    )
+    milestone_doc = new_milestone.model_dump()
+
+    obj_id = _resolve_goal_id(goal_id)
+    result = await goals_collection.update_one(
+        {"_id": obj_id, "deleted_at": None},
+        {
+            "$push": {"milestones": milestone_doc},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+
+    if result.matched_count == 0:
+        # Fallback: string _id
+        result = await goals_collection.update_one(
+            {"_id": goal_id, "deleted_at": None},
+            {
+                "$push": {"milestones": milestone_doc},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    return MilestoneResponse(
+        id=new_milestone.id,
+        title=new_milestone.title,
+        due_date=new_milestone.due_date,
+        completed=new_milestone.completed,
+        is_key_result=new_milestone.is_key_result,
+    )
+
+
+@router.patch(
+    "/goals/{goal_id}/milestones/{milestone_id}",
+    response_model=MilestoneResponse,
+)
+async def update_milestone(
+    goal_id: str,
+    milestone_id: str,
+    payload: MilestonePatch,
+    current_user: dict = Depends(get_firebase_user),
+) -> MilestoneResponse:
+    """
+    Partially update a single milestone within a goal.
+
+    Only fields present in the request body are written; unset fields are
+    left unchanged. Uses MongoDB positional operator `$` to target the
+    milestone by its `id` field without replacing the whole array.
+    """
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+
+    goal = await _fetch_goal_doc(goal_id)
+
+    milestones: list = goal.get("milestones", [])
+    target = next((m for m in milestones if m.get("id") == milestone_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    # Merge patch fields onto the existing milestone
+    updated = dict(target)
+    if payload.title is not None:
+        updated["title"] = payload.title
+    if payload.due_date is not None:
+        updated["due_date"] = payload.due_date
+    if payload.completed is not None:
+        updated["completed"] = payload.completed
+    if payload.is_key_result is not None:
+        updated["is_key_result"] = payload.is_key_result
+
+    obj_id = _resolve_goal_id(goal_id)
+    result = await goals_collection.update_one(
+        {"_id": obj_id, "milestones.id": milestone_id, "deleted_at": None},
+        {
+            "$set": {
+                "milestones.$": updated,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    if result.matched_count == 0:
+        # Fallback: string _id
+        result = await goals_collection.update_one(
+            {"_id": goal_id, "milestones.id": milestone_id, "deleted_at": None},
+            {
+                "$set": {
+                    "milestones.$": updated,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal or milestone not found")
+
+    return MilestoneResponse(
+        id=updated["id"],
+        title=updated["title"],
+        due_date=updated.get("due_date"),
+        completed=updated["completed"],
+        is_key_result=updated["is_key_result"],
+    )
+
+
+@router.delete(
+    "/goals/{goal_id}/milestones/{milestone_id}",
+    response_model=MessageResponse,
+)
+async def delete_milestone(
+    goal_id: str,
+    milestone_id: str,
+    current_user: dict = Depends(get_firebase_user),
+) -> MessageResponse:
+    """
+    Remove a single milestone from a goal's milestones array by its `id`.
+
+    Uses MongoDB `$pull` so only the targeted sub-document is removed.
+    """
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+
+    obj_id = _resolve_goal_id(goal_id)
+    result = await goals_collection.update_one(
+        {"_id": obj_id, "deleted_at": None},
+        {
+            "$pull": {"milestones": {"id": milestone_id}},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    if result.matched_count == 0:
+        result = await goals_collection.update_one(
+            {"_id": goal_id, "deleted_at": None},
+            {
+                "$pull": {"milestones": {"id": milestone_id}},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    return MessageResponse(message="Milestone deleted")
 
 
 
