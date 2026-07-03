@@ -279,7 +279,7 @@ async def get_full_annual_plan(
         "plan": plan_serialized,
         "focus_areas": [serialize(a) for a in areas],
         "priorities": [serialize(p) for p in priorities],
-        "goals": [serialize(g) for g in all_goals],
+        "goals": [{**serialize(g), "_computed_progress": g.get("progress", 0)} for g in all_goals],
         "activities": [serialize(act) for act in all_activities],
         "quarter_reports": [serialize(r) for r in reports],
     }
