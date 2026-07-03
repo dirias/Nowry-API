@@ -861,6 +861,73 @@ async def delete_priority(id: str, current_user: dict = Depends(get_firebase_use
     return {"message": "Priority deleted"}
 
 
+class PriorityReorderRequest(BaseModel):
+    """Payload for PATCH /annual-plan/priorities/reorder."""
+    annual_plan_id: str
+    priority_ids: List[str]
+
+
+# NOTE: this route must remain ABOVE any future PATCH /priorities/{id} to avoid
+# FastAPI matching "reorder" as the {id} path parameter.
+@router.patch("/priorities/reorder", response_model=OkResponse)
+async def reorder_priorities(
+    payload: PriorityReorderRequest,
+    current_user: dict = Depends(get_firebase_user),
+) -> OkResponse:
+    """
+    Accept an ordered list of priority IDs and write sequential `order`
+    values (0-indexed). Validates that all IDs belong to the given plan
+    before performing any writes (D-09/D-10).
+    """
+    from bson.errors import InvalidId
+
+    user_id = current_user.get("user_id")
+
+    # Guard: oversized payload (DoS defense — T-20-03)
+    if len(payload.priority_ids) > 50:
+        raise HTTPException(status_code=422, detail="priority_ids must contain at most 50 items")
+
+    # Auth + plan ownership (D-12)
+    await verify_annual_plan_ownership(payload.annual_plan_id, user_id)
+
+    # Build ObjectId list with string fallback for legacy docs (D-09, Pattern 4)
+    obj_ids = []
+    for pid in payload.priority_ids:
+        try:
+            obj_ids.append(ObjectId(pid))
+        except InvalidId:
+            obj_ids.append(pid)
+
+    # Include both ObjectId and string forms in $in — covers legacy string-_id docs
+    all_id_forms = obj_ids + payload.priority_ids
+    valid_count = await priorities_collection.count_documents({
+        "_id": {"$in": all_id_forms},
+        "annual_plan_id": payload.annual_plan_id,
+        "deleted_at": None,
+    })
+    if valid_count != len(payload.priority_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="One or more priority IDs do not belong to this plan",
+        )
+
+    # Sequential update_one loop — all-or-nothing validation already passed (D-10)
+    # Use datetime.now() (naive) to match the existing update_priority pattern (line 801)
+    for index, (pid, obj_id) in enumerate(zip(payload.priority_ids, obj_ids)):
+        result = await priorities_collection.update_one(
+            {"_id": obj_id},
+            {"$set": {"order": index, "updated_at": datetime.now()}},
+        )
+        if result.matched_count == 0:
+            # Fallback: document has string _id (legacy doc)
+            await priorities_collection.update_one(
+                {"_id": pid},
+                {"$set": {"order": index, "updated_at": datetime.now()}},
+            )
+
+    return {"ok": True}
+
+
 # --- Goals ---
 
 @router.get("/goals", response_model=List[Goal])
