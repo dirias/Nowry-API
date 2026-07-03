@@ -211,7 +211,7 @@ async def get_full_annual_plan(
 
     # Level 2: focus areas, priorities, and quarter reports in parallel
     areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
-    priorities_coro = priorities_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=50)
+    priorities_coro = priorities_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).sort([("is_completed", 1), ("order", 1), ("created_at", 1)]).to_list(length=50)
     reports_coro = quarter_reports_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
 
     areas, priorities, reports = await asyncio.gather(areas_coro, priorities_coro, reports_coro)
@@ -756,7 +756,7 @@ async def get_priorities(
 ):
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(annual_plan_id, user_id)
-    priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id, "deleted_at": None}).to_list(length=50)
+    priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id, "deleted_at": None}).sort([("is_completed", 1), ("order", 1), ("created_at", 1)]).to_list(length=50)
     return priorities
 
 @router.post("/priorities", response_model=Priority)
