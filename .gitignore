@@ -174,3 +174,6 @@ data/
 
 # OS junk
 .DS_Store
+
+# Anki deck exports (personal/test data, not app assets)
+*.apkg
