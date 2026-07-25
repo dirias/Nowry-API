@@ -15,6 +15,7 @@ class Priority(BaseModel, SoftDeleteMixin):
     description: Optional[str] = ""
     deadline: Optional[datetime] = None
     order: int = 0
+    is_active: bool = True
     is_completed: bool = False
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)

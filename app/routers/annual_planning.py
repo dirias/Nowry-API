@@ -1,7 +1,10 @@
+import re
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
+
+DATE_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 from app.auth.firebase_auth import get_firebase_user
 from app.models.common import MessageResponse, OkResponse, FullAnnualPlanResponse
@@ -71,7 +74,11 @@ async def verify_priority_ownership(priority_id: str, user_id: str):
     except InvalidId:
         obj_id = priority_id
     p = await priorities_collection.find_one({"_id": obj_id})
-    if not p: raise HTTPException(status_code=404, detail="Priority not found")
+    if not p:
+        # Fallback: legacy priority stored with string _id
+        p = await priorities_collection.find_one({"_id": priority_id})
+    if not p:
+        raise HTTPException(status_code=404, detail="Priority not found")
     await verify_annual_plan_ownership(p["annual_plan_id"], user_id)
 
 
@@ -114,7 +121,7 @@ async def update_daily_routine(
             "morning_routine": routine.morning_routine,
             "afternoon_routine": routine.afternoon_routine,
             "evening_routine": routine.evening_routine,
-            "updated_at": datetime.now()
+            "updated_at": datetime.now(timezone.utc)
         }}
     )
     
@@ -153,10 +160,13 @@ async def update_routine_completions(
     """
     user_id = current_user.get("user_id")
     date_key = payload.get("date")
-    items = payload.get("items", [])
+    if not date_key or not DATE_KEY_RE.match(date_key):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
-    if not date_key:
-        raise HTTPException(status_code=400, detail="date field is required")
+    MAX_COMPLETION_ITEMS = 200
+    items = payload.get("items", [])
+    if not isinstance(items, list) or len(items) > MAX_COMPLETION_ITEMS:
+        raise HTTPException(status_code=400, detail=f"items must be a list of at most {MAX_COMPLETION_ITEMS} entries")
 
     await daily_routines_collection.update_one(
         {"user_id": user_id},
@@ -171,8 +181,10 @@ async def update_routine_completions(
 @router.get("", response_model=AnnualPlan)
 async def get_annual_plan(
     current_user: dict = Depends(get_firebase_user),
-    year: int = datetime.now().year
+    year: Optional[int] = None,
 ):
+    if year is None:
+        year = datetime.now().year
     user_id = current_user.get("user_id")
     plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
 
@@ -185,7 +197,7 @@ async def get_annual_plan(
 @router.get("/full", response_model=FullAnnualPlanResponse)
 async def get_full_annual_plan(
     current_user: dict = Depends(get_firebase_user),
-    year: int = datetime.now().year
+    year: Optional[int] = None,
 ):
     """
     Aggregation endpoint — returns the plan, focus areas, priorities, and all
@@ -199,6 +211,8 @@ async def get_full_annual_plan(
     """
     import asyncio
 
+    if year is None:
+        year = datetime.now().year
     user_id = current_user.get("user_id")
     plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
 
@@ -211,7 +225,11 @@ async def get_full_annual_plan(
 
     # Level 2: focus areas, priorities, and quarter reports in parallel
     areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
-    priorities_coro = priorities_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).sort([("is_completed", 1), ("order", 1), ("created_at", 1)]).to_list(length=50)
+    # D-03 sort — is_active DESC groups active before inactive within non-completed
+    # (aggregation $ifNull normalizes missing is_active on legacy docs — WR-02 fix)
+    priorities_coro = priorities_collection.aggregate(
+        _priorities_sort_pipeline({"annual_plan_id": plan_id, "deleted_at": None}, 50)
+    ).to_list(length=50)
     reports_coro = quarter_reports_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
 
     areas, priorities, reports = await asyncio.gather(areas_coro, priorities_coro, reports_coro)
@@ -329,7 +347,7 @@ async def update_annual_plan(
 
     update_data = {
         "title": plan_update.title,
-        "updated_at": datetime.now()
+        "updated_at": datetime.now(timezone.utc)
     }
     
     await annual_plans_collection.update_one(
@@ -346,24 +364,24 @@ async def update_annual_plan_by_id(
     current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
-    
-    # Try to find plan by string ID first (seems to be stored as string in DB)
-    print(f"Looking for plan with ID: {id}, user: {user_id}")
-    existing_plan = await annual_plans_collection.find_one({"_id": id})
-    
-    # If not found, try as ObjectId
-    if not existing_plan:
+
+    # Track which _id form matched so update and return use the same key
+    existing_plan, id_key = None, id
+    found_by_string = await annual_plans_collection.find_one({"_id": id})
+    if found_by_string:
+        existing_plan = found_by_string
+    else:
         try:
             object_id = ObjectId(id)
             existing_plan = await annual_plans_collection.find_one({"_id": object_id})
-        except:
+            if existing_plan:
+                id_key = object_id
+        except Exception:
             pass
-    
-    print(f"Found plan: {existing_plan}")
-    
+
     if not existing_plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-        
+
     if existing_plan["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -371,14 +389,14 @@ async def update_annual_plan_by_id(
     update_data = {}
     if "title" in plan_update:
         update_data["title"] = plan_update["title"]
-    update_data["updated_at"] = datetime.now()
-    
+    update_data["updated_at"] = datetime.now(timezone.utc)
+
     await annual_plans_collection.update_one(
-        {"_id": id},  # Use string ID
+        {"_id": id_key},
         {"$set": update_data}
     )
-    
-    return await annual_plans_collection.find_one({"_id": id})
+
+    return await annual_plans_collection.find_one({"_id": id_key})
 
 
 @router.delete("/{id}", response_model=MessageResponse)
@@ -528,20 +546,20 @@ async def close_quarter(
         if goal_id and new_quarter and new_target_date:
             try:
                 obj_id = ObjectId(goal_id)
-            except:
+            except Exception:
                 obj_id = goal_id
-            
+
             # parse date string if it's string format (from frontend)
             dt = new_target_date
             if isinstance(dt, str):
                 dt = dt.replace('Z', '+00:00')
                 dt = datetime.fromisoformat(dt)
-            
+
             update_payload = {
                 "$set": {
                     "quarter": new_quarter,
                     "target_date": dt,
-                    "updated_at": datetime.now()
+                    "updated_at": datetime.now(timezone.utc)
                 },
                 "$inc": {"migration_count": 1}
             }
@@ -675,14 +693,14 @@ async def update_focus_area(
     result = await focus_areas_collection.update_one(
         {"_id": obj_id},
         {"$set": {
-            "name": focus_area.name, 
+            "name": focus_area.name,
             "description": focus_area.description,
             "color": focus_area.color,
             "icon": focus_area.icon,
-            "updated_at": datetime.now()
+            "updated_at": datetime.now(timezone.utc)
         }}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Focus Area not found")
         
@@ -749,6 +767,21 @@ async def delete_focus_area(
 
 # --- Priorities ---
 
+def _priorities_sort_pipeline(match_filter: dict, limit: int) -> list:
+    """D-03 compound sort — is_active DESC groups active before inactive within
+    non-completed. Uses an aggregation $ifNull instead of a plain .find().sort()
+    so priority documents that predate Phase 24 (missing is_active entirely,
+    which BSON sorts as null — behind explicit false) are treated as active,
+    matching the Pydantic `is_active: bool = True` response default (WR-02 fix).
+    """
+    return [
+        {"$match": match_filter},
+        {"$addFields": {"_is_active_sort": {"$ifNull": ["$is_active", True]}}},
+        {"$sort": {"is_completed": 1, "_is_active_sort": -1, "order": 1, "created_at": 1}},
+        {"$project": {"_is_active_sort": 0}},
+        {"$limit": limit},
+    ]
+
 @router.get("/priorities", response_model=List[Priority])
 async def get_priorities(
     annual_plan_id: str,
@@ -756,7 +789,9 @@ async def get_priorities(
 ):
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(annual_plan_id, user_id)
-    priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id, "deleted_at": None}).sort([("is_completed", 1), ("order", 1), ("created_at", 1)]).to_list(length=50)
+    priorities = await priorities_collection.aggregate(
+        _priorities_sort_pipeline({"annual_plan_id": annual_plan_id, "deleted_at": None}, 50)
+    ).to_list(length=50)
     return priorities
 
 @router.post("/priorities", response_model=Priority)
@@ -779,27 +814,22 @@ async def update_priority(
     await verify_priority_ownership(id, user_id)
     try:
         obj_id = ObjectId(id)
-    except Exception as e:
-        print(f"[DEBUG] Invalid ObjectId format: {id}, error: {e}")
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID format")
 
-    # Debug: Check if priority exists
+    # Check if priority exists
     existing = await priorities_collection.find_one({"_id": obj_id})
     if not existing:
-        print(f"[DEBUG] Priority not found with ObjectId: {obj_id}")
         # Try finding with string ID
         existing = await priorities_collection.find_one({"_id": id})
         if not existing:
-            print(f"[DEBUG] Priority not found with string ID either: {id}")
             raise HTTPException(status_code=404, detail=f"Priority not found: {id}")
         # Use string ID for update
         obj_id = id
 
-    print(f"[DEBUG] Found priority: {existing.get('title')} with ID: {obj_id}")
-
     # Build update dict with only provided fields
-    update_data = {"updated_at": datetime.now()}
-    
+    update_data = {"updated_at": datetime.now(timezone.utc)}
+
     if "title" in priority_update:
         update_data["title"] = priority_update["title"]
     if "description" in priority_update:
@@ -808,28 +838,38 @@ async def update_priority(
         update_data["deadline"] = priority_update["deadline"]
     if "is_completed" in priority_update:
         update_data["is_completed"] = priority_update["is_completed"]
-        update_data["completed_at"] = datetime.now() if priority_update["is_completed"] else None
+        update_data["completed_at"] = datetime.now(timezone.utc) if priority_update["is_completed"] else None
+    if "is_active" in priority_update:
+        # No completed_at-style timestamp needed — is_active is a manual "not right now"
+        # toggle (D-04), not a completion event. Reject non-boolean values outright
+        # instead of coercing (bool("false") == True would silently invert intent — T-24-01/WR-01).
+        raw_is_active = priority_update["is_active"]
+        if not isinstance(raw_is_active, bool):
+            raise HTTPException(status_code=400, detail="is_active must be a boolean")
+        update_data["is_active"] = raw_is_active
     if "linked_entity_id" in priority_update:
         update_data["linked_entity_id"] = priority_update["linked_entity_id"]
     if "linked_entity_type" in priority_update:
         update_data["linked_entity_type"] = priority_update["linked_entity_type"]
     if "annual_plan_id" in priority_update:
+        # Reparenting to a new plan requires proving the caller owns the *target*
+        # plan too — verify_priority_ownership above only confirmed the *current*
+        # parent (CR-02: otherwise a user could move their priority into any
+        # other user's annual_plan_id).
+        await verify_annual_plan_ownership(priority_update["annual_plan_id"], user_id)
         update_data["annual_plan_id"] = priority_update["annual_plan_id"]
     if "focus_area_id" in priority_update:
+        await verify_focus_area_ownership(priority_update["focus_area_id"], user_id)
         update_data["focus_area_id"] = priority_update["focus_area_id"]
-
-    print(f"[DEBUG] Updating priority with data: {update_data}")
 
     result = await priorities_collection.update_one(
         {"_id": obj_id},
         {"$set": update_data}
     )
-    
+
     if result.matched_count == 0:
-        print(f"[DEBUG] Update matched 0 documents for ID: {obj_id}")
         raise HTTPException(status_code=404, detail="Priority not found")
 
-    print(f"[DEBUG] Successfully updated priority")
     return await priorities_collection.find_one({"_id": obj_id})
 
 @router.delete("/priorities/{id}", response_model=MessageResponse)
@@ -887,6 +927,11 @@ async def reorder_priorities(
     if len(payload.priority_ids) > 50:
         raise HTTPException(status_code=422, detail="priority_ids must contain at most 50 items")
 
+    # Guard: duplicate IDs would clobber `order` redundantly and can mask a
+    # client-side bug producing the ordered list (IN-03)
+    if len(set(payload.priority_ids)) != len(payload.priority_ids):
+        raise HTTPException(status_code=422, detail="priority_ids must not contain duplicates")
+
     # Auth + plan ownership (D-12)
     await verify_annual_plan_ownership(payload.annual_plan_id, user_id)
 
@@ -905,24 +950,23 @@ async def reorder_priorities(
         "annual_plan_id": payload.annual_plan_id,
         "deleted_at": None,
     })
-    if valid_count != len(payload.priority_ids):
+    if valid_count < len(payload.priority_ids):
         raise HTTPException(
             status_code=422,
             detail="One or more priority IDs do not belong to this plan",
         )
 
     # Sequential update_one loop — all-or-nothing validation already passed (D-10)
-    # Use datetime.now() (naive) to match the existing update_priority pattern (line 801)
     for index, (pid, obj_id) in enumerate(zip(payload.priority_ids, obj_ids)):
         result = await priorities_collection.update_one(
             {"_id": obj_id},
-            {"$set": {"order": index, "updated_at": datetime.now()}},
+            {"$set": {"order": index, "updated_at": datetime.now(timezone.utc)}},
         )
         if result.matched_count == 0:
             # Fallback: document has string _id (legacy doc)
             await priorities_collection.update_one(
                 {"_id": pid},
-                {"$set": {"order": index, "updated_at": datetime.now()}},
+                {"$set": {"order": index, "updated_at": datetime.now(timezone.utc)}},
             )
 
     return {"ok": True}
@@ -932,18 +976,14 @@ async def reorder_priorities(
 
 @router.get("/goals", response_model=List[Goal])
 async def get_goals(
-    focus_area_id: Optional[str] = None,
+    focus_area_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
-    query = {}
-    if focus_area_id:
-        await verify_focus_area_ownership(focus_area_id, user_id)
-        query["focus_area_id"] = focus_area_id
-    
-    # We filter by focus_area_id which is strictly ownership validated
-    query["deleted_at"] = None
-    goals = await goals_collection.find(query).to_list(length=100)
+    await verify_focus_area_ownership(focus_area_id, user_id)
+    goals = await goals_collection.find(
+        {"focus_area_id": focus_area_id, "deleted_at": None}
+    ).to_list(length=100)
     return goals
 
 @router.post("/goals", response_model=Goal)
@@ -964,62 +1004,59 @@ async def update_goal(
 ):
     user_id = current_user.get("user_id")
     await verify_goal_ownership(id, user_id)
-    # Try validating/converting to ObjectId
+
+    # Resolve the id to an ObjectId when possible; fall back to the raw string
+    # for legacy documents stored with a string _id. This never raises — both
+    # branches are tried against the DB below, so an invalid ObjectId string
+    # degrades to "no match" rather than crashing (Rule 3 / CR-01 fix).
     try:
         obj_id = ObjectId(id)
-        
-        # Build update dict with only provided fields
-        update_data = {"updated_at": datetime.now()}
-        
-        if "title" in goal_update:
-            update_data["title"] = goal_update["title"]
-        if "description" in goal_update:
-            update_data["description"] = goal_update["description"]
-        if "image_url" in goal_update:
-            update_data["image_url"] = goal_update["image_url"]
-        if "target_date" in goal_update:
-            update_data["target_date"] = goal_update["target_date"]
-        if "progress" in goal_update:
-            update_data["progress"] = goal_update["progress"]
-        if "status" in goal_update:
-            update_data["status"] = goal_update["status"]
-        if "milestones" in goal_update:
-            update_data["milestones"] = goal_update["milestones"]
-        if "parent_id" in goal_update:
-            update_data["parent_id"] = goal_update["parent_id"]
-        if "quarter" in goal_update:
-            update_data["quarter"] = goal_update["quarter"]
-        if "year" in goal_update:
-            update_data["year"] = goal_update["year"]
-        if "type" in goal_update:
-            update_data["type"] = goal_update["type"]
-        
-        # Try updating with ObjectId
-        result = await goals_collection.update_one(
-            {"_id": obj_id},
-            {"$set": update_data}
-        )
-        # If no match, maybe it's stored as a string?
-        if result.matched_count == 0:
-             result = await goals_collection.update_one(
-                {"_id": id},
-                {"$set": update_data}
-            )
-             if result.matched_count > 0:
-                 # It was a string ID
-                 obj_id = id
-             else:
-                 raise HTTPException(status_code=404, detail="Goal not found")
-
     except Exception:
-        # If ObjectId conversion failed completely, try as string directly
+        obj_id = id
+
+    # Build update dict with only provided fields — always constructed,
+    # regardless of which id form matched (fixes UnboundLocalError, CR-01).
+    update_data = {"updated_at": datetime.now(timezone.utc)}
+
+    if "title" in goal_update:
+        update_data["title"] = goal_update["title"]
+    if "description" in goal_update:
+        update_data["description"] = goal_update["description"]
+    if "image_url" in goal_update:
+        update_data["image_url"] = goal_update["image_url"]
+    if "target_date" in goal_update:
+        update_data["target_date"] = goal_update["target_date"]
+    if "progress" in goal_update:
+        update_data["progress"] = goal_update["progress"]
+    if "status" in goal_update:
+        update_data["status"] = goal_update["status"]
+    if "milestones" in goal_update:
+        update_data["milestones"] = goal_update["milestones"]
+    if "parent_id" in goal_update:
+        update_data["parent_id"] = goal_update["parent_id"]
+    if "quarter" in goal_update:
+        update_data["quarter"] = goal_update["quarter"]
+    if "year" in goal_update:
+        update_data["year"] = goal_update["year"]
+    if "type" in goal_update:
+        update_data["type"] = goal_update["type"]
+
+    result = await goals_collection.update_one(
+        {"_id": obj_id},
+        {"$set": update_data}
+    )
+    # If no match on the resolved id form and it was an ObjectId, retry as a
+    # legacy string _id before giving up.
+    if result.matched_count == 0 and isinstance(obj_id, ObjectId):
         result = await goals_collection.update_one(
             {"_id": id},
             {"$set": update_data}
         )
-        if result.matched_count == 0:
-             raise HTTPException(status_code=404, detail="Goal not found")
-        obj_id = id
+        if result.matched_count > 0:
+            obj_id = id
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal not found")
 
     # --- Priority cascade on status change ---
     # When a goal is completed, archive all priorities linked to it.
@@ -1027,7 +1064,7 @@ async def update_goal(
     if "status" in goal_update:
         new_status = goal_update["status"]
         goal_id_str = str(id)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         if new_status == "completed":
             priority_update = {
@@ -1102,6 +1139,8 @@ async def get_activities(
     goal_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
     activities = await activities_collection.find({"goal_id": goal_id, "deleted_at": None}).to_list(length=50)
     return activities
 
@@ -1111,6 +1150,8 @@ async def create_activity(
     activity: Activity,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
     activity.goal_id = goal_id
     result = await activities_collection.insert_one(activity.model_dump(by_alias=True))
     return await activities_collection.find_one({"_id": result.inserted_id})
@@ -1121,10 +1162,16 @@ async def update_activity(
     activity: Activity,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
     try:
         obj_id = ObjectId(id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    existing_act = await activities_collection.find_one({"_id": obj_id})
+    if not existing_act:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    await verify_goal_ownership(existing_act["goal_id"], user_id)
 
     result = await activities_collection.update_one(
         {"_id": obj_id},
@@ -1134,10 +1181,10 @@ async def update_activity(
             "days_of_week": activity.days_of_week,
             "time_of_day": activity.time_of_day,
             "is_active": activity.is_active,
-            "updated_at": datetime.now()
+            "updated_at": datetime.now(timezone.utc)
         }}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Activity not found")
 

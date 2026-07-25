@@ -6,7 +6,7 @@ from typing import Optional, List
 from datetime import datetime, timezone
 
 class Milestone(BaseModel):
-    id: Optional[str] = None  # assigned on creation via str(ObjectId())
+    id: str = Field(default_factory=lambda: str(ObjectId()))
     title: str
     due_date: Optional[str] = None
     completed: bool = False
