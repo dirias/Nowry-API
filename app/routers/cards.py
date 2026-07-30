@@ -3,7 +3,12 @@
 import asyncio
 import json
 import random
+import time
+from typing import AsyncGenerator
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from pymongo.collection import Collection
 from app.ai_orchestrator.llm_clients.gemini_client import (
     GeminiQuotaError,
@@ -14,11 +19,21 @@ from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
 from app.core import prompt_manager
 from app.models.StudyCard import StudyCard
-from app.models.CardGenerationRequest import CardGenerationRequest
+from app.models.CardGenerationRequest import (
+    CardGenerationRequest,
+    compute_effective_cap,
+)
 from app.models.book_generation import (
     GenerateFromBookRequest,
     GenerateFromBookResponse,
     GeneratedCard,
+)
+from app.models.card_stream import (
+    SSE_HEARTBEAT,
+    CardEventData,
+    DoneEventData,
+    ErrorEventData,
+    sse_event,
 )
 from app.models.deck_analysis import (
     DeckAnalysisRequest,
@@ -45,6 +60,11 @@ logger_cards = get_logger(__name__)
 
 MAX_BOOK_TEXT_CHARS: int = 50_000
 
+# SSE streaming tuning (POST /card/generate/stream)
+STREAM_HEARTBEAT_INTERVAL_S: float = 15.0
+STREAM_TIMEOUT_S: float = 120.0
+STREAM_CARD_PACING_S: float = 0.08
+
 
 def _extract_text_from_lexical(lexical_state: dict) -> str:
     """Recursively walk Lexical JSON state, collecting text node values."""
@@ -69,18 +89,25 @@ def get_cards_collection() -> Collection:
     return cards_collection
 
 
-@router.post("/generate", summary="Generate a new card using AI")
+@router.post(
+    "/generate",
+    summary="Generate a new card using AI",
+    response_model=list[GeneratedCard],
+)
 async def generate_card(
     payload: CardGenerationRequest,
     current_user: dict = Depends(track_ai_usage),
-) -> dict:
+) -> list[GeneratedCard]:
     # CARD-01: Free users receive full card generation via Groq (Llama 3.3).
     # Tier is extracted from the user doc and forwarded to the orchestrator,
     # which routes to Groq for 'free' or Gemini for 'plus'/'pro'.
     # No caps or quotas are applied per D-01 (CONTEXT.md).
     # TODO: AI usage limit enforcement is pending (Phase 4 deferred — WR-01)
     tier: str = current_user.get("subscription", {}).get("tier", "free")
-    logger.info(f"[cards] tier={tier}")
+    # None sampleNumber => adaptive mode: deterministic content-derived cap.
+    effective_cap: int = compute_effective_cap(payload.sampleText, payload.sampleNumber)
+    adaptive: bool = payload.sampleNumber is None
+    logger.info(f"[cards] tier={tier} adaptive={adaptive} cap={effective_cap}")
     try:
         logger.info(f"Received generation request: {payload}")
         result = orchestrator.invoke(
@@ -88,18 +115,187 @@ async def generate_card(
             {
                 "prompt": payload.prompt,
                 "sampleText": payload.sampleText,
-                "sampleNumber": payload.sampleNumber,
+                "sampleNumber": effective_cap,
+                "adaptive": adaptive,
+                "excludeTitles": payload.excludeTitles,
                 "tier": tier,
             },
         )
         logger.info("Card generation completed successfully.")
-        return result["generated_cards"]
+        cards: list[GeneratedCard] = [
+            GeneratedCard.model_validate(card) for card in result["generated_cards"]
+        ]
+        if len(cards) > effective_cap:
+            logger.warning(
+                f"[cards] Model returned {len(cards)} cards — clipping to "
+                f"cap {effective_cap}"
+            )
+            cards = cards[:effective_cap]
+        return cards
     except HTTPException as http_err:
         logger.error(f"Generation failed with HTTP error: {http_err.detail}")
         raise http_err
     except Exception as ex:
         logger.exception(f"Unexpected error during card generation: {ex}")
         raise HTTPException(status_code=500, detail=str(ex))
+
+
+@router.post(
+    "/generate/stream",
+    summary="Generate cards using AI, streamed as Server-Sent Events",
+)
+async def generate_card_stream(
+    payload: CardGenerationRequest,
+    current_user: dict = Depends(track_ai_usage),
+) -> StreamingResponse:
+    # NOTE: the RAG pipeline is atomic — one non-streaming LLM call in
+    # text_node.py. Cards are emitted sequentially AFTER pipeline completion.
+    # The SSE contract is the permanent transport; when the Gemini client
+    # gains token streaming plus incremental JSON-array parsing, only steps
+    # 2–5 of this generator change — the wire contract and the frontend do not.
+    #
+    # Auth: the router-level Depends(get_firebase_user) plus track_ai_usage
+    # resolve BEFORE this handler returns a StreamingResponse, so auth
+    # failures surface as plain HTTP 401/403 with no SSE bytes.
+    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    # None sampleNumber => adaptive mode: deterministic content-derived cap,
+    # computed here BEFORE the orchestrator is invoked.
+    effective_cap: int = compute_effective_cap(payload.sampleText, payload.sampleNumber)
+    adaptive: bool = payload.sampleNumber is None
+    logger.info(
+        f"[generate_card_stream] tier={tier} adaptive={adaptive} cap={effective_cap}"
+    )
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        start: float = time.monotonic()
+        task: "asyncio.Task[dict]" = asyncio.create_task(
+            asyncio.to_thread(
+                orchestrator.invoke,
+                "rag",
+                {
+                    "prompt": payload.prompt,
+                    "sampleText": payload.sampleText,
+                    "sampleNumber": effective_cap,
+                    "adaptive": adaptive,
+                    "excludeTitles": payload.excludeTitles,
+                    "tier": tier,
+                },
+            )
+        )
+        try:
+            # Heartbeat loop — keeps the connection alive while the blocking
+            # pipeline runs off the event loop in a worker thread.
+            while not task.done():
+                done, _ = await asyncio.wait(
+                    {task}, timeout=STREAM_HEARTBEAT_INTERVAL_S
+                )
+                if done:
+                    break
+                if time.monotonic() - start > STREAM_TIMEOUT_S:
+                    # The pipeline thread cannot be cancelled — known,
+                    # accepted limitation: let it finish detached.
+                    logger.warning(
+                        "[generate_card_stream] Generation exceeded "
+                        f"{STREAM_TIMEOUT_S:.0f}s — abandoning pipeline "
+                        "thread (it will finish detached)."
+                    )
+                    yield sse_event(
+                        "error",
+                        ErrorEventData(
+                            code="STREAM_TIMEOUT",
+                            message="Generation exceeded 120s",
+                        ),
+                    )
+                    return
+                yield SSE_HEARTBEAT
+
+            try:
+                result: dict = task.result()
+            except GeminiQuotaError:
+                logger.exception("[generate_card_stream] AI quota exhausted")
+                yield sse_event(
+                    "error",
+                    ErrorEventData(
+                        code="AI_QUOTA_EXHAUSTED",
+                        message="AI quota exhausted. Please try again later.",
+                    ),
+                )
+                return
+            except Exception:
+                logger.exception("[generate_card_stream] AI pipeline failed")
+                yield sse_event(
+                    "error",
+                    ErrorEventData(
+                        code="AI_PIPELINE_FAILED",
+                        message="AI pipeline failed. Please try again.",
+                    ),
+                )
+                return
+
+            if result.get("parse_error"):
+                logger.error(
+                    "[generate_card_stream] LLM returned malformed output"
+                )
+                yield sse_event(
+                    "error",
+                    ErrorEventData(
+                        code="AI_MALFORMED_OUTPUT",
+                        message="AI returned unexpected format. Please try again.",
+                    ),
+                )
+                return
+
+            raw_cards: list = result.get("generated_cards") or []
+            valid_cards: list[GeneratedCard] = []
+            for raw_index, raw_card in enumerate(raw_cards):
+                try:
+                    valid_cards.append(GeneratedCard.model_validate(raw_card))
+                except ValidationError as exc:
+                    logger.warning(
+                        f"[generate_card_stream] Dropping invalid card at "
+                        f"index {raw_index}: {exc}"
+                    )
+
+            truncated: bool = len(valid_cards) > effective_cap
+            if truncated:
+                logger.warning(
+                    f"[generate_card_stream] Model returned {len(valid_cards)} "
+                    f"cards — clipping to cap {effective_cap}"
+                )
+                valid_cards = valid_cards[:effective_cap]
+
+            total: int = len(valid_cards)
+            for index, card in enumerate(valid_cards):
+                yield sse_event(
+                    "card", CardEventData(index=index, total=total, card=card)
+                )
+                if index < total - 1:
+                    # Progressive-render pacing for the frontend.
+                    await asyncio.sleep(STREAM_CARD_PACING_S)
+
+            elapsed_ms: int = int((time.monotonic() - start) * 1000)
+            yield sse_event(
+                "done",
+                DoneEventData(
+                    total_cards=total,
+                    elapsed_ms=elapsed_ms,
+                    mode="auto" if adaptive else "fixed",
+                    cap=effective_cap,
+                    truncated=truncated,
+                ),
+            )
+            return
+        except asyncio.CancelledError:
+            logger.info(
+                "[generate_card_stream] Client disconnected — stream cancelled"
+            )
+            raise
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/create", summary="Create a new card", response_model=StudyCard)

@@ -1,8 +1,13 @@
 # Centralized prompt templates for the application
 
 # RAG / Card Generation
+# {card_count_instruction} is built per-request by the rag text_node:
+#   fixed mode    -> "Generate exactly N cards."
+#   adaptive mode -> "Generate the number of cards this content warrants, ..."
+# with an optional exclusion sentence appended when excludeTitles is non-empty.
 RAG_CARD_GENERATION_TEMPLATE = (
-    "{prompt}\n\nContext:\n{sample_text}\n\nCreate UP TO {sample_number} study card samples as JSON."
+    "{prompt}\n\nContext:\n{sample_text}\n\n{card_count_instruction} "
+    "Return the study cards as a JSON array."
 )
 
 # Quiz Generation

@@ -46,7 +46,13 @@ def test_get_prompt_fallback(monkeypatch):
     importlib.reload(pm)
     with patch("app.core.prompt_manager._prompt_cache", {}):
         with patch("app.core.langfuse_client.get_langfuse_client", return_value=None):
-            result = pm.get_prompt("nowry-cards-magic", prompt="q", sample_text="s", sample_number=3)
+            result = pm.get_prompt(
+                "nowry-cards-magic",
+                prompt="q",
+                sample_text="s",
+                sample_number=3,
+                card_count_instruction="Generate exactly 3 cards.",
+            )
     assert "q" in result or len(result) > 0  # fallback string returned, not empty
 
 

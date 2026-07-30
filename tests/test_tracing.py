@@ -1212,7 +1212,8 @@ def test_text_node_format_valid_true_on_json_success():
 
 def test_text_node_format_valid_false_on_json_error():
     """text_node: malformed JSON -> format-valid=False with non-None comment,
-    unchanged {'generated_cards': []} soft-failure return."""
+    soft-failure return of {'generated_cards': []} plus the parse_error flag
+    consumed by POST /card/generate/stream (ignored by the sync route)."""
     from app.ai_orchestrator.rag import text_node as text_node_module
 
     state = {
@@ -1227,7 +1228,7 @@ def test_text_node_format_valid_false_on_json_error():
     with patch.object(text_node_module, "score_trace") as mock_score:
         result = text_node_module.text_node(state)
 
-    assert result == {"generated_cards": []}
+    assert result == {"generated_cards": [], "parse_error": True}
     mock_score.assert_called_once()
     _, score_kwargs = mock_score.call_args
     assert score_kwargs["name"] == "format-valid"
