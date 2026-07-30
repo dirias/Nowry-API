@@ -3,8 +3,11 @@ Firebase Authentication Module
 Handles Firebase token validation and user authentication with caching
 """
 
+from __future__ import annotations
+
 from fastapi import HTTPException, Header, Request, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pymongo.errors import DuplicateKeyError
 from app.config.firebase_config import verify_firebase_token
 from app.config.subscription_plans import SubscriptionTier
 from functools import lru_cache
@@ -200,8 +203,48 @@ async def get_firebase_user(request: Request) -> dict:
                 "created_at": now,
                 "updated_at": now,
             }
-            result = await users_collection.insert_one(new_user_doc)
-            token_data["user_id"] = str(result.inserted_id)
+            try:
+                result = await users_collection.insert_one(new_user_doc)
+                token_data["user_id"] = str(result.inserted_id)
+            except DuplicateKeyError:
+                # A unique index (firebase_uid/email/username) collided with an
+                # already-existing active user document. This happens when:
+                #   - two concurrent first-login requests race the insert, or
+                #   - the token's uid/email no longer matches the stored doc
+                #     (e.g. re-auth issued a new uid for the same email).
+                # Recover instead of 500ing: re-fetch the real existing doc by
+                # email (most reliable unique key here) and sync firebase_uid
+                # onto it so this and future logins resolve correctly.
+                existing = await users_collection.find_one({"email": email}) if email else None
+                if not existing:
+                    existing = await users_collection.find_one(
+                        {"firebase_uid": token_data["firebase_uid"]}
+                    )
+                if existing:
+                    if existing.get("firebase_uid") != token_data["firebase_uid"]:
+                        await users_collection.update_one(
+                            {"_id": existing["_id"]},
+                            {
+                                "$set": {
+                                    "firebase_uid": token_data["firebase_uid"],
+                                    "updated_at": now,
+                                }
+                            },
+                        )
+                    token_data["user_id"] = str(existing["_id"])
+                else:
+                    # No matching doc by email/uid — this was a genuine
+                    # username collision between two different accounts that
+                    # happen to share a display name. Disambiguate and retry
+                    # once rather than 500ing on a brand-new sign-up.
+                    new_user_doc["username"] = f"{username}-{token_data['firebase_uid'][:6]}"
+                    try:
+                        result = await users_collection.insert_one(new_user_doc)
+                        token_data["user_id"] = str(result.inserted_id)
+                    except DuplicateKeyError:
+                        # Still colliding (e.g. firebase_uid/email race resolved
+                        # elsewhere in the meantime) — surface the failure.
+                        raise
 
         # uid is an alias for firebase_uid (Firebase authentication identifier only)
         # NEVER use uid for MongoDB storage — always use user_id (MongoDB ObjectId string)
@@ -214,6 +257,11 @@ async def get_firebase_user(request: Request) -> dict:
     except HTTPException:
         raise
     except Exception as e:
+        # Log the full traceback server-side — the client only ever sees the
+        # generic detail string below, but without this, an unhandled error
+        # here is invisible in the access logs (no traceback is ever printed
+        # for a deliberately-raised HTTPException).
+        logger.exception("get_firebase_user: failed to resolve user profile")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to resolve user profile: {str(e)}"

@@ -102,7 +102,7 @@ async def get_news(language: str = "en", category: str = "general", user: dict =
         # Cache key includes feed URL hash to auto-invalidate when feeds change
         import hashlib
 
-        url_hash = hashlib.md5(feed_url.encode()).hexdigest()[:8]
+        url_hash = hashlib.md5(feed_url.encode(), usedforsecurity=False).hexdigest()[:8]
         cache_key = f"{language}_{category}_{url_hash}"
 
         # Check cache
@@ -175,7 +175,7 @@ async def get_news(language: str = "en", category: str = "general", user: dict =
                 # Add entry index for variety within same category
                 import hashlib
 
-                url_hash = hashlib.md5(entry.link.encode()).hexdigest()
+                url_hash = hashlib.md5(entry.link.encode(), usedforsecurity=False).hexdigest()
                 unique_id = seed + int(url_hash[:4], 16) % 100
                 # Picsum.photos provides reliable random images
                 image_url = f"https://picsum.photos/seed/{unique_id}/800/450"

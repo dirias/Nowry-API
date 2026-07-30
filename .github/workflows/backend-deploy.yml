@@ -1,7 +1,10 @@
 # Backend Deploy — Nowry FastAPI
 #
-# Triggers on push to main. Runs validation (pip install, lint, type check) before
-# Railway's GitHub integration automatically deploys to production.
+# Triggers on push to main AND on pull requests targeting main, so the security
+# gate below (bandit + pip-audit + the phase-32 regression-guard test suite)
+# surfaces findings BEFORE merge, not just after. Runs validation (pip install,
+# lint, type check) before Railway's GitHub integration automatically deploys
+# to production on push to main.
 #
 # Required GitHub Secrets (Settings → Secrets and Variables → Actions):
 #   RAILWAY_TOKEN  — Railway API token (only needed if NOT using Railway GitHub integration)
@@ -14,11 +17,26 @@
 # Deployment note: If Railway GitHub integration is configured (recommended),
 # Railway auto-deploys when code is pushed to main — no additional step needed.
 # If not configured, uncomment the deploy job below and set RAILWAY_TOKEN secret.
+#
+# IMPORTANT — this job's pass/fail status does NOT by itself block Railway's
+# deploy (Railway's GitHub integration deploys independently of this Actions
+# workflow's outcome unless configured otherwise). For bandit/pip-audit/tests
+# failing here to actually stop a bad deploy, one of the following must be
+# configured OUTSIDE this file (neither is set up as of Phase 32):
+#   (a) GitHub branch protection on `main` — require this workflow ("Validate
+#       & Lint") as a required status check before merge, and/or
+#   (b) Railway dashboard → enable "wait for CI" / require this check before
+#       auto-deploying.
+# Until (a) or (b) is configured, a red check here is a strong, PR-visible
+# signal but not a hard deployment block.
 
 name: Backend Deploy
 
 on:
   push:
+    branches:
+      - main
+  pull_request:
     branches:
       - main
 
@@ -39,6 +57,36 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Security — static analysis (bandit)
+        run: |
+          pip install bandit==1.8.6
+          bandit -r app/ --severity-level high --confidence-level high
+
+      - name: Security — dependency audit (pip-audit)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pip install pip-audit==2.9.0
+          pip-audit -r requirements.lock -f json -o pip-audit-report.json || true
+          python scripts/check_pip_audit_severity.py pip-audit-report.json
+
+      - name: Security regression guards (Phase 32 — SEC-01/SEC-02/SEC-03)
+        run: |
+          pip install pytest==8.4.2 pytest-asyncio==1.2.0
+          pytest tests/test_dependencies.py tests/test_bounded_queries.py tests/test_check_pip_audit_severity.py tests/test_study_cards_review_mode.py -v
+        # Scoped to exactly the regression-guard tests added by Phase 32
+        # (IDOR/ownership, bounded-query, mode-guard, pip-audit severity
+        # classifier) — NOT the full `tests/` suite. The full suite has
+        # pre-existing, unrelated failures (AI-feature tests needing real
+        # API keys, a pre-existing test_deck_fixes.py collection error) that
+        # predate this phase and would make a blocking `pytest tests/` step
+        # red from day one, defeating the point of a gate (see 32-REVIEW.md
+        # CR-03). These four files pass reliably as a scoped set — verified
+        # locally under a fresh Python 3.11 venv mirroring this job's setup.
+        # No continue-on-error: unlike lint/mypy, these are the security
+        # guards this phase exists to add — a failure here is exactly what
+        # this step is supposed to catch.
 
       - name: Lint (flake8 — critical errors only)
         run: |

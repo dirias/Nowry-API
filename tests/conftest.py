@@ -219,3 +219,41 @@ def mock_blackboards_collection(mock_blackboard_doc):
     mock_cursor.to_list = AsyncMock(return_value=[mock_blackboard_doc])
     collection.find = MagicMock(return_value=mock_cursor)
     return collection
+
+
+# --------------------------------------------------------------------------- #
+# Phase 31 — cards / study_cards Motor mock fixtures (session_summary + D-08)
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def mock_cards_collection():
+    """Mock Motor `cards_collection` (agent.py / study_cards.py call sites).
+
+    These call sites use `.find_one(...)` (single-doc lookups, e.g. the
+    most-missed-card fetch in `_fetch_intervention_context`) and
+    `.find(...).to_list(length=...)` (bounded multi-doc queries, e.g. the
+    struggle-cards query in study_cards.py). count_documents defaults to 0.
+    """
+    collection = MagicMock()
+    collection.find_one = AsyncMock(return_value=None)
+    collection.count_documents = AsyncMock(return_value=0)
+    mock_cursor = MagicMock()
+    mock_cursor.to_list = AsyncMock(return_value=[])
+    collection.find = MagicMock(return_value=mock_cursor)
+    return collection
+
+
+@pytest.fixture
+def mock_study_cards_collection():
+    """Mock Motor `study_cards_collection` (users.py call sites).
+
+    users.py's get_user_stats iterates the `.find(...)` cursor directly via
+    `async for card in cursor` (NOT `.to_list()`), so the cursor mock here
+    must support `__aiter__` rather than `to_list`.
+    """
+    collection = MagicMock()
+    collection.count_documents = AsyncMock(return_value=0)
+    mock_cursor = MagicMock()
+    mock_cursor.__aiter__.return_value = iter([])
+    collection.find = MagicMock(return_value=mock_cursor)
+    return collection

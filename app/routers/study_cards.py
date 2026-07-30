@@ -5,7 +5,7 @@ from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.StudyCard import StudyCard
 from app.models.deck_config import resolve_deck_budget
-from app.config.database import cards_collection, decks_collection
+from app.config.database import cards_collection, decks_collection, books_collection
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
 
@@ -248,22 +248,48 @@ async def get_statistics(
         user_id = current_user.get("user_id")
         logger.info(f"Fetching statistics for user {user_id}")
 
-        # Only fetch reviewed cards needed for streak, weekly progress, and recent performance.
-        # Bounded to last 90 days to avoid loading the full card corpus into memory.
+        # Weekly progress + streak are computed server-side via an aggregation
+        # instead of pulling up to 2000 raw card docs into a Python loop
+        # (PERF-01 / D-01 finding #1). $match is copied VERBATIM from the
+        # replaced .find() filter (user_id, deleted_at, last_reviewed) as the
+        # pipeline's FIRST stage — the sole BOLA enforcement point for this
+        # aggregation (T-33-01). $group buckets by (day, type) so weekly
+        # buckets and the streak can both be derived from pre-grouped counts.
+        # No `timezone` param on $dateToString — the Motor client stores
+        # naive-UTC datetimes (no tz_aware), so the default UTC formatting
+        # matches the day boundaries already used throughout this file
+        # (A2 spot-check: a review at 2026-07-30T00:00:00 UTC groups into
+        # "2026-07-30", the same calendar day datetime.now(utc).replace(tzinfo=None)
+        # would bucket it into).
         from datetime import datetime, timedelta, timezone
 
         ninety_days_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
-        all_cards = await collection.find(
-            {
+        weekly_pipeline = [
+            {"$match": {
                 "user_id": user_id,
                 "deleted_at": None,
                 "last_reviewed": {"$gte": ninety_days_ago},
-            }
-        ).to_list(length=2000)
+            }},
+            {"$group": {
+                "_id": {
+                    "day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed"}},
+                    "type": {"$ifNull": ["$card_type", "flashcard"]},
+                },
+                "count": {"$sum": 1},
+            }},
+        ]
+        # Bounded: 90 days * at most 3 card types per day.
+        grouped_counts = await collection.aggregate(weekly_pipeline).to_list(length=700)
 
-        # Get books collection for book stats
-        from app.config.database import books_collection
+        day_type_totals: dict = {}
+        for row in grouped_counts:
+            day = row["_id"]["day"]
+            card_type = row["_id"]["type"]
+            day_type_totals.setdefault(day, {})[card_type] = row.get("count", 0)
 
+        # books_collection is a per-user own-book fetch (bounded, cheap at
+        # current scale) — left unchanged, only hoisted to a module-level
+        # import so it is patchable in tests.
         all_books = await books_collection.find({"user_id": user_id, "deleted_at": None}).to_list(length=500)
 
         # Calculate weekly progress (last 7 days) - separated by type
@@ -273,31 +299,12 @@ async def get_statistics(
         for i in range(6, -1, -1):  # Last 7 days (6 days ago to today)
             day_start = today - timedelta(days=i)
             day_end = day_start + timedelta(days=1)
+            date_str = day_start.strftime("%Y-%m-%d")
+            type_counts = day_type_totals.get(date_str, {})
 
-            # Count by card type
-            flashcards_count = sum(
-                1
-                for card in all_cards
-                if card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") in [None, "flashcard"]
-            )
-
-            quizzes_count = sum(
-                1
-                for card in all_cards
-                if card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") == "quiz"
-            )
-
-            visual_count = sum(
-                1
-                for card in all_cards
-                if card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") == "visual"
-            )
+            flashcards_count = type_counts.get("flashcard", 0)
+            quizzes_count = type_counts.get("quiz", 0)
+            visual_count = type_counts.get("visual", 0)
 
             # Count books accessed/updated on this day
             books_count = sum(
@@ -311,7 +318,7 @@ async def get_statistics(
             weekly_data.append(
                 {
                     "day": day_start.strftime("%A")[:3],  # Mon, Tue, etc.
-                    "date": day_start.strftime("%Y-%m-%d"),
+                    "date": date_str,
                     "cards": total_count,  # Keep for backwards compatibility
                     "flashcards": flashcards_count,
                     "quizzes": quizzes_count,
@@ -320,14 +327,20 @@ async def get_statistics(
                 }
             )
 
-        # Get recent performance (last 10 reviews) - include type
-        reviewed_cards = [card for card in all_cards if card.get("last_reviewed")]
-        reviewed_cards.sort(
-            key=lambda x: x.get("last_reviewed", datetime.min), reverse=True
-        )
+        # Recent performance stays its OWN small bounded query (needs record
+        # fields the grouped counts don't carry: title/ease_factor/type) —
+        # not folded into the $group above (RESEARCH.md recommends against
+        # over-engineering a single giant $facet).
+        recent_cards = await collection.find(
+            {
+                "user_id": user_id,
+                "deleted_at": None,
+                "last_reviewed": {"$ne": None},
+            }
+        ).sort("last_reviewed", -1).limit(10).to_list(length=10)
 
         recent_performance = []
-        for card in reviewed_cards[:10]:
+        for card in recent_cards:
             # Calculate performance score based on ease_factor
             ease = card.get("ease_factor", 2.5)
             score = min(10, max(1, int((ease - 1.3) / (2.5 - 1.3) * 10)))
@@ -393,18 +406,16 @@ async def get_statistics(
             ]
         })
 
-        # Current streak (days with at least 1 review)
+        # Current streak (consecutive days ending today with >=1 review),
+        # derived from the same grouped day/type counts computed above
+        # instead of re-scanning raw docs. Naturally bounded to the same
+        # 90-day window as the aggregation's $match (last_reviewed >=
+        # ninety_days_ago), matching the prior Python-loop's implicit cap.
+        reviewed_days = set(day_type_totals.keys())
         streak = 0
         check_date = today
         while True:
-            day_start = check_date
-            day_end = check_date + timedelta(days=1)
-            reviewed_today = any(
-                card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                for card in all_cards
-            )
-            if reviewed_today:
+            if check_date.strftime("%Y-%m-%d") in reviewed_days:
                 streak += 1
                 check_date -= timedelta(days=1)
             else:
@@ -458,6 +469,11 @@ async def get_card_tags(
 
     # Mirror the same active-deck filter used in list_study_cards so tag counts
     # match the number of cards actually returned when a tag is selected.
+    # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
+    # doc per deck), not a per-deck card fan-out; a single user's deck count
+    # stays far below 500 at this app's current scale. Retained as-is, not
+    # lowered — truncating would silently drop a legitimate power user's own
+    # decks (D-01 finding #2).
     active_decks = await decks_collection.find(
         {"user_id": user_id, "deleted_at": None}, {"_id": 1}
     ).to_list(length=500)
@@ -502,6 +518,11 @@ async def get_daily_review_cards(
     now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
+    # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
+    # doc per deck), not a per-deck card fan-out; a single user's deck count
+    # stays far below 500 at this app's current scale. Retained as-is, not
+    # lowered — truncating would silently drop a legitimate power user's own
+    # decks (D-01 finding #2).
     active_decks = await decks_collection.find(
         {"user_id": user_id, "deleted_at": None}
     ).to_list(length=500)
@@ -578,6 +599,11 @@ async def list_study_cards(
         query["$or"] = [{"deck_id": v} for v in deck_filter]
     else:
         # Collect active deck IDs (both ObjectId and string forms) to exclude orphans
+        # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
+        # doc per deck), not a per-deck card fan-out; a single user's deck count
+        # stays far below 500 at this app's current scale. Retained as-is, not
+        # lowered — truncating would silently drop a legitimate power user's own
+        # decks (D-01 finding #2).
         active_decks = await decks_collection.find(
             {"user_id": user_id, "deleted_at": None}, {"_id": 1}
         ).to_list(length=500)
@@ -771,6 +797,7 @@ async def delete_study_card(
 async def review_card(
     id: str,
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
+    mode: str = Query("study", pattern="^(study|browse|cram)$"),
     collection: Collection = Depends(get_cards_collection),
     card: dict = Depends(require_ownership(get_cards_collection, "id")),
     user: dict = Depends(get_firebase_user),
@@ -779,7 +806,16 @@ async def review_card(
     Review a card and update its SM-2 spaced repetition parameters.
 
     - **grade**: User's self-assessment (again, hard, good, easy)
+    - **mode**: Active session mode (study, browse, cram). Only `study`
+      (the default) may grade a card and mutate its SM-2 schedule;
+      `browse`/`cram` are rejected with 403 before any write (D-04/D-05).
     """
+    if mode != "study":
+        raise HTTPException(
+            status_code=403,
+            detail="Reviews cannot be graded in Browse or Cram mode.",
+        )
+
     try:
         from app.utils.sm2 import calculate_next_review
         from app.routers.agent import grant_xp
@@ -817,9 +853,18 @@ async def review_card(
             },
         )
 
-        # Award XP for reviewing a card (fire-and-forget)
+        # Award XP for reviewing a card — genuinely fire-and-forget: the SM-2
+        # update above already committed, so a grant_xp failure must never
+        # turn an already-persisted review into a client-facing 500 (which
+        # would cause the frontend's retry queue to resubmit and re-apply
+        # the same grade a second time — see 32-REVIEW.md CR-01).
         user_id = user.get("user_id")
-        await grant_xp(user_id, 2)
+        try:
+            await grant_xp(user_id, 2)
+        except Exception as xp_err:
+            logger.warning(
+                f"grant_xp failed for user {user_id} after review of card {id}: {xp_err}"
+            )
 
         logger.info(f"Successfully updated card {id}")
 

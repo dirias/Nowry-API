@@ -93,6 +93,7 @@ class ScreenContextPayload(BaseModel):
     front: Optional[str] = None
     back: Optional[str] = None           # None when is_flipped is False
     is_daily_review: Optional[bool] = None
+    mode: Optional[Literal['study', 'browse', 'cram']] = None
     # book fields
     book_id: Optional[str] = None
     book_title: Optional[str] = None
@@ -271,10 +272,19 @@ def _build_context_injection(
             "Answer questions about this card directly from this context — no tool calls needed for this card's content. "
         )
         if ctx.is_flipped and ctx.back:
-            tutor_hint += (
-                "The user has seen the answer. If they answer correctly or ask for more, "
-                "enrich their understanding with examples, mnemonics, and usage patterns from your knowledge."
-            )
+            if ctx.mode in ('browse', 'cram'):
+                # Read-only modes: no grading happens, so never imply the user
+                # "answered" anything — mirrors mode_note's constraint below so
+                # the two blocks never give the LLM contradictory instructions.
+                tutor_hint += (
+                    "The back of the card is visible. Enrich the user's understanding "
+                    "with examples, mnemonics, and usage patterns from your knowledge."
+                )
+            else:
+                tutor_hint += (
+                    "The user has seen the answer. If they answer correctly or ask for more, "
+                    "enrich their understanding with examples, mnemonics, and usage patterns from your knowledge."
+                )
         else:
             tutor_hint += (
                 "The answer is not yet revealed. Guide the user toward it — don't spoil it."
@@ -288,6 +298,11 @@ def _build_context_injection(
                 + ". If you need to call get_deck_content for this session, use this deck_id directly — never call it without this value."
             )
 
+        mode_note = (
+            "\nMODE NOTE: This is a read-only review — do not mention progress, "
+            "when the card comes up again, or whether the answer was right or wrong."
+        ) if ctx.mode in ('browse', 'cram') else ""
+
         return (
             f"\n\nCURRENT SCREEN CONTEXT:\n"
             f"The user is studying {position} in their {session_label}. "
@@ -297,6 +312,7 @@ def _build_context_injection(
             f"{deck_ref_block}"
             f"{hint_rule}"
             f"{tutor_hint}"
+            f"{mode_note}"
         )
 
     elif ctx.page == 'book':
@@ -1586,28 +1602,28 @@ def _build_session_summary_message(body: InterventionRequest) -> str:
     """
     Rule-based diagnostic. No praise. No exclamation points. Max 2 sentences.
     """
-    total: int = body.session_total_cards or 1
+    total: int = body.session_total_cards if body.session_total_cards is not None else 1
     wrong: int = body.session_wrong_count or 0
     missed_front: str = (body.most_missed_card_front or "").strip()
 
     if wrong == 0:
-        return f"You completed {total} cards without a wrong answer this session."
+        return f"You completed {total} cards without any needing extra practice this session."
 
     error_rate: float = wrong / total
 
     if missed_front and wrong >= 2:
         return (
-            f"{missed_front} was the most-missed concept this session. "
+            f"{missed_front} needs the most attention from this session. "
             "That card is worth revisiting before your next review."
         )
     if error_rate >= 0.4:
         return (
-            f"{wrong} of {total} cards were answered wrong. "
+            f"{wrong} of {total} cards need more practice. "
             "Review the core material for this deck before the next session."
         )
     return (
-        f"{wrong} of {total} cards were answered wrong this session. "
-        "The misses were spread across different concepts — no single bottleneck stands out."
+        f"{wrong} of {total} cards need more practice from this session. "
+        "The cards needing attention were spread across different concepts — no single bottleneck stands out."
     )
 
 
@@ -1709,13 +1725,13 @@ _INTERVENTION_PROMPT_TEMPLATES: dict[str, str] = {
     "session_summary": (
         "The learner just finished a study session.\n"
         "Total cards reviewed: {total_cards}\n"
-        "Cards answered wrong: {wrong_count}\n"
-        "Most-missed card front: {most_missed_front}\n"
-        "Most-missed card back: {most_missed_back}\n"
+        "Cards needing more practice: {needs_practice_count}\n"
+        "Card needing the most attention, front: {most_attention_front}\n"
+        "Card needing the most attention, back: {most_attention_back}\n"
         "Session duration in minutes: {duration_minutes}\n"
         "Deck name: {deck_name}\n\n"
-        "Write a 1-2 sentence diagnostic summary. If wrong_count is 0, state that cleanly. "
-        "If most_missed_front is non-empty, name it specifically. "
+        "Write a 1-2 sentence diagnostic summary. If needs_practice_count is 0, state that cleanly. "
+        "If most_attention_front is non-empty, name it specifically as the card needing attention. "
         "Do not use the word 'great' or any praise word."
     ),
     "pre_session_framing": (
@@ -1787,9 +1803,9 @@ async def _fetch_intervention_context(
 
     elif event_type == "session_summary":
         ctx["total_cards"] = body.session_total_cards or 0
-        ctx["wrong_count"] = body.session_wrong_count or 0
-        ctx["most_missed_front"] = (body.most_missed_card_front or "None").strip()
-        ctx["most_missed_back"] = "None"
+        ctx["needs_practice_count"] = body.session_wrong_count or 0
+        ctx["most_attention_front"] = (body.most_missed_card_front or "None").strip()
+        ctx["most_attention_back"] = "None"
         ctx["duration_minutes"] = body.session_duration_minutes or 0
         ctx["deck_name"] = "this deck"
         try:
@@ -1799,7 +1815,7 @@ async def _fetch_intervention_context(
                     {"back": 1, "deck_id": 1},
                 )
                 if card:
-                    ctx["most_missed_back"] = (card.get("back") or "None").strip()
+                    ctx["most_attention_back"] = (card.get("back") or "None").strip()
         except Exception:
             pass
 

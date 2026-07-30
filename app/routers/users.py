@@ -2,6 +2,7 @@
 User Profile Router
 Handles user profile management, settings, and preferences
 """
+from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -303,22 +304,19 @@ async def get_user_stats(user_id: str) -> dict:
             study_cards_collection.count_documents({"user_id": user_oid, "card_type": "visual"})
         )
 
-        # Calculate study streak efficiently (fetch last 365 days of reviews at once)
+        # Calculate study streak efficiently via a user-scoped aggregation that
+        # returns already-distinct reviewed dates (avoids streaming one
+        # document per reviewed card over an async-for cursor iteration).
         one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
-        reviewed_cards_cursor = study_cards_collection.find(
-            {
-                "user_id": user_oid,
-                "last_reviewed": {"$gt": one_year_ago}
-            },
-            {"last_reviewed": 1}
-        )
-        
+        streak_pipeline = [
+            {"$match": {"user_id": user_oid, "last_reviewed": {"$gt": one_year_ago}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed"}}}},
+        ]
+        distinct_dates = await study_cards_collection.aggregate(streak_pipeline).to_list(length=366)
+
         # Collect unique dates locally
-        reviewed_dates = set()
-        async for card in reviewed_cards_cursor:
-            if "last_reviewed" in card and card["last_reviewed"]:
-                reviewed_dates.add(card["last_reviewed"].date())
-                
+        reviewed_dates = {datetime.strptime(d["_id"], "%Y-%m-%d").date() for d in distinct_dates}
+
         # Calculate streak
         today = datetime.now(timezone.utc).date()
         streak = 0

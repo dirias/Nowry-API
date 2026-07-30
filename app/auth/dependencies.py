@@ -27,7 +27,11 @@ def require_ownership(get_collection_dependency: Callable, id_param_name: str = 
         except Exception:
             obj_id = resource_id
             
-        doc = await collection.find_one({"_id": obj_id})
+        # Exclude soft-deleted resources — every other query in this codebase
+        # (list/get/aggregate) already filters deleted_at: None; this dependency
+        # didn't, letting a user still fetch/PATCH/re-grade cards or decks they'd
+        # already soft-deleted via the DELETE endpoint (see 32-REVIEW.md WR-03).
+        doc = await collection.find_one({"_id": obj_id, "deleted_at": None})
         
         if not doc:
             raise HTTPException(status_code=404, detail="Resource not found")
@@ -124,7 +128,11 @@ def require_public_or_ownership(get_collection_dependency: Callable, id_param_na
         except Exception:
             obj_id = resource_id
             
-        doc = await collection.find_one({"_id": obj_id})
+        # Exclude soft-deleted resources — every other query in this codebase
+        # (list/get/aggregate) already filters deleted_at: None; this dependency
+        # didn't, letting a user still fetch/PATCH/re-grade cards or decks they'd
+        # already soft-deleted via the DELETE endpoint (see 32-REVIEW.md WR-03).
+        doc = await collection.find_one({"_id": obj_id, "deleted_at": None})
         
         if not doc:
             raise HTTPException(status_code=404, detail="Resource not found")
