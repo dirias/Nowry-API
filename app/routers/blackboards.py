@@ -26,6 +26,37 @@ def _serialize(doc: dict) -> dict:
     return doc
 
 
+async def _resolve_owner_names(boards) -> dict:
+    """Map owner_user_id -> display name for a batch of board documents.
+
+    One bounded `$in` query instead of an N+1 per-board lookup. Ids that are not
+    valid ObjectIds (or that no longer resolve to a user) are simply absent from
+    the returned map; callers substitute "".
+    """
+    owner_ids = {
+        board.get("owner_user_id")
+        for board in boards
+        if board.get("owner_user_id")
+    }
+    if not owner_ids:
+        return {}
+
+    object_ids = []
+    for owner_id in owner_ids:
+        try:
+            object_ids.append(ObjectId(owner_id))
+        except Exception:
+            continue
+    if not object_ids:
+        return {}
+
+    users = await db.users.find({"_id": {"$in": object_ids}}).to_list(length=100)
+    return {
+        str(user["_id"]): (user.get("username") or user.get("email") or "")
+        for user in users
+    }
+
+
 def _clean_node_text(raw: str, max_chars: int = 500) -> str:
     """Strip HTML tags and entities from node text, then cap at max_chars."""
     unescaped = html.unescape(raw)
@@ -86,19 +117,30 @@ async def create_board(
 async def list_boards(current_user: dict = Depends(get_firebase_user)):
     user_id = current_user.get("user_id")
 
-    owned = await db.blackboards.find({"owner_user_id": user_id}).to_list(length=100)
-    shared = await db.blackboards.find({"collaborators": user_id}).to_list(length=100)
+    # "deleted_at": None also matches documents where the field is absent, so
+    # boards predating the soft-delete field still list normally. Boards whose
+    # owner deleted their account are soft-deleted by the users.py cascade and
+    # therefore drop out of every collaborator's list too (no orphaned boards).
+    owned = await db.blackboards.find(
+        {"owner_user_id": user_id, "deleted_at": None}
+    ).to_list(length=100)
+    shared = await db.blackboards.find(
+        {"collaborators": user_id, "deleted_at": None}
+    ).to_list(length=100)
 
     # Merge, deduplicating by _id (owned takes precedence)
     all_boards: dict = {doc["_id"]: doc for doc in owned}
     for doc in shared:
         all_boards.setdefault(doc["_id"], doc)
 
+    owner_names = await _resolve_owner_names(all_boards.values())
+
     result = []
     for doc in all_boards.values():
         doc["is_owner"] = (doc.get("owner_user_id") == user_id) or (
             doc.get("user_id") == user_id and doc.get("owner_user_id") is None
         )
+        doc["owner_name"] = owner_names.get(doc.get("owner_user_id"), "")
         result.append(_serialize(doc))
     return result
 
@@ -112,14 +154,17 @@ async def get_blackboard(board_id: str, current_user: dict = Depends(get_firebas
     # The caller's user_id is deliberately NOT part of either Mongo filter — a
     # collaborator is not the owner, so filtering on user_id here would 404 every
     # shared board. Access is enforced by the guard below instead.
+    # "deleted_at": None keeps soft-deleted (orphaned) boards out of both steps.
     doc = None
     try:
-        doc = await db.blackboards.find_one({"_id": ObjectId(board_id)})
+        doc = await db.blackboards.find_one(
+            {"_id": ObjectId(board_id), "deleted_at": None}
+        )
     except Exception:
         pass
 
     if not doc:
-        doc = await db.blackboards.find_one({"board_id": board_id})
+        doc = await db.blackboards.find_one({"board_id": board_id, "deleted_at": None})
 
     if not doc:
         raise HTTPException(status_code=404, detail="board_not_found")

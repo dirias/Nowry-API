@@ -30,6 +30,9 @@ class Blackboard(BaseModel):
     viewport: Optional[Dict[str, float]] = {"x": 0, "y": 0, "zoom": 1}
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Soft delete (30-day retention, purged by the `soft_delete_ttl` index)
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
 
 
 class BlackboardUpdate(BaseModel):

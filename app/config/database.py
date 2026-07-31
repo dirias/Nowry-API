@@ -43,6 +43,9 @@ stripe_processed_events_collection = db["stripe_processed_events"]
 # Micro Sheets
 sheets_collection = db["sheets"]
 
+# Blackboards (Phase 7 multi-board)
+blackboards_collection = db["blackboards"]
+
 async def create_indexes():
     # User indexes
     await users_collection.create_index("firebase_uid", unique=True)
@@ -149,6 +152,7 @@ async def create_indexes():
         ("annual_plans",  annual_plans_collection),
         ("goals",         goals_collection),
         ("sheets",        sheets_collection),
+        ("blackboards",   blackboards_collection),
     ]
 
     for collection_name, collection in _collection_ttl_map:

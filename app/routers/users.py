@@ -37,6 +37,7 @@ from app.config.database import (
     annual_plans_collection,
     focus_areas_collection,
     goals_collection,
+    blackboards_collection,
 )
 from app.auth.firebase_auth import get_firebase_user
 
@@ -931,6 +932,20 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     await daily_routines_collection.update_many(
         {"user_id": user_id, "deleted_at": None},
         soft_delete_update
+    )
+
+    # Blackboards — owned boards are soft-deleted; the deleted user is also
+    # pulled from every OTHER board's collaborators array so no stale reference
+    # lingers on someone else's shared board. Blackboard has no is_public field,
+    # so soft_delete_update is deliberately not reused here.
+    await blackboards_collection.update_many(
+        {"owner_user_id": user_id, "deleted_at": None},
+        {"$set": {"deleted_at": now, "deleted_by": user_id, "updated_at": now}}
+    )
+
+    await blackboards_collection.update_many(
+        {"collaborators": user_id},
+        {"$pull": {"collaborators": user_id}, "$set": {"updated_at": now}}
     )
 
     # 3. Revoke Firebase credentials AFTER all MongoDB soft-deletes (D-08)

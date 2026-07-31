@@ -23,6 +23,7 @@ for mod in ["app.models.agent_models", "langfuse", "langfuse.langchain"]:
 
 import pytest
 from bson import ObjectId
+from datetime import datetime, timezone
 from fastapi import HTTPException
 
 
@@ -51,6 +52,29 @@ def make_cursor(docs: list) -> MagicMock:
     cursor = MagicMock()
     cursor.to_list = AsyncMock(return_value=docs)
     return cursor
+
+
+def make_filtering_find(docs: list) -> MagicMock:
+    """Mock `db.blackboards.find` that ACTUALLY applies the filter it is given.
+
+    A plain MagicMock returns its docs regardless of the query, so a router that
+    forgot `deleted_at` would still look correct. This mini-matcher mirrors the
+    two Mongo semantics `list_boards` depends on: a missing field compares equal
+    to `None`, and a scalar matched against an array field means "contains".
+    """
+    def _matches(doc: dict, query: dict) -> bool:
+        for key, expected in query.items():
+            actual = doc.get(key)
+            if isinstance(actual, list):
+                if expected not in actual:
+                    return False
+            elif actual != expected:
+                return False
+        return True
+
+    return MagicMock(side_effect=lambda query: make_cursor(
+        [doc for doc in docs if _matches(doc, query)]
+    ))
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +129,8 @@ async def test_list_boards_returns_owned_and_shared(mock_blackboards_collection,
         mock_db.blackboards.find = MagicMock(
             side_effect=[make_cursor([owned_board]), make_cursor([shared_board])]
         )
+        # owner_name resolution issues one bounded db.users lookup.
+        mock_db.users.find = MagicMock(return_value=make_cursor([]))
 
         result = await list_boards(current_user=mock_firebase_user)
 
@@ -113,10 +139,11 @@ async def test_list_boards_returns_owned_and_shared(mock_blackboards_collection,
     assert by_id[owned_id]["is_owner"] is True
     assert by_id[shared_id]["is_owner"] is False
 
-    # Both queries are bounded and use the expected filters.
+    # Both queries are bounded, use the expected filters, and exclude
+    # soft-deleted boards.
     owned_call, shared_call = mock_db.blackboards.find.call_args_list
-    assert owned_call.args[0] == {"owner_user_id": user_id}
-    assert shared_call.args[0] == {"collaborators": user_id}
+    assert owned_call.args[0] == {"owner_user_id": user_id, "deleted_at": None}
+    assert shared_call.args[0] == {"collaborators": user_id, "deleted_at": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -393,3 +420,60 @@ async def test_generate_cards_empty_text_returns_422(mock_blackboards_collection
     assert exc_info.value.detail == "no_extractable_text"
     # No LLM spend on an empty selection.
     fake_invoke.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 34 Plan 03 — F7 (soft-delete filtering) and F3 (owner_name)
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_list_boards_excludes_soft_deleted(mock_blackboards_collection, mock_firebase_user):
+    """GET /blackboards omits soft-deleted boards, including owner-deleted orphans."""
+    from app.routers.blackboards import list_boards
+
+    user_id = mock_firebase_user["user_id"]
+    live_board = make_board(owner_user_id=user_id, name="Live Board")
+    live_board["deleted_at"] = None
+    orphaned_board = make_board(owner_user_id=user_id, name="Orphaned Board")
+    orphaned_board["deleted_at"] = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        # Filter-aware fake: dropping "deleted_at" from the router's query would
+        # let the orphaned board through and fail this assertion.
+        mock_db.blackboards.find = make_filtering_find([live_board, orphaned_board])
+        mock_db.users.find = MagicMock(return_value=make_cursor([]))
+
+        result = await list_boards(current_user=mock_firebase_user)
+
+    assert [doc["name"] for doc in result] == ["Live Board"]
+
+
+@pytest.mark.asyncio
+async def test_list_boards_populates_owner_name(mock_blackboards_collection, mock_firebase_user):
+    """A shared board carries its owner's real display name, not the '...' fallback."""
+    from app.routers.blackboards import list_boards
+
+    user_id = mock_firebase_user["user_id"]
+    shared_board = make_board(
+        owner_user_id=OTHER_USER_ID,
+        collaborators=[user_id],
+        name="Shared With Me",
+    )
+    users_cursor = make_cursor([
+        {"_id": ObjectId(OTHER_USER_ID), "username": "alice", "email": "alice@example.com"}
+    ])
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find = MagicMock(
+            side_effect=[make_cursor([]), make_cursor([shared_board])]
+        )
+        mock_db.users.find = MagicMock(return_value=users_cursor)
+
+        result = await list_boards(current_user=mock_firebase_user)
+
+    assert len(result) == 1
+    assert result[0]["owner_name"] == "alice"   # username preferred over email
+    assert result[0]["is_owner"] is False
+
+    # One bounded $in lookup for the whole batch, not an N+1 per-board query.
+    mock_db.users.find.assert_called_once_with({"_id": {"$in": [ObjectId(OTHER_USER_ID)]}})
+    users_cursor.to_list.assert_awaited_once_with(length=100)
