@@ -59,9 +59,18 @@ async def test_delete_account_cascades_blackboards(mock_firebase_user):
     mock_fb_auth = MagicMock()
     mock_fb_auth.revoke_refresh_tokens.side_effect = lambda uid: order.append("revoke")
 
-    # priorities/activities/daily_routines are imported inside delete_account, so
+    # priorities/activities/daily_routines are imported INSIDE delete_account, so
     # they resolve from app.config.database at call time and must be patched there.
+    # patch.object on the module object is deliberate: other test modules install a
+    # bare MagicMock at sys.modules["app.config.database"], which leaves app.config
+    # without a `database` attribute and makes patch()'s dotted lookup fail under
+    # full-suite ordering.
+    db_module = sys.modules["app.config.database"]
+
     with patch.dict(sys.modules, {"firebase_admin": MagicMock(auth=mock_fb_auth)}), \
+         patch.object(db_module, "priorities_collection", make_collection()), \
+         patch.object(db_module, "activities_collection", make_collection()), \
+         patch.object(db_module, "daily_routines_collection", make_collection()), \
          patch("app.routers.users.users_collection", make_collection()), \
          patch("app.routers.users.decks_collection", make_collection()), \
          patch("app.routers.users.books_collection", make_collection()), \
@@ -71,9 +80,6 @@ async def test_delete_account_cascades_blackboards(mock_firebase_user):
          patch("app.routers.users.focus_areas_collection", make_collection()), \
          patch("app.routers.users.goals_collection", make_collection()), \
          patch("app.routers.users.tasks_collection", make_collection()), \
-         patch("app.config.database.priorities_collection", make_collection()), \
-         patch("app.config.database.activities_collection", make_collection()), \
-         patch("app.config.database.daily_routines_collection", make_collection()), \
          patch("app.routers.users.blackboards_collection", mock_blackboards):
 
         await delete_account(current_user=mock_firebase_user)
