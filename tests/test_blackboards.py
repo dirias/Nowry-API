@@ -149,6 +149,124 @@ async def test_save_board_denied_when_not_owner_or_collaborator(mock_blackboards
 
 
 # --------------------------------------------------------------------------- #
+# BBAUDIT-01 / F1 — GET /{board_id} owner-or-collaborator access
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_get_shared_board_as_collaborator(mock_blackboards_collection, mock_firebase_user):
+    """GET /blackboards/{id} returns the board when the caller is a collaborator.
+
+    Regression for F1: the lookup used to filter on the OWNER's `user_id`, so a
+    collaborator opening a shared board 404'd every time.
+    """
+    from app.routers.blackboards import get_blackboard
+
+    shared_board = make_board(
+        owner_user_id=OTHER_USER_ID,
+        collaborators=[mock_firebase_user["user_id"]],
+        name="Shared With Me",
+    )
+    board_id = str(shared_board["_id"])
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find_one = AsyncMock(return_value=shared_board)
+
+        result = await get_blackboard(
+            board_id=board_id,
+            current_user=mock_firebase_user,
+        )
+
+    assert result["id"] == board_id
+    assert result["name"] == "Shared With Me"
+
+    # The Mongo filter must not scope by the caller's user_id — a collaborator is
+    # not the owner, so that filter is exactly what broke sharing.
+    filter_arg = mock_db.blackboards.find_one.await_args.args[0]
+    assert "user_id" not in filter_arg
+
+
+@pytest.mark.asyncio
+async def test_get_board_denied_for_non_collaborator(mock_blackboards_collection, mock_firebase_user):
+    """GET /blackboards/{id} returns 403 when caller is neither owner nor collaborator."""
+    from app.routers.blackboards import get_blackboard
+
+    foreign_board = make_board(owner_user_id=OTHER_USER_ID, collaborators=[])
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find_one = AsyncMock(return_value=foreign_board)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_blackboard(
+                board_id=str(foreign_board["_id"]),
+                current_user=mock_firebase_user,
+            )
+
+    # Explicit denial — not a silent 404, and not a silent grant.
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "board_access_denied"
+
+
+# --------------------------------------------------------------------------- #
+# BBAUDIT-01 / F6 — DELETE /{board_id} clear actually clears + is guarded
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_clear_board_by_object_id(mock_blackboards_collection, mock_firebase_user):
+    """DELETE /blackboards/{id} clears a Phase-7 board keyed on its real `_id`.
+
+    Regression for F6: the old filter was `{"board_id": <str>, "user_id": ...}`,
+    a field Phase-7 boards do not have, so `update_one` matched nothing and the
+    endpoint returned ok without clearing anything.
+    """
+    from app.routers.blackboards import clear_blackboard
+
+    board = make_board(owner_user_id=mock_firebase_user["user_id"])
+    assert "board_id" not in board  # Phase-7 shape: `_id` only
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find_one = AsyncMock(return_value=board)
+        mock_db.blackboards.update_one = AsyncMock()
+
+        result = await clear_blackboard(
+            board_id=str(board["_id"]),
+            current_user=mock_firebase_user,
+        )
+
+    assert result == {"ok": True}
+
+    filter_arg, update_arg = mock_db.blackboards.update_one.await_args.args
+    assert filter_arg["_id"] == board["_id"]
+    assert "board_id" not in filter_arg
+    assert update_arg["$set"]["nodes"] == []
+    assert update_arg["$set"]["edges"] == []
+
+
+@pytest.mark.asyncio
+async def test_clear_board_denied_for_non_owner(mock_blackboards_collection, mock_firebase_user):
+    """DELETE /blackboards/{id} returns 403 for a caller who is neither owner nor collaborator.
+
+    Guards T-34-02: fixing F6's lookup without this check would turn a harmless
+    no-op into "any authenticated user can wipe any board by id".
+    """
+    from app.routers.blackboards import clear_blackboard
+
+    foreign_board = make_board(owner_user_id=OTHER_USER_ID, collaborators=[])
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find_one = AsyncMock(return_value=foreign_board)
+        mock_db.blackboards.update_one = AsyncMock()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await clear_blackboard(
+                board_id=str(foreign_board["_id"]),
+                current_user=mock_firebase_user,
+            )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "board_access_denied"
+    # Nothing was cleared.
+    mock_db.blackboards.update_one.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
 # BB-02 — Collaboration: invite
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
