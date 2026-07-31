@@ -105,6 +105,8 @@ async def test_list_boards_returns_owned_and_shared(mock_blackboards_collection,
         mock_db.blackboards.find = MagicMock(
             side_effect=[make_cursor([owned_board]), make_cursor([shared_board])]
         )
+        # owner_name resolution issues one bounded db.users lookup.
+        mock_db.users.find = MagicMock(return_value=make_cursor([]))
 
         result = await list_boards(current_user=mock_firebase_user)
 
@@ -113,10 +115,11 @@ async def test_list_boards_returns_owned_and_shared(mock_blackboards_collection,
     assert by_id[owned_id]["is_owner"] is True
     assert by_id[shared_id]["is_owner"] is False
 
-    # Both queries are bounded and use the expected filters.
+    # Both queries are bounded, use the expected filters, and exclude
+    # soft-deleted boards.
     owned_call, shared_call = mock_db.blackboards.find.call_args_list
-    assert owned_call.args[0] == {"owner_user_id": user_id}
-    assert shared_call.args[0] == {"collaborators": user_id}
+    assert owned_call.args[0] == {"owner_user_id": user_id, "deleted_at": None}
+    assert shared_call.args[0] == {"collaborators": user_id, "deleted_at": None}
 
 
 # --------------------------------------------------------------------------- #
