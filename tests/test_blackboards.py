@@ -154,13 +154,63 @@ async def test_save_board_denied_when_not_owner_or_collaborator(mock_blackboards
 @pytest.mark.asyncio
 async def test_invite_collaborator_success(mock_blackboards_collection, mock_firebase_user, mock_invitation):
     """PUT /blackboards/{id}/invite adds collaborator to board."""
-    pytest.skip("Wave 0 stub — implement in 07-02-PLAN.md")
+    from app.routers.blackboards import invite_collaborator
+    from app.models.Blackboard import InviteCollaboratorRequest
+
+    board = make_board(owner_user_id=mock_firebase_user["user_id"])
+    invitee_id = ObjectId()
+    invitee_doc = {"_id": invitee_id, "email": mock_invitation["invitee_email"]}
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find_one = AsyncMock(return_value=board)
+        mock_db.users.find_one = AsyncMock(return_value=invitee_doc)
+        mock_db.blackboards.update_one = AsyncMock()
+
+        result = await invite_collaborator(
+            board_id=str(board["_id"]),
+            body=InviteCollaboratorRequest(**mock_invitation),
+            current_user=mock_firebase_user,
+        )
+
+    assert result == {"ok": True}
+    # Invitee is resolved by email, never trusted from the request body as an id.
+    mock_db.users.find_one.assert_awaited_once_with(
+        {"email": mock_invitation["invitee_email"]}
+    )
+    filter_arg, update_arg = mock_db.blackboards.update_one.await_args.args
+    assert filter_arg == {"_id": board["_id"]}
+    assert update_arg == {"$addToSet": {"collaborators": str(invitee_id)}}
 
 
 @pytest.mark.asyncio
 async def test_invite_collaborator_requires_ownership(mock_blackboards_collection, mock_firebase_user):
     """PUT /blackboards/{id}/invite returns 403 when caller is not owner."""
-    pytest.skip("Wave 0 stub — implement in 07-02-PLAN.md")
+    from app.routers.blackboards import invite_collaborator
+    from app.models.Blackboard import InviteCollaboratorRequest
+
+    # Caller is a collaborator on someone else's board — still may not invite.
+    foreign_board = make_board(
+        owner_user_id=OTHER_USER_ID,
+        collaborators=[mock_firebase_user["user_id"]],
+    )
+
+    with patch("app.routers.blackboards.db") as mock_db:
+        mock_db.blackboards.find_one = AsyncMock(return_value=foreign_board)
+        mock_db.users.find_one = AsyncMock()
+        mock_db.blackboards.update_one = AsyncMock()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await invite_collaborator(
+                board_id=str(foreign_board["_id"]),
+                body=InviteCollaboratorRequest(invitee_email="someone@example.com"),
+                current_user=mock_firebase_user,
+            )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "only_owner_can_invite"
+    # Ownership is checked before the invitee lookup and before any write.
+    mock_db.users.find_one.assert_not_called()
+    mock_db.blackboards.update_one.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -169,10 +219,59 @@ async def test_invite_collaborator_requires_ownership(mock_blackboards_collectio
 @pytest.mark.asyncio
 async def test_generate_cards_from_board_success(mock_blackboards_collection, mock_firebase_user):
     """POST /blackboards/{id}/generate-cards returns cards list for valid node selection."""
-    pytest.skip("Wave 0 stub — implement in 07-02-PLAN.md")
+    from app.routers.blackboards import generate_cards_from_board
+    from app.models.Blackboard import BoardToCardRequest
+
+    board = make_board(owner_user_id=mock_firebase_user["user_id"])
+    generated = [{"front": "Q1", "back": "A1"}]
+
+    # orchestrator.invoke is a sync callable — it runs inside asyncio.to_thread.
+    fake_invoke = MagicMock(return_value={"generated_cards": generated})
+
+    with patch("app.routers.blackboards.db") as mock_db, \
+         patch("app.routers.blackboards.orchestrator.invoke", fake_invoke):
+        mock_db.blackboards.find_one = AsyncMock(return_value=board)
+
+        result = await generate_cards_from_board(
+            board_id=str(board["_id"]),
+            body=BoardToCardRequest(node_ids=["n1"], node_texts=["Some node text"]),
+            current_user=mock_firebase_user,
+            tier="pro",
+        )
+
+    assert result.cards == generated
+    assert result.node_count == 1
+    assert result.nodes_truncated is False
+
+    # The "rag" graph is invoked with the cleaned node text in the state payload.
+    graph_name, state = fake_invoke.call_args.args
+    assert graph_name == "rag"
+    assert "Some node text" in state["sampleText"]
+    assert state["tier"] == "pro"
 
 
 @pytest.mark.asyncio
 async def test_generate_cards_empty_text_returns_422(mock_blackboards_collection, mock_firebase_user):
     """POST /blackboards/{id}/generate-cards returns 422 when all nodes have no extractable text."""
-    pytest.skip("Wave 0 stub — implement in 07-02-PLAN.md")
+    from app.routers.blackboards import generate_cards_from_board
+    from app.models.Blackboard import BoardToCardRequest
+
+    board = make_board(owner_user_id=mock_firebase_user["user_id"])
+    fake_invoke = MagicMock()
+
+    with patch("app.routers.blackboards.db") as mock_db, \
+         patch("app.routers.blackboards.orchestrator.invoke", fake_invoke):
+        mock_db.blackboards.find_one = AsyncMock(return_value=board)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await generate_cards_from_board(
+                board_id=str(board["_id"]),
+                body=BoardToCardRequest(node_ids=["n1", "n2"], node_texts=["   ", ""]),
+                current_user=mock_firebase_user,
+                tier="pro",
+            )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "no_extractable_text"
+    # No LLM spend on an empty selection.
+    fake_invoke.assert_not_called()
