@@ -108,18 +108,31 @@ async def list_boards(current_user: dict = Depends(get_firebase_user)):
 async def get_blackboard(board_id: str, current_user: dict = Depends(get_firebase_user)):
     user_id = current_user.get("user_id")
 
-    # Try by Mongo _id first, then by board_id string
+    # Two-step lookup: ObjectId first, then legacy board_id string (same as PUT).
+    # The caller's user_id is deliberately NOT part of either Mongo filter — a
+    # collaborator is not the owner, so filtering on user_id here would 404 every
+    # shared board. Access is enforced by the guard below instead.
     doc = None
     try:
-        doc = await db.blackboards.find_one({"_id": ObjectId(board_id), "user_id": user_id})
+        doc = await db.blackboards.find_one({"_id": ObjectId(board_id)})
     except Exception:
         pass
 
     if not doc:
-        doc = await db.blackboards.find_one({"board_id": board_id, "user_id": user_id})
+        doc = await db.blackboards.find_one({"board_id": board_id})
 
     if not doc:
         raise HTTPException(status_code=404, detail="board_not_found")
+
+    if doc.get("owner_user_id") is not None:
+        # Phase 7 board: enforce owner/collaborator guard
+        owner = doc.get("owner_user_id")
+        collaborators = doc.get("collaborators", [])
+        if owner != user_id and user_id not in collaborators:
+            raise HTTPException(status_code=403, detail="board_access_denied")
+
+    # Legacy boards (no owner_user_id): allow read for backward compat
+
     return _serialize(doc)
 
 
@@ -297,8 +310,35 @@ async def clear_blackboard(board_id: str, current_user: dict = Depends(get_fireb
     user_id = current_user.get("user_id")
     now = datetime.now(timezone.utc)
 
+    # Two-step lookup: ObjectId first, then legacy board_id string (same as GET/PUT).
+    # Every board created since Phase 7 has only an _id — the old
+    # {"board_id": ..., "user_id": ...} filter matched zero documents, so the
+    # clear silently no-op'd while still returning ok.
+    board = None
+    try:
+        board = await db.blackboards.find_one({"_id": ObjectId(board_id)})
+    except Exception:
+        pass
+
+    if not board:
+        board = await db.blackboards.find_one({"board_id": board_id})
+
+    if not board:
+        raise HTTPException(status_code=404, detail="board_not_found")
+
+    if board.get("owner_user_id") is not None:
+        # Phase 7 board: enforce owner/collaborator guard. Required alongside the
+        # lookup fix — without it, making the clear actually work would let any
+        # authenticated caller wipe any board by id.
+        owner = board.get("owner_user_id")
+        collaborators = board.get("collaborators", [])
+        if owner != user_id and user_id not in collaborators:
+            raise HTTPException(status_code=403, detail="board_access_denied")
+
+    # Legacy boards (no owner_user_id): allow clear for backward compat
+
     await db.blackboards.update_one(
-        {"board_id": board_id, "user_id": user_id},
+        {"_id": board["_id"]},
         {"$set": {"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}, "updated_at": now}},
     )
     return {"ok": True}
