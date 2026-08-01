@@ -424,6 +424,11 @@ SMALL TALK & GREETINGS (highest priority — overrides IDENTITY RULES #2/#3 and 
 
 QUIZ_TRIGGER_RULES = """
 QUIZ MODE — TOOL USE CONTRACT:
+- DEFAULT: DO NOT call `start_quiz`. You are a straight-to-the-point helper first:
+  answer the user's current message yourself, using CURRENT SCREEN CONTEXT (book
+  title, card front/back, etc.) whenever it is relevant. The tool exists ONLY for
+  the case where the user explicitly asks to be quizzed or tested — NEVER call it
+  as a "helpful" follow-up to a content request, and never instead of answering.
 - You have a `start_quiz` tool. Call it with confidence="high" whenever the user's
   message is ANY unambiguous, explicit request to be quizzed, tested, examined, or
   given practice questions — no matter how it's phrased or which language it's in.
@@ -452,7 +457,18 @@ QUIZ MODE — TOOL USE CONTRACT:
       questions on X"
 - Examples that NEVER call the tool — answer them directly and completely, as you
   normally would: "explain photosynthesis", "what is chapter 3 about", "tell me about
-  Spanish verbs", "can you help me understand X".
+  Spanish verbs", "can you help me understand X", "give me more examples using における",
+  "give me an example sentence with this word", "use this card/word in a phrase or
+  sentence", "translate this", "what does this mean".
+- CRITICAL DISTINCTION: requests for EXAMPLES, sample sentences, usage
+  demonstrations, translations, or explanations are content requests, NOT quiz
+  requests — even when they contain "give me", "use", "more", or "practice
+  sentences", and even when they reference the current card, book, or a grammar
+  point. The test is direction: a quiz request asks YOU to ask THEM questions (or
+  to produce a quiz/test/exam/questionnaire artifact); a request for you to SHOW,
+  EXPLAIN, or DEMONSTRATE something is never a quiz request. When in doubt,
+  answer directly — a wrong direct answer is recoverable, a wrongly launched quiz
+  is not.
 - Reserve confidence="medium" / [[QUIZ_OFFER:...]] STRICTLY for requests where the
   intent is genuinely unclear between "explain this to me" and "quiz me on this" —
   i.e. there is NO quiz/test/exam/practice/questionnaire verb or noun anywhere in the
@@ -1235,9 +1251,14 @@ QUIZ_TOOLS = [
                     "cuestionario sobre X' / 'ponme a prueba', French 'fais-moi un quiz sur X', "
                     "German 'mach ein Quiz über X', Japanese 'Xのクイズを作って', Chinese "
                     "'给我出一些关于X的题' / '考我', etc.). "
-                    "Do NOT call this for informational requests like 'explain X', "
-                    "'tell me about X', 'what is X', or 'help me understand X' — those "
-                    "are answered directly with text, never with this tool. "
+                    "Do NOT call this for informational or content requests like "
+                    "'explain X', 'tell me about X', 'what is X', 'help me understand X', "
+                    "'give me (more) examples using X', 'give me an example sentence', "
+                    "'use this card/word in a phrase or sentence', or 'translate this' — "
+                    "those are answered directly with text, never with this tool. A "
+                    "request for you to SHOW, EXPLAIN, or DEMONSTRATE something (examples, "
+                    "sample sentences, translations) is never a quiz request, even if it "
+                    "contains words like 'give me' or 'use'. "
                     "Only if the user's phrasing contains NO quiz/test/exam/practice/"
                     "questionnaire verb or noun at all, and is genuinely ambiguous between "
                     "'explain this' and 'quiz me' (e.g. 'help me study X' could mean either), "
@@ -2627,10 +2648,12 @@ async def chat(
                         f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
                     )
     except Exception as exc:
-        logger.error(f"Agent Chat Error: {exc}")
+        # Full details go to the log (and Sentry via the error handler) —
+        # never into the client-facing detail string.
+        logger.error(f"Agent Chat Error: {exc}", exc_info=True)
         raise HTTPException(
             status_code=502,
-            detail=f"AI service error: {str(exc)}",
+            detail="AI service error. Please try again.",
         )
 
     # ── Quiz result processing ──────────────────────────────────────────────

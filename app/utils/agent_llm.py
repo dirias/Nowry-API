@@ -171,6 +171,26 @@ class AgentLLM:
         return response.text
 
     @staticmethod
+    def _is_tool_use_failed(exc: Exception) -> bool:
+        """
+        True when Groq rejected the MODEL'S OWN malformed tool call (HTTP 400,
+        error code 'tool_use_failed').
+
+        Known Groq/Llama failure mode: the model emits the arguments JSON inside
+        the function NAME (e.g. '<function=start_quiz {"confidence": ...}>')
+        instead of a structured tool_call, so Groq's server-side validator
+        rejects it as "tool ... was not in request.tools" even though the tool
+        WAS sent. This is a model-output defect, not a request defect — safe to
+        retry once without tools. Any other error must propagate unchanged.
+        """
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error", body)
+            if isinstance(err, dict) and err.get("code") == "tool_use_failed":
+                return True
+        return "tool_use_failed" in str(exc)
+
+    @staticmethod
     def _strip_function_calls(text: str) -> str:
         """
         Strip Llama/Groq text-based function call artifacts from the response.
@@ -228,9 +248,31 @@ class AgentLLM:
                     completion_kwargs["tool_choice"] = "auto"
                 completion = self.groq_client.chat.completions.create(**completion_kwargs)
             except Exception as e:
-                logger.error(f"Groq API Error: {e}")
-                # Optional: try fallback to Gemini here?
-                raise e
+                if openai_tools and self._is_tool_use_failed(e):
+                    # Known Groq/Llama failure mode: the model emitted a malformed
+                    # tool call (arguments embedded in the function name), which
+                    # Groq's validator rejects with 400 'tool_use_failed'. Degrade
+                    # gracefully: log it, then retry ONCE without tools so the user
+                    # gets a plain-text answer instead of a 502. Tools are disabled
+                    # for the remainder of this turn only — the next request starts
+                    # fresh with the full tool set.
+                    logger.error(
+                        "[Groq] tool_use_failed — model emitted a malformed tool call; "
+                        "retrying this turn without tools. Original error: %s", e,
+                    )
+                    openai_tools = None
+                    try:
+                        completion = self.groq_client.chat.completions.create(
+                            model=self.groq_model,
+                            messages=messages,
+                        )
+                    except Exception as retry_exc:
+                        logger.error(f"Groq API Error (tool-less retry also failed): {retry_exc}")
+                        raise retry_exc
+                else:
+                    logger.error(f"Groq API Error: {e}")
+                    # Optional: try fallback to Gemini here?
+                    raise e
 
             response_message = completion.choices[0].message
 
