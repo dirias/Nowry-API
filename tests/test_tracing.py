@@ -496,6 +496,26 @@ def _fake_quiz_json(n=1):
     return json.dumps(items)
 
 
+def _fake_book_quiz_json(n=1):
+    """Book-quiz payload shape: multiple-choice with explicit `options`/`answer`.
+
+    Distinct from _fake_quiz_json (deck/topic quizzes, which are short-answer
+    with a rubric). generate_quiz_from_book normalises to a multiple-choice
+    contract, so its fixtures must carry selectable options.
+    """
+    items = [
+        {
+            "question": f"Q{i}",
+            "options": [f"A{i}", f"B{i}", f"C{i}", f"D{i}"],
+            "answer": f"A{i}",
+            "explanation": f"Because A{i}.",
+            "difficulty": "Medium",
+        }
+        for i in range(n)
+    ]
+    return json.dumps(items)
+
+
 @pytest.mark.asyncio
 async def test_generate_questions_retries_traced_separately(mock_langfuse_client):
     import app.routers.quiz_ai as quiz_ai_module
@@ -613,7 +633,7 @@ async def test_generate_quiz_from_book_happy_path_traces_quiz_from_book(mock_lan
     fake_book = {"_id": "abc123", "user_id": "u1", "deleted_at": None, "full_content": "Some book text"}
     fake_gemini_client = MagicMock()
     fake_completion = MagicMock()
-    fake_completion.choices = [MagicMock(message=MagicMock(content=_fake_quiz_json(2)))]
+    fake_completion.choices = [MagicMock(message=MagicMock(content=_fake_book_quiz_json(2)))]
     fake_gemini_client.request.return_value = fake_completion
 
     body = GenerateQuizFromBookRequest(book_id="abc123")
@@ -629,7 +649,7 @@ async def test_generate_quiz_from_book_happy_path_traces_quiz_from_book(mock_lan
             body=body, current_user=current_user, tier="plus"
         )
 
-    assert len(result["questions"]) == 2
+    assert len(result.questions) == 2
 
     mock_langfuse_client.start_as_current_observation.assert_called_once()
     _, gen_kwargs = mock_langfuse_client.start_as_current_observation.call_args
@@ -650,7 +670,7 @@ async def test_generate_quiz_from_book_langfuse_unreachable(broken_langfuse_clie
     fake_book = {"_id": "abc123", "user_id": "u1", "deleted_at": None, "full_content": "Some book text"}
     fake_gemini_client = MagicMock()
     fake_completion = MagicMock()
-    fake_completion.choices = [MagicMock(message=MagicMock(content=_fake_quiz_json(2)))]
+    fake_completion.choices = [MagicMock(message=MagicMock(content=_fake_book_quiz_json(2)))]
     fake_gemini_client.request.return_value = fake_completion
 
     body = GenerateQuizFromBookRequest(book_id="abc123")
@@ -667,7 +687,7 @@ async def test_generate_quiz_from_book_langfuse_unreachable(broken_langfuse_clie
                 body=body, current_user=current_user, tier="plus"
             )
 
-    assert len(result["questions"]) == 2
+    assert len(result.questions) == 2
     warning_records = [
         r for r in caplog.records
         if r.levelname == "WARNING" and "Langfuse tracing failed" in r.message

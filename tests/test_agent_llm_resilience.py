@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.utils.agent_llm import AgentLLM
+from app.utils.agent_llm import AgentLLM, ToolCallRejectedError
 
 
 class FakeGroqToolUseFailed(Exception):
@@ -117,3 +117,92 @@ def test_genuine_groq_error_still_propagates() -> None:
         asyncio.new_event_loop().run_until_complete(
             llm._chat_groq("hi", [], "sys", _fake_gemini_tools(), None, "u1")
         )
+
+
+# --------------------------------------------------------------------------- #
+# Server-side tool gate: ToolCallRejectedError re-runs the turn without tool
+# --------------------------------------------------------------------------- #
+
+def _fake_tool_call_completion(fn_name: str, arguments: str):
+    tool_call = MagicMock()
+    tool_call.id = "call_1"
+    tool_call.function.name = fn_name
+    tool_call.function.arguments = arguments
+    msg = MagicMock()
+    msg.content = None
+    msg.tool_calls = [tool_call]
+    completion = MagicMock()
+    completion.choices = [MagicMock(message=msg)]
+    return completion
+
+
+def test_rejected_tool_call_reruns_turn_without_tool() -> None:
+    """A ToolCallRejectedError from the dispatcher must trigger a re-run of the
+    turn WITHOUT the rejected tool, yielding a direct text answer — never an
+    error to the user."""
+    calls: list[dict] = []
+
+    def create(**kwargs: Any) -> MagicMock:
+        calls.append(kwargs)
+        if "tools" in kwargs:
+            # Model wrongly attempts start_quiz on a content request
+            return _fake_tool_call_completion(
+                "start_quiz", '{"mode": "ai", "confidence": "high", "topic": "行動する"}'
+            )
+        return _fake_completion("行動する means 'to take action'. Example: 早く行動する…")
+
+    llm = _make_llm(create)
+
+    async def rejecting_dispatcher(fn_name: str, fn_args: dict, user_id: str) -> str:
+        raise ToolCallRejectedError(fn_name, "not an explicit quiz request")
+
+    reply = asyncio.new_event_loop().run_until_complete(
+        llm._chat_groq(
+            message="Give me an example using this card",
+            history=[],
+            system_prompt="sys",
+            tools=_fake_gemini_tools(),
+            tool_dispatcher=rejecting_dispatcher,
+            user_id="u1",
+        )
+    )
+    assert len(calls) == 2, "expected re-run after rejection"
+    assert "tools" in calls[0]
+    assert "tools" not in calls[1], "rejected tool must be removed from the re-run"
+    # The vetoed assistant tool-call message must NOT leak into the re-run
+    assert len(calls[1]["messages"]) == len(calls[0]["messages"])
+    assert "行動する" in reply
+
+
+# --------------------------------------------------------------------------- #
+# intent_yes_no — tiny YES/NO classifier used by the quiz gate
+# --------------------------------------------------------------------------- #
+
+def _intent_llm(content: Any, raise_exc: bool = False) -> AgentLLM:
+    llm = AgentLLM.__new__(AgentLLM)
+    llm.groq_model = "test-model"
+    client = MagicMock()
+    if raise_exc:
+        client.chat.completions.create.side_effect = RuntimeError("boom")
+    else:
+        client.chat.completions.create.return_value = _fake_completion(content)
+    llm.groq_client = client
+    return llm
+
+
+def _run(coro: Any) -> Any:
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def test_intent_yes_no_parses_verdicts() -> None:
+    assert _run(_intent_llm("YES").intent_yes_no("i", "quiz me")) is True
+    assert _run(_intent_llm("No.").intent_yes_no("i", "give me an example")) is False
+    assert _run(_intent_llm("The answer is NO").intent_yes_no("i", "m")) is False
+
+
+def test_intent_yes_no_returns_none_when_unparseable_or_failing() -> None:
+    assert _run(_intent_llm("maybe?").intent_yes_no("i", "m")) is None
+    assert _run(_intent_llm("", raise_exc=True).intent_yes_no("i", "m")) is None
+    no_client = AgentLLM.__new__(AgentLLM)
+    no_client.groq_client = None
+    assert _run(no_client.intent_yes_no("i", "m")) is None

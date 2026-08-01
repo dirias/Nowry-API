@@ -50,7 +50,7 @@ from app.utils.agent_tools import (
     read_book_section,
 )
 
-from app.utils.agent_llm import agent_llm
+from app.utils.agent_llm import agent_llm, ToolCallRejectedError
 from app.core.model_config import TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
@@ -353,14 +353,20 @@ LANGUAGE_NAMES: dict[str, str] = {
 
 
 def _build_language_directive(language_code: str) -> str:
-    """Returns a system prompt instruction to respond in the user's language."""
-    lang: Optional[str] = LANGUAGE_NAMES.get(language_code.split('-')[0].lower(), None)
-    if not lang or language_code.startswith('en'):
-        return ''
+    """Returns the fallback-language instruction that complements LANGUAGE MIRRORING.
+
+    The language of the user's message is always the strongest signal (see
+    LANGUAGE_MIRRORING_RULES); the interface language passed here is only the
+    default when the message language is ambiguous.
+    """
+    lang: str = LANGUAGE_NAMES.get(language_code.split('-')[0].lower(), 'English')
     return (
-        f'\n\nLANGUAGE DIRECTIVE: The user has set their interface language to {lang}. '
-        f'Always respond in {lang}, regardless of what language the user writes in. '
-        f'This is a strict requirement.'
+        f'\n\nDEFAULT LANGUAGE: The user\'s interface language is set to {lang}. '
+        f'Use {lang} ONLY as a fallback — when the language of the user\'s current '
+        f'message is ambiguous (e.g. a bare emoji, a proper noun, or a single word '
+        f'that exists in several languages). Whenever the message has an identifiable '
+        f'language, the LANGUAGE MIRRORING rules take precedence: mirror the language '
+        f'the user wrote in.'
     )
 
 
@@ -419,6 +425,39 @@ SMALL TALK & GREETINGS (highest priority — overrides IDENTITY RULES #2/#3 and 
 - Only bring up study content, the user's interests, or a quiz offer if the user's
   CURRENT message actually asks for help, study, practice, or references that topic.
   A bare greeting is never, by itself, a reason to continue an earlier topic.
+"""
+
+
+LANGUAGE_MIRRORING_RULES = """
+LANGUAGE MIRRORING (strict — applies to every reply):
+- Write ALL explanations, meta-commentary, encouragement, and follow-up questions
+  in the language the user's CURRENT message is written in. The message language is
+  the strongest signal — it overrides the interface language setting and the
+  language of the study material.
+- Study content in the language being studied (example sentences, vocabulary,
+  grammar demonstrations) stays in that target language — but EVERY such example
+  MUST be immediately followed by a translation into the user's language.
+  Example: the user asks in English for examples of a grammar point in the language
+  they are studying (e.g. Japanese) → give each example sentence in the target
+  language, follow it with its English translation, and write all explanations and
+  follow-up questions in English.
+- If the user writes their message IN the language being studied, respond fully in
+  that language — by writing in it they have opted into immersion, and no
+  translations are needed.
+- NEVER answer entirely in the target language when the user asked in another
+  language: a learner cannot understand an explanation written in the very
+  language they are trying to learn.
+"""
+
+
+MARKDOWN_FORMAT_RULES = """
+FORMATTING (chat bubble constraints — strict):
+- You may use ONLY this markdown subset: **bold**, *italics*, bullet lists,
+  numbered lists, and `inline code`.
+- NEVER use headers (#, ##, ...), tables, images, horizontal rules (---), or
+  fenced code blocks — they break the small chat bubble UI.
+- Keep replies compact and chat-sized: short paragraphs and short lists, never
+  document-style structure.
 """
 
 
@@ -1010,6 +1049,8 @@ BEHAVIORAL RULES:
 
 {TUTOR_RULES}
 {QUIZ_TRIGGER_RULES}
+{LANGUAGE_MIRRORING_RULES}
+{MARKDOWN_FORMAT_RULES}
 {tool_instructions}"""
     identity_block = ""
     if pet_name:
@@ -1294,6 +1335,44 @@ QUIZ_TOOLS = [
 ]
 
 
+# ── Deterministic server-side quiz gate ─────────────────────────────────────
+# Prompt steering alone proved unreliable: both Llama and gpt-oss on Groq
+# pattern-match study-flavored content requests ("give me an example using this
+# card") into start_quiz with self-reported confidence="high", ignoring the
+# never-call rules. This gate re-validates intent server-side with a tiny,
+# language-agnostic secondary LLM call over ONLY the user's last message, and
+# it runs ONLY when the model actually attempts start_quiz — zero added latency
+# on normal turns.
+_QUIZ_INTENT_GATE_PROMPT = (
+    "You are a strict binary intent classifier. Reply with exactly one word: YES or NO.\n"
+    "QUESTION: Does the user's message EXPLICITLY ask to be quizzed, tested, or "
+    "examined, or explicitly ask for a quiz/test/exam/questionnaire/practice-question "
+    "session to be created or started?\n"
+    "The message may be in any language — judge the intent of the message itself.\n"
+    "Reply NO for requests for examples, sample sentences, usage demonstrations, "
+    "explanations, translations, definitions, or any request for the assistant to "
+    "show, explain, or demonstrate something (e.g. 'give me an example using this "
+    "card', 'use this word in a sentence', 'give me more examples of X').\n"
+    "Reply YES only when the user asks to be asked questions, or asks for a "
+    "quiz/test/exam to be produced or started (e.g. 'quiz me', 'test me', 'make a "
+    "quiz about X').\n"
+    "Reply with one word only: YES or NO."
+)
+
+
+async def _verify_explicit_quiz_intent(user_message: Optional[str]) -> Optional[bool]:
+    """Language-agnostic check: does this message explicitly ask for a quiz?
+
+    Returns True/False from the classifier, or None when no verdict is
+    available (no message threaded, classifier unavailable, or unparseable
+    output). Policy for None is decided at the call site: fail-open, so a
+    transient classifier failure can never block a legitimate "quiz me".
+    """
+    if not user_message or not user_message.strip():
+        return None
+    return await agent_llm.intent_yes_no(_QUIZ_INTENT_GATE_PROMPT, user_message)
+
+
 async def _dispatch_tool_call(
     fn_name: str,
     fn_args: dict,
@@ -1301,6 +1380,7 @@ async def _dispatch_tool_call(
     client=None,
     default_question_count: int = 10,
     quiz_result_holder: Optional[dict] = None,
+    user_message: Optional[str] = None,
 ) -> str:
     """
     Executes the tool function requested by the model and returns the
@@ -1332,8 +1412,11 @@ async def _dispatch_tool_call(
 
     with span_cm as tool_span:
         # ── The ONE tool-execution call — executes exactly once ─────────────
+        # A ToolCallRejectedError raised here propagates to the provider loop
+        # in agent_llm, which re-runs the turn without the rejected tool.
         result_str = await _dispatch_tool_call_inner(
-            fn_name, fn_args, user_id, default_question_count, quiz_result_holder
+            fn_name, fn_args, user_id, default_question_count, quiz_result_holder,
+            user_message=user_message,
         )
 
         if tool_span is not None:
@@ -1354,10 +1437,15 @@ async def _dispatch_tool_call_inner(
     user_id: str,
     default_question_count: int = 10,
     quiz_result_holder: Optional[dict] = None,
+    user_message: Optional[str] = None,
 ) -> str:
     """
     Executes the tool function requested by the model and returns the
     result as a JSON string to feed back into the conversation.
+
+    Raises ToolCallRejectedError (never converted to a result string) when the
+    server-side quiz gate vetoes a start_quiz call — the provider loop re-runs
+    the turn without the tool so the user gets a direct answer.
     """
     try:
         if fn_name == "get_study_summary":
@@ -1398,6 +1486,22 @@ async def _dispatch_tool_call_inner(
                              "question directly and append [[QUIZ_OFFER:<topic>]] instead."
                 }
             else:
+                # Deterministic server-side gate: the model's self-reported
+                # confidence is not trusted. Re-validate against the user's
+                # actual message; only an explicit quiz/test request passes.
+                # None (classifier unavailable) fails open so a transient
+                # classifier failure never blocks a legitimate "quiz me".
+                intent_ok = await _verify_explicit_quiz_intent(user_message)
+                if intent_ok is False:
+                    logger.warning(
+                        "[start_quiz] Server-side intent gate rejected tool call "
+                        "(model claimed confidence=high): %s", fn_args,
+                    )
+                    raise ToolCallRejectedError(
+                        "start_quiz",
+                        "The user's message does not explicitly ask to be "
+                        "quizzed or tested.",
+                    )
                 raw_count = fn_args.get("question_count", default_question_count)
                 try:
                     q_count = max(1, min(20, int(raw_count)))
@@ -1414,6 +1518,10 @@ async def _dispatch_tool_call_inner(
                 result = {"status": "launching", "quiz_config": quiz_config_dict}
         else:
             result = {"error": f"Unknown tool: {fn_name}"}
+    except ToolCallRejectedError:
+        # Control-flow signal for the provider loop — must NOT be converted
+        # into a tool-result string, or the gate would be silently bypassed.
+        raise
     except Exception as exc:
         result = {"error": f"Tool execution failed: {str(exc)}"}
 
@@ -2622,6 +2730,7 @@ async def chat(
         client=client,
         default_question_count=default_q_count,
         quiz_result_holder=quiz_result_holder,
+        user_message=body.message,  # threaded to the server-side quiz intent gate
     )
 
     try:

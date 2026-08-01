@@ -24,6 +24,7 @@ import json
 import os
 import random
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 from bson import ObjectId
@@ -44,7 +45,11 @@ from app.config.database import (
 )
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
-from app.models.book_generation import GenerateQuizFromBookRequest
+from app.models.book_generation import (
+    GeneratedQuizQuestion,
+    GenerateQuizFromBookRequest,
+    GenerateQuizFromBookResponse,
+)
 from app.models.deck_quiz_analysis import DeckQuizAnalysisResponse
 from app.models.quiz import (
     AIQuizQuestionResponse,
@@ -452,16 +457,116 @@ def _extract_text_from_lexical_quiz(lexical_state: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Quiz question normalisation
+# ---------------------------------------------------------------------------
+
+# The book-quiz prompt historically asked for `correct_answer` +
+# `incorrect_answers`, while the frontend QuestionnaireModal (shared with
+# POST /quiz/generate) reads `question` / `options` / `answer` / `explanation`.
+# The mismatch made every option list render empty. We normalise server-side so
+# the wire contract holds regardless of which prompt version Langfuse serves.
+_QUESTION_KEYS: tuple[str, ...] = ("question", "question_text", "prompt", "text")
+_ANSWER_KEYS: tuple[str, ...] = ("answer", "correct_answer", "correctAnswer")
+_OPTIONS_KEYS: tuple[str, ...] = ("options", "choices", "alternatives", "answers")
+_DISTRACTOR_KEYS: tuple[str, ...] = (
+    "incorrect_answers",
+    "incorrectAnswers",
+    "distractors",
+    "wrong_answers",
+)
+_EXPLANATION_KEYS: tuple[str, ...] = ("explanation", "rationale", "reason")
+
+
+def _first_str(raw: dict, keys: tuple[str, ...]) -> str:
+    """Return the first non-empty string value found under `keys`, else ""."""
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _string_list(value: object) -> list[str]:
+    """Coerce an LLM-supplied value into a list of non-empty trimmed strings."""
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = item.strip() if isinstance(item, str) else ""
+        if text:
+            items.append(text)
+    return items
+
+
+def _normalize_quiz_question(raw: object) -> Optional[GeneratedQuizQuestion]:
+    """Map one LLM-produced question onto the canonical frontend shape.
+
+    Accepts either the `options`/`answer` shape or the
+    `correct_answer`/`incorrect_answers` shape. Returns None when the entry
+    cannot produce a usable multiple-choice question (missing text, or fewer
+    than two distinct options) so malformed items are dropped instead of
+    rendering as an empty option list.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    question = _first_str(raw, _QUESTION_KEYS)
+    if not question:
+        return None
+
+    answer = _first_str(raw, _ANSWER_KEYS)
+
+    options: list[str] = []
+    for key in _OPTIONS_KEYS:
+        options = _string_list(raw.get(key))
+        if options:
+            break
+
+    if not options:
+        distractors: list[str] = []
+        for key in _DISTRACTOR_KEYS:
+            distractors = _string_list(raw.get(key))
+            if distractors:
+                break
+        if answer and distractors:
+            options = [answer, *distractors]
+            random.shuffle(options)
+
+    # De-duplicate while preserving order (an LLM occasionally repeats a choice).
+    seen: set[str] = set()
+    options = [opt for opt in options if not (opt in seen or seen.add(opt))]
+
+    if answer and answer not in options:
+        # The answer must be selectable, otherwise the question is unanswerable.
+        options.append(answer)
+        random.shuffle(options)
+
+    if len(options) < 2:
+        return None
+    if not answer:
+        return None
+
+    difficulty = _first_str(raw, ("difficulty",))
+    return GeneratedQuizQuestion(
+        question=question,
+        options=options,
+        answer=answer,
+        explanation=_first_str(raw, _EXPLANATION_KEYS) or None,
+        difficulty=difficulty or None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /generate-from-book — Plus+ only
 # ---------------------------------------------------------------------------
 
 
-@router.post("/generate-from-book")
+@router.post("/generate-from-book", response_model=GenerateQuizFromBookResponse)
 async def generate_quiz_from_book(
     body: GenerateQuizFromBookRequest,
     current_user: dict = Depends(track_ai_usage),
     tier: str = Depends(get_subscription_tier),
-) -> dict:
+) -> GenerateQuizFromBookResponse:
     """Generate quiz questions from full book content. Plus+ only."""
     if tier == "free":
         raise HTTPException(status_code=403, detail="Book-wide quiz generation requires Plus or Pro.")
@@ -564,7 +669,26 @@ async def generate_quiz_from_book(
     if question_limit:
         parsed = parsed[:question_limit]
 
-    return {"questions": parsed}
+    questions: list[GeneratedQuizQuestion] = []
+    for item in parsed:
+        normalized = _normalize_quiz_question(item)
+        if normalized is not None:
+            questions.append(normalized)
+
+    dropped = len(parsed) - len(questions)
+    if dropped:
+        logger.warning(
+            f"[generate_quiz_from_book] Dropped {dropped}/{len(parsed)} malformed questions "
+            f"(missing question text or fewer than 2 options)."
+        )
+
+    if not questions:
+        logger.error(
+            f"[generate_quiz_from_book] No usable questions after normalisation. Raw: {raw_text[:500]}"
+        )
+        raise HTTPException(status_code=502, detail="AI returned unexpected format. Please try again.")
+
+    return GenerateQuizFromBookResponse(questions=questions)
 
 
 # ---------------------------------------------------------------------------

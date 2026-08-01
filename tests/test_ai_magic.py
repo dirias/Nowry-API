@@ -541,15 +541,194 @@ async def test_generate_quiz_from_book_plus_success(mock_books_collection, mock_
 
     with patch("app.routers.quiz_ai.books_collection") as mock_col:
         mock_col.find_one = AsyncMock(return_value=book_doc)
-        with patch("app.routers.quiz_ai.Gemini_client", return_value=mock_gemini_instance):
+        with patch("app.routers.quiz_ai.get_client_for_tier", return_value=mock_gemini_instance):
             result = await generate_quiz_from_book(
                 body=body,
                 current_user=mock_user_doc_plus,
                 tier="plus",
             )
 
-    assert "questions" in result
-    assert len(result["questions"]) > 0
+    assert len(result.questions) == 2
+
+    # QUIZ-02 regression: the frontend QuestionnaireModal reads
+    # `options` / `answer`. The prompt emits `correct_answer` +
+    # `incorrect_answers`, so the router MUST normalise — otherwise every
+    # option list renders empty.
+    for question in result.questions:
+        assert len(question.options) == 4, "options must be materialised from correct + incorrect answers"
+        assert question.answer in question.options, "the correct answer must be selectable"
+
+    assert result.questions[0].answer == "Food from sunlight"
+    assert sorted(result.questions[0].options) == sorted(["Food from sunlight", "A", "B", "C"])
+
+
+@pytest.mark.asyncio
+async def test_generate_quiz_from_book_live_prompt_shape_serialises_options(
+    mock_books_collection, mock_user_doc_plus
+):
+    """QUIZ-02 regression, reproducing the reported bug exactly.
+
+    The prompt actually served at runtime (confirmed from the prewarm
+    write-through in app/config/langfuse_cache.json) asks for:
+
+        'question', 'correct_answer', 'incorrect_answers' (list of 3), 'difficulty'
+
+    The old router returned that verbatim, so the JSON on the wire had no
+    `options` key at all and QuestionnaireModal rendered an empty list.
+    This asserts on the SERIALISED body — what the browser actually receives.
+    """
+    import json as _json
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from app.models.book_generation import GenerateQuizFromBookRequest
+    from app.routers.quiz_ai import generate_quiz_from_book
+
+    body = GenerateQuizFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    book_doc = {
+        "_id": "60b8d295f1d2c17f4e4b1234",
+        "user_id": "507f1f77bcf86cd799439011",
+        "full_content": "JLPT N2 grammar notes.",
+        "deleted_at": None,
+    }
+
+    # Verbatim live-prompt shape, with the user's real JLPT content.
+    quiz_json = _json.dumps([
+        {
+            "question": "私の研究テーマは、日本______自動車産業の発展です。",
+            "correct_answer": "における",
+            "incorrect_answers": ["にとって", "によって", "につれて"],
+            "difficulty": "Medium",
+        },
+        {
+            "question": "注意事項をよく______、お申込みください。",
+            "correct_answer": "お読みの上",
+            "incorrect_answers": ["読むの上", "お読みのため", "読んでの上"],
+            "difficulty": "Hard",
+        },
+    ])
+
+    mock_client = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = quiz_json
+    mock_client.request.return_value = mock_shim
+
+    with patch("app.routers.quiz_ai.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=book_doc)
+        with patch("app.routers.quiz_ai.get_client_for_tier", return_value=mock_client):
+            result = await generate_quiz_from_book(
+                body=body,
+                current_user=mock_user_doc_plus,
+                tier="plus",
+            )
+
+    # The wire body, exactly as FastAPI serialises it for the browser.
+    payload = result.model_dump(mode="json")
+
+    assert len(payload["questions"]) == 2
+    for item in payload["questions"]:
+        assert "options" in item, "the browser must receive an `options` key"
+        assert len(item["options"]) == 4
+        assert item["answer"] in item["options"]
+        # QuestionnaireModal filters to non-empty strings — none may be blank.
+        assert all(isinstance(o, str) and o.strip() for o in item["options"])
+
+    first = payload["questions"][0]
+    assert first["answer"] == "における"
+    assert sorted(first["options"]) == sorted(["における", "にとって", "によって", "につれて"])
+
+
+@pytest.mark.asyncio
+async def test_generate_quiz_from_book_canonical_shape_passthrough(mock_books_collection, mock_user_doc_plus):
+    """QUIZ-02: questions already in `options`/`answer` shape survive untouched,
+    while entries with no usable options are dropped rather than rendered empty."""
+    import json as _json
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from app.models.book_generation import GenerateQuizFromBookRequest
+    from app.routers.quiz_ai import generate_quiz_from_book
+
+    body = GenerateQuizFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    book_doc = {
+        "_id": "60b8d295f1d2c17f4e4b1234",
+        "user_id": "507f1f77bcf86cd799439011",
+        "full_content": "Plain text book body about Japanese grammar.",
+        "deleted_at": None,
+    }
+
+    quiz_json = _json.dumps([
+        {
+            "question": "私の研究テーマは、日本______自動車産業の発展です。",
+            "options": ["における", "にとって", "によって", "につれて"],
+            "answer": "における",
+            "explanation": "における marks a location or field.",
+        },
+        # Unusable: no options and no distractors to build them from.
+        {"question": "Broken question", "answer": "only-answer"},
+        # Unusable: no question text.
+        {"options": ["a", "b", "c", "d"], "answer": "a"},
+    ])
+
+    mock_client = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = quiz_json
+    mock_client.request.return_value = mock_shim
+
+    with patch("app.routers.quiz_ai.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=book_doc)
+        with patch("app.routers.quiz_ai.get_client_for_tier", return_value=mock_client):
+            result = await generate_quiz_from_book(
+                body=body,
+                current_user=mock_user_doc_plus,
+                tier="plus",
+            )
+
+    assert len(result.questions) == 1
+    only = result.questions[0]
+    assert only.options == ["における", "にとって", "によって", "につれて"]
+    assert only.answer == "における"
+    assert only.explanation == "における marks a location or field."
+
+
+@pytest.mark.asyncio
+async def test_generate_quiz_from_book_all_malformed_502(mock_books_collection, mock_user_doc_plus):
+    """QUIZ-02: if nothing normalises into a usable question, fail loudly with
+    502 instead of handing the UI a list of option-less questions."""
+    import json as _json
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from fastapi import HTTPException
+    from app.models.book_generation import GenerateQuizFromBookRequest
+    from app.routers.quiz_ai import generate_quiz_from_book
+
+    body = GenerateQuizFromBookRequest(book_id="60b8d295f1d2c17f4e4b1234")
+
+    book_doc = {
+        "_id": "60b8d295f1d2c17f4e4b1234",
+        "user_id": "507f1f77bcf86cd799439011",
+        "full_content": "Some book text.",
+        "deleted_at": None,
+    }
+
+    quiz_json = _json.dumps([{"question": "No options at all", "answer": "x"}])
+
+    mock_client = MagicMock()
+    mock_shim = MagicMock()
+    mock_shim.choices = [MagicMock()]
+    mock_shim.choices[0].message.content = quiz_json
+    mock_client.request.return_value = mock_shim
+
+    with patch("app.routers.quiz_ai.books_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=book_doc)
+        with patch("app.routers.quiz_ai.get_client_for_tier", return_value=mock_client):
+            with pytest.raises(HTTPException) as exc_info:
+                await generate_quiz_from_book(
+                    body=body,
+                    current_user=mock_user_doc_plus,
+                    tier="plus",
+                )
+
+    assert exc_info.value.status_code == 502
 
 
 # ─────────────────────────────────────────────────────────────────────────────

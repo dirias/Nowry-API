@@ -11,6 +11,22 @@ from app.config.subscription_plans import AGENT_MODELS
 
 logger = get_logger(__name__)
 
+
+class ToolCallRejectedError(Exception):
+    """Raised by a tool dispatcher to veto a model-initiated tool call.
+
+    Signals the provider loop that the attempted call must be discarded and the
+    turn re-run WITHOUT the rejected tool, so the model answers the user's
+    message directly instead. This is a control-flow signal, not a failure —
+    it must never surface to the end user.
+    """
+
+    def __init__(self, tool_name: str, reason: str) -> None:
+        self.tool_name = tool_name
+        self.reason = reason
+        super().__init__(f"{tool_name}: {reason}")
+
+
 class AgentLLM:
     """
     Unified LLM interface for the Study Buddy.
@@ -156,7 +172,21 @@ class AgentLLM:
                 fn_name = fn_call.name
                 fn_args = dict(fn_call.args)
                 logger.info(f"[Gemini Tool] Calling {fn_name} with {fn_args}")
-                result_str = await tool_dispatcher(fn_name, fn_args, user_id)
+                try:
+                    result_str = await tool_dispatcher(fn_name, fn_args, user_id)
+                except ToolCallRejectedError as rej:
+                    logger.warning(
+                        "[Gemini] Server-side gate rejected tool '%s' (%s) — "
+                        "instructing the model to answer directly.",
+                        fn_name, rej.reason,
+                    )
+                    result_str = json.dumps({
+                        "error": (
+                            f"Tool call rejected: {rej.reason} "
+                            "Do not call this tool again this turn. Answer the "
+                            "user's message directly with text instead."
+                        )
+                    })
                 tool_results.append(
                     genai.protos.Part(
                         function_response=genai.protos.FunctionResponse(
@@ -169,6 +199,42 @@ class AgentLLM:
             rounds += 1
             
         return response.text
+
+    async def intent_yes_no(self, instruction: str, user_message: str) -> Optional[bool]:
+        """Tiny, cheap YES/NO classification of a single user message.
+
+        Used for deterministic server-side tool gating (e.g. "does this message
+        explicitly ask to be quizzed?"). Returns True for YES, False for NO, and
+        None when the classifier is unavailable, errors, or produces an
+        unparseable verdict — the CALLER decides the fail-open/fail-closed
+        policy for None.
+
+        Runs on Groq only (the provider this gate exists to police). Uses
+        GROQ_INTENT_MODEL when set, otherwise the main chat model — same
+        availability guarantees, negligible cost at ~5 output tokens.
+        """
+        if not self.groq_client:
+            return None
+        try:
+            intent_model = os.getenv("GROQ_INTENT_MODEL") or self.groq_model
+            completion = self.groq_client.chat.completions.create(
+                model=intent_model,
+                messages=[
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0,
+                max_completion_tokens=256,  # headroom for reasoning models (gpt-oss)
+            )
+            content = (completion.choices[0].message.content or "").strip()
+            match = re.search(r"\b(YES|NO)\b", content.upper())
+            if match:
+                return match.group(1) == "YES"
+            logger.warning(f"[AgentLLM] intent_yes_no unparseable verdict: {content!r}")
+            return None
+        except Exception as exc:
+            logger.warning(f"[AgentLLM] intent_yes_no classifier failed: {exc}")
+            return None
 
     @staticmethod
     def _is_tool_use_failed(exc: Exception) -> bool:
@@ -305,26 +371,50 @@ class AgentLLM:
                         "I wasn't able to retrieve that information right now. Please try again."
                     )
 
+            assistant_msg_index = len(messages)
             messages.append(response_message)
 
             if not response_message.tool_calls:
                 return self._strip_function_calls(response_message.content)
 
             # Handle tool calls
+            rejected_tool: Optional[str] = None
             for tool_call in response_message.tool_calls:
                 fn_name = tool_call.function.name
                 fn_args = json.loads(tool_call.function.arguments)
-                
+
                 logger.info(f"[Groq Tool] Calling {fn_name} with {fn_args}")
-                result_str = await tool_dispatcher(fn_name, fn_args, user_id)
-                
+                try:
+                    result_str = await tool_dispatcher(fn_name, fn_args, user_id)
+                except ToolCallRejectedError as rej:
+                    rejected_tool = fn_name
+                    logger.warning(
+                        "[Groq] Server-side gate rejected tool '%s' (%s) — "
+                        "re-running the turn without that tool.",
+                        fn_name, rej.reason,
+                    )
+                    break
+
                 messages.append({
                     "tool_call_id": tool_call.id,
                     "role": "tool",
                     "name": fn_name,
                     "content": result_str,
                 })
-            
+
+            if rejected_tool is not None:
+                # Discard the vetoed assistant tool-call message (and any tool
+                # results appended this round), remove the rejected tool from the
+                # request, and re-run the turn — the model then answers directly.
+                # Tools are restored on the next request; this is per-turn only.
+                del messages[assistant_msg_index:]
+                openai_tools = [
+                    t for t in (openai_tools or [])
+                    if t["function"]["name"] != rejected_tool
+                ] or None
+                rounds += 1
+                continue
+
             rounds += 1
             
         return self._strip_function_calls(

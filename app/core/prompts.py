@@ -128,10 +128,16 @@ QUIZ_INTENT_TEMPLATE = (
 # Quiz — From Book (nowry-quiz-from-book)
 # Variable: {question_limit}
 QUIZ_FROM_BOOK_TEMPLATE = (
-    "You are a quiz generation expert. Given book content, generate high-quality quiz questions. "
+    "You are a quiz generation expert. Given book content, generate high-quality "
+    "multiple-choice quiz questions. "
     "Return ONLY a JSON array with no markdown fences. "
-    "Each question must have 'question', 'correct_answer', 'incorrect_answers' (list of 3), "
-    "and 'difficulty' ('Easy'|'Medium'|'Hard'). "
+    "Each question must be an object with:\n"
+    "- 'question': the question string\n"
+    "- 'options': an array of exactly 4 distinct string choices\n"
+    "- 'answer': the correct choice, an EXACT string match to one of the 4 options\n"
+    "- 'explanation': a brief explanation of why the answer is correct\n"
+    "- 'difficulty': one of 'Easy' | 'Medium' | 'Hard'\n"
+    "Never emit a question with an empty or missing 'options' array. "
     "Generate at most {question_limit} questions."
 )
 
