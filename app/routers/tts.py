@@ -9,6 +9,8 @@ from __future__ import annotations
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
+from google.api_core import exceptions as google_api_exceptions
+from google.auth import exceptions as google_auth_exceptions
 from google.cloud import texttospeech
 
 from app.ai_orchestrator.llm_clients.tts_client import get_tts_client
@@ -30,7 +32,21 @@ router = APIRouter(
     dependencies=[Depends(get_firebase_user)],
 )
 
-_TTS_TEXT_CAP = 5000  # Safety cap: Google Cloud TTS max is 5000 bytes
+_TTS_TEXT_CAP_BYTES = 5000  # Safety cap: Google Cloud TTS max is 5000 UTF-8 bytes
+
+
+def _truncate_to_byte_limit(text: str, max_bytes: int) -> str:
+    """Truncate text to at most `max_bytes` when UTF-8 encoded.
+
+    Slicing by character count (e.g. text[:5000]) can still exceed the byte
+    limit for non-ASCII text (accents, CJK, emoji), which Google Cloud TTS
+    rejects with an InvalidArgument error. Truncating on the encoded bytes
+    and decoding with errors="ignore" guarantees the result fits.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 @router.post("/{book_id}/tts")
@@ -52,13 +68,24 @@ async def generate_tts(
 
     user_id: str = current_user.get("user_id", "")
 
-    # Ownership check (T-6-04)
+    # Validate the book_id format first — malformed IDs are a client error (400).
     try:
-        book = await books_collection.find_one(
-            {"_id": ObjectId(book_id), "deleted_at": None}
-        )
+        book_object_id = ObjectId(book_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid book ID.")
+
+    # Ownership check (T-6-04). A failure here (e.g. a transient Mongo error)
+    # is a server-side problem, not a malformed ID — log it with a traceback so
+    # it's diagnosable in Railway logs instead of being silently misreported.
+    try:
+        book = await books_collection.find_one(
+            {"_id": book_object_id, "deleted_at": None}
+        )
+    except Exception as exc:
+        logger.exception(f"[tts] book lookup failed for book_id={book_id}: {exc}")
+        raise HTTPException(
+            status_code=500, detail="Unable to load book. Please try again."
+        )
 
     if not book or book.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Book not found.")
@@ -66,8 +93,11 @@ async def generate_tts(
     # Pro-only language override; Plus always uses en-US (T-6-02 mitigation)
     language_code: str = body.language_code if tier == "pro" else "en-US"
 
-    # Sanitize input — plain text only, no SSML (T-6-03 mitigation)
-    text_input: str = body.text[:_TTS_TEXT_CAP]
+    # Sanitize input — plain text only, no SSML (T-6-03 mitigation).
+    # Truncated by UTF-8 byte count, not character count: Google Cloud TTS's
+    # 5000-byte limit applies to the encoded text, and non-ASCII text can
+    # exceed 5000 bytes well before 5000 characters.
+    text_input: str = _truncate_to_byte_limit(body.text, _TTS_TEXT_CAP_BYTES)
 
     client = get_langfuse_client()
     trace_metadata = {
@@ -146,6 +176,39 @@ async def generate_tts(
             content=tts_response.audio_content,
             media_type="audio/mpeg",
         )
+    except google_auth_exceptions.GoogleAuthError as exc:
+        # Missing/invalid GOOGLE_TTS_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS
+        # (no Application Default Credentials available in this environment).
+        # logger.exception captures the full traceback for Railway logs; the
+        # client only gets a generic message — the credentials detail is not
+        # something the caller can act on and shouldn't be exposed.
+        logger.exception(
+            f"[tts] Google credentials misconfigured for book={book_id} tier={tier}: {exc}"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="TTS service is temporarily unavailable. Please try again later.",
+        )
+    except google_api_exceptions.InvalidArgument as exc:
+        # e.g. text still rejected by Google despite our byte-length cap.
+        logger.exception(
+            f"[tts] Google TTS rejected input for book={book_id} tier={tier}: {exc}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="This section could not be converted to audio. Try a shorter section.",
+        )
+    except google_api_exceptions.GoogleAPICallError as exc:
+        logger.exception(
+            f"[tts] Google TTS API call failed for book={book_id} tier={tier}: {exc}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="TTS service is temporarily unavailable. Please try again later.",
+        )
     except Exception as exc:
-        logger.error(f"[tts] synthesis failed for book={book_id} tier={tier}: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception(f"[tts] synthesis failed for book={book_id} tier={tier}: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Audio generation failed. Please try again.",
+        )

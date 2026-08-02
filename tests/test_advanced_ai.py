@@ -35,6 +35,28 @@ def _ensure_advanced_ai_importable() -> None:
         sys.modules["google.oauth2"] = MagicMock()
     if "google.oauth2.service_account" not in sys.modules:
         sys.modules["google.oauth2.service_account"] = MagicMock()
+    # app/routers/tts.py catches specific google.api_core / google.auth exception
+    # types — these must be real Exception subclasses (not MagicMock attributes),
+    # since `except SomeType:` requires SomeType to inherit from BaseException.
+    if "google.api_core" not in sys.modules:
+        sys.modules["google.api_core"] = MagicMock()
+    if "google.api_core.exceptions" not in sys.modules:
+        api_core_exceptions_stub = MagicMock()
+        api_core_exceptions_stub.GoogleAPICallError = type(
+            "GoogleAPICallError", (Exception,), {}
+        )
+        api_core_exceptions_stub.InvalidArgument = type(
+            "InvalidArgument", (api_core_exceptions_stub.GoogleAPICallError,), {}
+        )
+        sys.modules["google.api_core.exceptions"] = api_core_exceptions_stub
+    if "google.auth" not in sys.modules:
+        sys.modules["google.auth"] = MagicMock()
+    if "google.auth.exceptions" not in sys.modules:
+        auth_exceptions_stub = MagicMock()
+        auth_exceptions_stub.GoogleAuthError = type(
+            "GoogleAuthError", (Exception,), {}
+        )
+        sys.modules["google.auth.exceptions"] = auth_exceptions_stub
     mock_firebase = MagicMock()
     mock_firebase.get_firebase_user = MagicMock()
     sys.modules.setdefault("app.auth.firebase_auth", mock_firebase)
