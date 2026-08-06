@@ -36,6 +36,7 @@ from app.auth.dependencies import get_subscription_tier, track_ai_usage
 from app.core.langfuse_client import get_langfuse_client
 from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core import prompt_manager
+from app.core import prompts as _prompts
 from app.config.database import (
     ai_quiz_sessions_collection,
     books_collection,
@@ -606,6 +607,7 @@ async def generate_quiz_from_book(
         "nowry-quiz-from-book",
         question_limit=question_limit if question_limit else "as many as appropriate",
     )
+    system_prompt = f"{system_prompt}\n\n{_prompts.MATH_NOTATION_INSTRUCTION}"
     user_prompt = f"Book content:\n{plain_text}"
 
     client = get_langfuse_client()

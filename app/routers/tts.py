@@ -19,6 +19,7 @@ from app.auth.firebase_auth import get_firebase_user
 from app.config.database import books_collection
 from app.models.tts import TTSRequest
 from app.utils.logger import get_logger
+from app.utils.rate_limit import enforce_user_rate_limit
 from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
 import contextlib
@@ -33,6 +34,14 @@ router = APIRouter(
 )
 
 _TTS_TEXT_CAP_BYTES = 5000  # Safety cap: Google Cloud TTS max is 5000 UTF-8 bytes
+
+# Per-user request volume cap. This route can synthesise from any *public* book,
+# not just the caller's own, so a Plus account could otherwise drive unbounded
+# Google Cloud TTS spend (billed per character) over community content.
+# _TTS_TEXT_CAP_BYTES bounds the cost of one request; this bounds how many.
+_TTS_RATE_LIMIT_MAX_REQUESTS = 60
+_TTS_RATE_LIMIT_WINDOW_SECONDS = 3600
+_TTS_RATE_LIMIT_DETAIL = "Too many audio requests. Please wait a moment."
 
 
 def _truncate_to_byte_limit(text: str, max_bytes: int) -> str:
@@ -74,12 +83,31 @@ async def generate_tts(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid book ID.")
 
-    # Ownership check (T-6-04). A failure here (e.g. a transient Mongo error)
-    # is a server-side problem, not a malformed ID — log it with a traceback so
-    # it's diagnosable in Railway logs instead of being silently misreported.
+    # Access check (T-6-04). The caller may read a book they own OR any book
+    # published to the community browse surface (is_public), so that "Listen"
+    # works on public content before it is forked — a fork already produces a
+    # copy owned by the forker, so the pre-fork read was the only gap.
+    # Mirrors require_public_or_ownership() in app/auth/dependencies.py.
+    #
+    # The predicate lives in the query, not in Python, so a private book owned
+    # by someone else is never loaded into this process at all. deleted_at:None
+    # still applies to BOTH branches — a soft-deleted public book stays a 404.
+    #
+    # Projected down to the access-control and tracing fields: the caller sends
+    # its own text, so nothing here needs `full_content`, which is the entire
+    # body of the book and is now fetchable for public books too.
+    #
+    # A failure here (e.g. a transient Mongo error) is a server-side problem,
+    # not a malformed ID — log it with a traceback so it's diagnosable in
+    # Railway logs instead of being silently misreported.
     try:
         book = await books_collection.find_one(
-            {"_id": book_object_id, "deleted_at": None}
+            {
+                "_id": book_object_id,
+                "deleted_at": None,
+                "$or": [{"user_id": user_id}, {"is_public": True}],
+            },
+            {"user_id": 1, "is_public": 1},
         )
     except Exception as exc:
         logger.exception(f"[tts] book lookup failed for book_id={book_id}: {exc}")
@@ -87,8 +115,24 @@ async def generate_tts(
             status_code=500, detail="Unable to load book. Please try again."
         )
 
-    if not book or book.get("user_id") != user_id:
+    # Deliberately 404, never 403: a 403 would confirm to a stranger that a
+    # given private book exists. Missing, soft-deleted, and inaccessible are
+    # indistinguishable to the caller by design — do not "improve" this.
+    if not book:
         raise HTTPException(status_code=404, detail="Book not found.")
+
+    owner_id: str = str(book.get("user_id") or "")
+    is_public_book: bool = bool(book.get("is_public", False))
+
+    # Volume cap, applied once the request is known to be authorised and about
+    # to reach the paid provider. Raises 429.
+    await enforce_user_rate_limit(
+        user_id=user_id,
+        feature="tts_amagic",
+        limit=_TTS_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=_TTS_RATE_LIMIT_WINDOW_SECONDS,
+        detail=_TTS_RATE_LIMIT_DETAIL,
+    )
 
     # Pro-only language override; Plus always uses en-US (T-6-02 mitigation)
     language_code: str = body.language_code if tier == "pro" else "en-US"
@@ -106,6 +150,12 @@ async def generate_tts(
         "user_id": user_id,
         "language_code": language_code,
         "input_char_count": len(text_input),
+        # Attribute non-owner usage: is_owner=False with is_public=True is the
+        # community-browse path, and owner_id identifies whose public book is
+        # driving the spend.
+        "is_public": is_public_book,
+        "owner_id": owner_id,
+        "is_owner": owner_id == user_id,
     }
 
     try:

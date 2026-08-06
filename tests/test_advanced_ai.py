@@ -316,7 +316,8 @@ async def test_tts_plus_returns_audio(mock_book_doc_with_counter, mock_user_doc_
     body = TTSRequest(text="Hello world", language_code="en-US")
     user = {"user_id": "507f1f77bcf86cd799439011"}
 
-    with patch("app.routers.tts.books_collection") as mock_col:
+    with patch("app.routers.tts.books_collection") as mock_col, \
+         patch("app.routers.tts.enforce_user_rate_limit", new=AsyncMock(return_value=1)):
         mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
         with patch("app.routers.tts.get_tts_client", return_value=mock_tts_client):
             response = await generate_tts(
@@ -346,7 +347,8 @@ async def test_tts_pro_language_code(mock_book_doc_with_counter, mock_user_doc_p
 
     mock_texttospeech = MagicMock()
 
-    with patch("app.routers.tts.books_collection") as mock_col:
+    with patch("app.routers.tts.books_collection") as mock_col, \
+         patch("app.routers.tts.enforce_user_rate_limit", new=AsyncMock(return_value=1)):
         mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
         with patch("app.routers.tts.get_tts_client", return_value=mock_tts_client):
             with patch("app.routers.tts.texttospeech", mock_texttospeech):

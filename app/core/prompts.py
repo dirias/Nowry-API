@@ -1,5 +1,13 @@
 # Centralized prompt templates for the application
 
+# Shared instruction appended to book-wide generation prompts (cards, quiz) so AI-generated
+# math notation/symbols/arrows reliably trigger the frontend's single-$-delimiter LaTeX renderer.
+MATH_NOTATION_INSTRUCTION = (
+    "When the content includes mathematical notation, symbols, or arrows (e.g. →, ∈, ≠), "
+    "always wrap them in single dollar-sign LaTeX delimiters, e.g. $\\rightarrow$ — do not use "
+    "\\(...\\), \\[...\\], or double $$...$$ delimiters."
+)
+
 # RAG / Card Generation
 # {card_count_instruction} is built per-request by the rag text_node:
 #   fixed mode    -> "Generate exactly N cards."

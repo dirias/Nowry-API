@@ -18,6 +18,7 @@ from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
 from app.core import prompt_manager
+from app.core import prompts as _prompts
 from app.models.StudyCard import StudyCard
 from app.models.CardGenerationRequest import (
     CardGenerationRequest,
@@ -362,6 +363,7 @@ async def generate_cards_from_book(
         "nowry-book-cards",
         card_limit=card_limit if card_limit else "as many as appropriate",
     )
+    system_prompt = f"{system_prompt}\n\n{_prompts.MATH_NOTATION_INSTRUCTION}"
     user_prompt = f"Book content:\n{plain_text}"
 
     client = get_langfuse_client()

@@ -46,6 +46,10 @@ sheets_collection = db["sheets"]
 # Blackboards (Phase 7 multi-board)
 blackboards_collection = db["blackboards"]
 
+# Per-user fixed-window rate limit counters (app/utils/rate_limit.py).
+# Shared across Uvicorn workers; buckets self-purge via a TTL on expires_at.
+rate_limits_collection = db["rate_limits"]
+
 async def create_indexes():
     # User indexes
     await users_collection.create_index("firebase_uid", unique=True)
@@ -187,5 +191,12 @@ async def create_indexes():
     # Phase 7: Blackboard multi-board indexes
     await db.blackboards.create_index([("owner_user_id", 1)])
     await db.blackboards.create_index([("collaborators", 1)])
+
+    # Per-user rate limit buckets: expire each document at its own expires_at
+    # (expireAfterSeconds=0 means "delete once expires_at is in the past").
+    # Lookups are by _id, so no additional index is needed.
+    await rate_limits_collection.create_index(
+        "expires_at", expireAfterSeconds=0, name="rate_limit_ttl"
+    )
 
     logger.info("Database indexes created successfully.")
