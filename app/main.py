@@ -60,9 +60,11 @@ from app.routers import (
     stripe_webhooks,
     subscriptions,
     tts,
+    tts_segment,
     illustrations,
     sheets,
     goal_ai,
+    comments,
 )
 
 
@@ -152,9 +154,11 @@ app.include_router(quiz_ai.router, prefix="/v1/assistant/quiz", tags=["quiz"])  
 app.include_router(study_sessions.router, prefix="/v1/study-sessions", tags=["study-sessions"])  # Session history
 app.include_router(subscriptions.router)  # Stripe checkout, portal, and subscription status
 app.include_router(tts.router)            # AMagic TTS — POST /book/{book_id}/tts
+app.include_router(tts_segment.router)    # Language segmentation — POST /v1/tts/segment
 app.include_router(illustrations.router)  # Illustration Magic — POST /book/{book_id}/diagram
 app.include_router(sheets.router)         # Micro Sheets — CRUD /sheets
 app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (Pro-only)
+app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  # Text-anchored annotations
 
 
 @app.get("/")

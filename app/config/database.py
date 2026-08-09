@@ -46,6 +46,9 @@ sheets_collection = db["sheets"]
 # Blackboards (Phase 7 multi-board)
 blackboards_collection = db["blackboards"]
 
+# Comments — user-private, text-anchored annotations on a resource (Books first)
+comments_collection = db["comments"]
+
 # Per-user fixed-window rate limit counters (app/utils/rate_limit.py).
 # Shared across Uvicorn workers; buckets self-purge via a TTL on expires_at.
 rate_limits_collection = db["rate_limits"]
@@ -157,6 +160,7 @@ async def create_indexes():
         ("goals",         goals_collection),
         ("sheets",        sheets_collection),
         ("blackboards",   blackboards_collection),
+        ("comments",      comments_collection),
     ]
 
     for collection_name, collection in _collection_ttl_map:
@@ -191,6 +195,15 @@ async def create_indexes():
     # Phase 7: Blackboard multi-board indexes
     await db.blackboards.create_index([("owner_user_id", 1)])
     await db.blackboards.create_index([("collaborators", 1)])
+
+    # Comments: compound index for the per-user, per-resource privacy filter that
+    # every query in app/routers/comments.py enforces (resource + owner together —
+    # never resource alone, since shared/public books keep the same _id for every
+    # viewer and resource_id-only filtering would leak private notes cross-user).
+    await comments_collection.create_index(
+        [("resource_type", 1), ("resource_id", 1), ("user_id", 1)],
+        name="comments_resource_owner",
+    )
 
     # Per-user rate limit buckets: expire each document at its own expires_at
     # (expireAfterSeconds=0 means "delete once expires_at is in the past").

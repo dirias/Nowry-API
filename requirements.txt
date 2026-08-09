@@ -15,6 +15,14 @@ anthropic>=0.40.0
 google-generativeai>=0.7.2
 google-cloud-texttospeech==2.36.0
 google-auth>=2.0.0
+# Pinned (not >=) to 2.0.2: lingua-language-detector 2.1.0+ requires Python
+# >=3.10, and 2.2.0+ requires >=3.12 — this must import cleanly under both
+# the Python 3.9 local dev env and the Python 3.10 production image (see
+# Nowry-API/dockerfile). 2.0.2 is the newest release compatible with both.
+# NOTE: this is the official/maintained package (github.com/pemistahl/lingua-py),
+# imported as `lingua` — do not confuse with the unrelated "lingua-py" PyPI
+# package, a low-adoption third-party binding of the same underlying Rust lib.
+lingua-language-detector==2.0.2
 langgraph>=0.0.53
 langchain>=0.2.12
 langchain-core>=0.2.24
