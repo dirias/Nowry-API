@@ -73,11 +73,11 @@ The classifier library is published on PyPI as **`lingua-language-detector`**
 (imported as `import lingua`) — this is the actively maintained, official
 package (github.com/pemistahl/lingua-py), NOT the similarly-named
 `lingua-py` package (an unrelated, low-adoption third-party Rust binding).
-Pinned to `lingua-language-detector==2.0.2` in `requirements.txt`: newer 2.x
-releases (2.1.0+) raise the minimum Python version to 3.10 or 3.12, but this
-service must import cleanly under the Python 3.9 local dev environment as
-well as the Python 3.10 production image (see `Nowry-API/dockerfile`); 2.0.2
-is the newest release still compatible with both (`requires_python >=3.8`).
+Pinned to `lingua-language-detector==2.1.1` in `requirements.txt`, which
+requires Python >=3.10 — satisfying both the production image
+(`python:3.10-slim`, see `Nowry-API/dockerfile`) and the 3.13 build
+environment. 2.2.0+ requires >=3.12 and would break the production image.
+No release of this package supports Python 3.9.
 """
 from __future__ import annotations
 
