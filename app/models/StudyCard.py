@@ -1,8 +1,11 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from .types import PyObjectId
 from .mixins import SoftDeleteMixin
 from typing import List, Optional
 from datetime import datetime, timedelta
+
+MAX_TAG_LENGTH: int = 40
+MAX_TAGS_COUNT: int = 10
 
 
 class StudyCard(BaseModel, SoftDeleteMixin):
@@ -12,6 +15,34 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     title: str = Field(..., max_length=100)
     content: str
     tags: Optional[List[str]] = None
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+
+        trimmed_tags = [tag.strip() for tag in value]
+        non_empty_tags = [tag for tag in trimmed_tags if tag]
+
+        for tag in non_empty_tags:
+            if len(tag) > MAX_TAG_LENGTH:
+                raise ValueError(
+                    f"Tag '{tag}' exceeds maximum length of {MAX_TAG_LENGTH} characters"
+                )
+
+        deduped_tags: List[str] = []
+        seen_lowercase: set[str] = set()
+        for tag in non_empty_tags:
+            tag_lower = tag.lower()
+            if tag_lower not in seen_lowercase:
+                seen_lowercase.add(tag_lower)
+                deduped_tags.append(tag)
+
+        if len(deduped_tags) > MAX_TAGS_COUNT:
+            raise ValueError(f"A card cannot have more than {MAX_TAGS_COUNT} tags")
+
+        return deduped_tags
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     last_reviewed: Optional[datetime] = None

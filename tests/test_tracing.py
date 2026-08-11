@@ -1435,11 +1435,11 @@ def _patch_goal_ai_collections(goal_ai_module, fake_plan, fake_areas, fake_prior
 
 
 def _import_fresh_goal_ai():
-    """Re-import app.routers.goal_ai fresh -- _ensure_cards_importable() (called at
-    module level above) already stubs app.ai_orchestrator.llm_clients.gemini_client as a
-    MagicMock whose .Gemini_client(...) call returns a MagicMock without raising, so
-    goal_ai.py's module-level `_gemini_client = Gemini_client("models/gemini-pro-latest")`
-    succeeds without GEMINI_API_KEY."""
+    """Re-import app.routers.goal_ai fresh. The module no longer instantiates a Gemini
+    client at import time -- it resolves the Pro-tier singleton per request via
+    model_config.get_client_for_tier("pro"), which returns None (never raises) when
+    GEMINI_API_KEY is absent. Tests patch goal_ai.get_client_for_tier with a fake client,
+    matching the cards.py / quiz_ai.py / books.py test pattern above."""
     sys.modules.pop("app.routers.goal_ai", None)
     import app.routers.goal_ai as goal_ai_module
 
@@ -1462,13 +1462,17 @@ async def test_analyze_goals_happy_path_traces_goal_ai(mock_langfuse_client):
         '"milestones": ["Run 15k"], "rationale": "Build on 10k progress"}], '
         '"conflicts": [], "archiving_recommendations": []}'
     )
-    goal_ai_module._gemini_client.request = MagicMock(
+    fake_llm_client = MagicMock()
+    fake_llm_client.request = MagicMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=valid_json))])
     )
 
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(goal_ai_module, "get_langfuse_client", return_value=mock_langfuse_client)
+        )
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_client_for_tier", return_value=fake_llm_client)
         )
         mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
         for p in col_patches:
@@ -1503,13 +1507,17 @@ async def test_analyze_goals_format_valid_false_on_parse_error(mock_langfuse_cli
         goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
     )
 
-    goal_ai_module._gemini_client.request = MagicMock(
+    fake_llm_client = MagicMock()
+    fake_llm_client.request = MagicMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="not json at all"))])
     )
 
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(goal_ai_module, "get_langfuse_client", return_value=mock_langfuse_client)
+        )
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_client_for_tier", return_value=fake_llm_client)
         )
         mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
         for p in col_patches:
@@ -1541,13 +1549,17 @@ async def test_analyze_goals_format_valid_false_on_non_dict_json(mock_langfuse_c
         goal_ai_module, fake_plan, fake_areas, fake_priorities, fake_goals
     )
 
-    goal_ai_module._gemini_client.request = MagicMock(
+    fake_llm_client = MagicMock()
+    fake_llm_client.request = MagicMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="[1, 2, 3]"))])
     )
 
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(goal_ai_module, "get_langfuse_client", return_value=mock_langfuse_client)
+        )
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_client_for_tier", return_value=fake_llm_client)
         )
         mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
         for p in col_patches:
@@ -1580,13 +1592,17 @@ async def test_analyze_goals_langfuse_unreachable_falls_back(broken_langfuse_cli
     valid_json = (
         '{"suggestions": [], "conflicts": [], "archiving_recommendations": []}'
     )
-    goal_ai_module._gemini_client.request = MagicMock(
+    fake_llm_client = MagicMock()
+    fake_llm_client.request = MagicMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=valid_json))])
     )
 
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(goal_ai_module, "get_langfuse_client", return_value=broken_langfuse_client)
+        )
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_client_for_tier", return_value=fake_llm_client)
         )
         for p in col_patches:
             stack.enter_context(p)
@@ -1616,12 +1632,16 @@ async def test_analyze_goals_langfuse_disabled_untraced():
     valid_json = (
         '{"suggestions": [], "conflicts": [], "archiving_recommendations": []}'
     )
-    goal_ai_module._gemini_client.request = MagicMock(
+    fake_llm_client = MagicMock()
+    fake_llm_client.request = MagicMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=valid_json))])
     )
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(goal_ai_module, "get_langfuse_client", return_value=None))
+        stack.enter_context(
+            patch.object(goal_ai_module, "get_client_for_tier", return_value=fake_llm_client)
+        )
         mock_score = stack.enter_context(patch.object(goal_ai_module, "score_trace"))
         for p in col_patches:
             stack.enter_context(p)

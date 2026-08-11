@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -80,14 +80,33 @@ async def create_deck(
 
 @router.get("", summary="List all decks", response_model=List[DeckWithStats])
 async def list_decks(
+    type: Optional[Literal["flashcard", "quiz", "visual"]] = Query(
+        default=None,
+        description="Filter decks by deck_type. Omit to return all types (used by content-library views).",
+    ),
     collection: Collection = Depends(get_decks_collection),
     user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
-    logger.info(f"Listing decks for user: {user_id}")
+    logger.info(f"Listing decks for user: {user_id} (type filter: {type})")
 
     # Filter by user_id to ensure users only see their own decks
-    cursor = collection.find({"user_id": user_id, "deleted_at": None})
+    base_filter: dict = {"user_id": user_id, "deleted_at": None}
+
+    if type == "flashcard":
+        # Legacy decks predate the deck_type field entirely, or may have it
+        # explicitly set to null — both should still count as "flashcard".
+        base_filter["$or"] = [
+            {"deck_type": "flashcard"},
+            {"deck_type": {"$exists": False}},
+            {"deck_type": None},
+        ]
+    elif type is not None:
+        # quiz / visual never existed prior to the deck_type field, so an
+        # exact match is sufficient — no legacy fallback needed.
+        base_filter["deck_type"] = type
+
+    cursor = collection.find(base_filter)
     decks = await cursor.to_list(length=100)
 
     now_dt = datetime.now(timezone.utc).replace(tzinfo=None)

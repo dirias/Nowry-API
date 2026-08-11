@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 # Load env before importing other modules that rely on env vars
 load_dotenv()
 
+from app.config.environment import get_environment, is_production
+
 # Initialize Sentry BEFORE FastAPI app creation — gated on env var presence
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -15,8 +17,8 @@ if _SENTRY_DSN:
         integrations=[
             FastApiIntegration(),
         ],
-        traces_sample_rate=0.1 if os.getenv("ENVIRONMENT") == "production" else 1.0,
-        environment=os.getenv("ENVIRONMENT", "development"),
+        traces_sample_rate=0.1 if is_production() else 1.0,
+        environment=get_environment(),
         debug=False,
     )
 

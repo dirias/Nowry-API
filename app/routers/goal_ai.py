@@ -15,7 +15,7 @@ from app.config.database import (
     priorities_collection,
     goals_collection,
 )
-from app.ai_orchestrator.llm_clients.gemini_client import Gemini_client
+from app.core.model_config import get_client_for_tier
 from app.models.goal_ai import (
     GoalAnalysisRequest,
     GoalAnalysisResponse,
@@ -30,8 +30,6 @@ from langfuse import propagate_attributes
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/goal-ai", tags=["goal-ai"])
-
-_gemini_client = Gemini_client("models/gemini-pro-latest")
 
 _SYSTEM_PROMPT = """You are an expert annual planning coach. Analyze the user's annual plan and return a JSON object with exactly three fields:
 - "suggestions": list of quarterly goal suggestions, each with keys: goal_title (str), quarter (int 1-4), milestones (list of str), rationale (str)
@@ -146,6 +144,13 @@ async def analyze_goals(
     plan_summary = _serialize_plan(areas, priorities, goal_lists)
     combined_prompt = f"{_SYSTEM_PROMPT}\n\n{plan_summary}"
 
+    # Goal AI is Pro-only (D-06) — always the Gemini Pro singleton. Resolved per
+    # request (not at import time) so the router imports without GEMINI_API_KEY;
+    # model_config returns None instead of raising when the key is absent.
+    llm_client = get_client_for_tier("pro")
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
+
     client = get_langfuse_client()
     model_name = "models/gemini-pro-latest"  # Goal AI is Pro-only (D-06)
     trace_metadata = {
@@ -195,7 +200,7 @@ async def analyze_goals(
             # (unhandled 500), matching the untraced/disabled-client paths below,
             # instead of being logged as a Langfuse failure and re-issuing a
             # second paid call.
-            response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
+            response = await asyncio.to_thread(llm_client.request, combined_prompt)
             raw_text = response.choices[0].message.content
             raw_text = re.sub(r"^```json\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
 
@@ -236,7 +241,7 @@ async def analyze_goals(
         return result
     else:
         # client is None -- Langfuse disabled (untraced path, identical to pre-Phase-13 behavior)
-        response = await asyncio.to_thread(_gemini_client.request, combined_prompt)
+        response = await asyncio.to_thread(llm_client.request, combined_prompt)
         raw_text = re.sub(
             r"^```json\n?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE
         )

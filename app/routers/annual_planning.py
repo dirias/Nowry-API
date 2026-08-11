@@ -667,8 +667,9 @@ async def create_focus_area(
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(focus_area.annual_plan_id, user_id)
     
-    # Check limit (max 3)
-    count = await focus_areas_collection.count_documents({"annual_plan_id": focus_area.annual_plan_id})
+    # Check limit (max 3) — must match the same not-deleted filter used everywhere else,
+    # otherwise soft-deleted areas keep counting against the limit forever.
+    count = await focus_areas_collection.count_documents({"annual_plan_id": focus_area.annual_plan_id, "deleted_at": None})
     if count >= 3:
         raise HTTPException(status_code=400, detail="Maximum 3 focus areas allowed")
         
