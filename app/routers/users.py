@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 from pymongo.collection import Collection
 from bson import ObjectId
+from bson.errors import InvalidId
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, List
 import bcrypt
@@ -19,7 +20,17 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-from app.models.User import User
+from app.models.User import (
+    RECORDABLE_ONBOARDING_POINTS,
+    OnboardingPoint,
+    OnboardingState,
+    OnboardingStatus,
+    User,
+    later_onboarding_point,
+    normalize_onboarding_state,
+    onboarding_resume_screen,
+    onboarding_show_reentry,
+)
 from app.models.topics import (
     MAX_INTERESTS,
     TopicValue,
@@ -781,6 +792,147 @@ async def complete_wizard(current_user: dict = Depends(get_firebase_user)):
     )
     
     return {"message": "Wizard completed successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Resumable onboarding journey (ADR-003 / ADR-007)
+# ---------------------------------------------------------------------------
+
+
+class OnboardingStateResponse(BaseModel):
+    """Server-authoritative journey state. Carries no preference data."""
+
+    status: OnboardingStatus
+    last_meaningful_point: OnboardingPoint
+    postponed_at: Optional[datetime] = None
+    activated_at: Optional[datetime] = None
+    updated_at: datetime
+    show_reentry: bool
+    resume_screen: Optional[OnboardingPoint] = None
+
+
+class OnboardingStateUpdate(BaseModel):
+    """Exactly one journey action per call.
+
+    ``action`` and ``point`` are plain strings rather than ``Literal`` so an
+    unrecognised value reaches the handler and returns the contract's
+    ``400 invalid_action`` instead of FastAPI's generic ``422``.
+    """
+
+    action: str = Field(..., description="record_point | postpone")
+    point: Optional[str] = Field(
+        default=None,
+        description="personalization | first_deck (record_point only)",
+    )
+
+
+async def _get_user_document(current_user: dict) -> dict:
+    """Load the caller's user document or raise the documented 404."""
+    try:
+        object_id = ObjectId(current_user.get("user_id"))
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = await users_collection.find_one({"_id": object_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def _build_onboarding_response(
+    state: OnboardingState,
+    now: Optional[datetime] = None,
+) -> OnboardingStateResponse:
+    """Project stored state plus the two server-derived fields."""
+    reference = now or datetime.now(timezone.utc)
+    return OnboardingStateResponse(
+        status=state.status,
+        last_meaningful_point=state.last_meaningful_point,
+        postponed_at=state.postponed_at,
+        activated_at=state.activated_at,
+        updated_at=state.updated_at,
+        show_reentry=onboarding_show_reentry(state, reference),
+        resume_screen=onboarding_resume_screen(state),
+    )
+
+
+def _resolve_onboarding_action(data: OnboardingStateUpdate) -> str:
+    """Validate the action/point pairing before any state is inspected."""
+    if data.action == "record_point" and data.point in RECORDABLE_ONBOARDING_POINTS:
+        return "record_point"
+    if data.action == "postpone" and data.point is None:
+        return "postpone"
+    raise HTTPException(status_code=400, detail="invalid_action")
+
+
+def _build_onboarding_update(
+    action: str,
+    point: Optional[str],
+    state: OnboardingState,
+    now: datetime,
+) -> dict:
+    """Build the ``$set`` document for one action using server UTC time.
+
+    Progress is monotonic: recording an earlier screen, and postponing after
+    the user already resumed further, both keep the later meaningful point.
+    """
+    if state.status == "activated":
+        raise HTTPException(status_code=409, detail="onboarding_already_activated")
+
+    candidate = point if action == "record_point" else "welcome"
+    set_doc: dict = {
+        "onboarding.status": "incomplete",
+        "onboarding.last_meaningful_point": later_onboarding_point(
+            state.last_meaningful_point, candidate
+        ),
+        "onboarding.updated_at": now,
+    }
+    if action == "postpone":
+        set_doc["onboarding.postponed_at"] = now
+    return set_doc
+
+
+@router.get("/onboarding", response_model=OnboardingStateResponse)
+async def get_onboarding_state(
+    current_user: dict = Depends(get_firebase_user),
+) -> OnboardingStateResponse:
+    """Read the resumable onboarding journey (FR-037, FR-038, FR-043).
+
+    Legacy users without the subdocument are normalized at read time: a
+    ``wizard_completed`` user resolves as activated, anyone else resolves to an
+    incomplete Welcome journey. No migration and no write is performed.
+    """
+    user = await _get_user_document(current_user)
+    return _build_onboarding_response(normalize_onboarding_state(user))
+
+
+@router.patch("/onboarding", response_model=OnboardingStateResponse)
+async def update_onboarding_state(
+    data: OnboardingStateUpdate,
+    current_user: dict = Depends(get_firebase_user),
+) -> OnboardingStateResponse:
+    """Record a meaningful point or postpone the journey (FR-041, FR-042).
+
+    Only these two actions exist, both keep the journey incomplete, and both
+    are timestamped with server UTC time so the 24-hour grace period stays
+    truthful regardless of the client clock.
+    """
+    action = _resolve_onboarding_action(data)
+    user = await _get_user_document(current_user)
+    now = datetime.now(timezone.utc)
+
+    state = normalize_onboarding_state(user, now)
+    set_doc = _build_onboarding_update(action, data.point, state, now)
+
+    result = await users_collection.find_one_and_update(
+        {"_id": user["_id"]},
+        {"$set": set_doc},
+        return_document=True,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return _build_onboarding_response(normalize_onboarding_state(result, now), now)
 
 
 @router.post("/2fa/enable", response_model=TwoFactorEnableResponse)
