@@ -289,10 +289,22 @@ class PublicContentService:
             import re
             safe_query = re.escape(search_query)
             # Text search on title and description
-            query["$or"] = [
+            search_filter: List[dict] = [
                 {"title" if content_type == "book" else "name": {"$regex": safe_query, "$options": "i"}},
                 {"summary" if content_type == "book" else "description": {"$regex": safe_query, "$options": "i"}},
                 {"public_metadata.tags": {"$regex": safe_query, "$options": "i"}}
+            ]
+            # The access restriction and the search are independent predicates
+            # that must BOTH hold, and they cannot share the single top-level
+            # `$or` key. Assigning the search clause to `query["$or"]` would
+            # silently drop the restriction and surface restricted content to
+            # viewers who are not entitled to it — visible only when a search
+            # term is supplied. `$and` conjoins the two so the access filter
+            # survives regardless of which other filters are present.
+            query.pop("$or", None)
+            query["$and"] = [
+                {"$or": restriction_filter},
+                {"$or": search_filter},
             ]
 
         return query
