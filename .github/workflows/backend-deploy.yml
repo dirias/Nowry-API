@@ -1,0 +1,123 @@
+# Backend Deploy — Nowry FastAPI
+#
+# Triggers on push to main and dev, AND on pull requests targeting either, so
+# the security gate below (bandit + pip-audit + the phase-32 regression-guard
+# test suite) surfaces findings BEFORE merge, not just after. Runs validation
+# (pip install, lint, type check) before Railway's GitHub integration deploys.
+#
+# `dev` MUST stay in the trigger list. Railway's development service has
+# "Wait for CI" enabled: if no workflow runs for a commit, the check suite is
+# not a success and Railway silently marks the deployment SKIPPED. Removing
+# `dev` here does not just skip testing — it stops dev deploying entirely.
+#
+# Required GitHub Secrets (Settings → Secrets and Variables → Actions):
+#   RAILWAY_TOKEN  — Railway API token (only needed if NOT using Railway GitHub integration)
+#
+# Runtime environment variables (set in Railway dashboard → Variables, NOT here):
+#   SENTRY_DSN        — Sentry backend DSN (from Sentry project settings)
+#   MONGODB_URI       — MongoDB connection string
+#   FIREBASE_*        — Firebase Admin SDK credentials
+#
+# Deployment note: If Railway GitHub integration is configured (recommended),
+# Railway auto-deploys when code is pushed to main — no additional step needed.
+# If not configured, uncomment the deploy job below and set RAILWAY_TOKEN secret.
+#
+# IMPORTANT — this job's status DOES gate deployment. Railway's "Wait for CI"
+# is enabled, so a red (or absent) check suite means Railway skips the deploy
+# rather than shipping. A failure here is a hard block, not just a signal.
+#
+# The complementary gate, GitHub branch protection on `main` requiring this
+# workflow ("Validate & Lint") as a required status check before merge, is
+# still not configured as of this writing.
+
+name: Backend Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  build:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Security — static analysis (bandit)
+        run: |
+          pip install bandit==1.8.6
+          bandit -r app/ --severity-level high --confidence-level high
+
+      - name: Security — dependency audit (pip-audit)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pip install pip-audit==2.9.0
+          pip-audit -r requirements.lock -f json -o pip-audit-report.json || true
+          python scripts/check_pip_audit_severity.py pip-audit-report.json
+
+      - name: Security regression guards (Phase 32 — SEC-01/SEC-02/SEC-03)
+        run: |
+          pip install pytest==8.4.2 pytest-asyncio==1.2.0
+          pytest tests/test_dependencies.py tests/test_bounded_queries.py tests/test_check_pip_audit_severity.py tests/test_study_cards_review_mode.py -v
+        # Scoped to exactly the regression-guard tests added by Phase 32
+        # (IDOR/ownership, bounded-query, mode-guard, pip-audit severity
+        # classifier) — NOT the full `tests/` suite. The full suite has
+        # pre-existing, unrelated failures (AI-feature tests needing real
+        # API keys, a pre-existing test_deck_fixes.py collection error) that
+        # predate this phase and would make a blocking `pytest tests/` step
+        # red from day one, defeating the point of a gate (see 32-REVIEW.md
+        # CR-03). These four files pass reliably as a scoped set — verified
+        # locally under a fresh Python 3.11 venv mirroring this job's setup.
+        # No continue-on-error: unlike lint/mypy, these are the security
+        # guards this phase exists to add — a failure here is exactly what
+        # this step is supposed to catch.
+
+      - name: Lint (flake8 — critical errors only)
+        run: |
+          pip install flake8
+          # E9: Runtime errors (syntax, indentation)
+          # F63: Invalid star imports
+          # F7: Syntax errors in function signatures
+          # F82: Undefined names
+          flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        continue-on-error: true  # Lint warnings do not block deployment
+
+      - name: Type check (mypy)
+        run: |
+          pip install mypy
+          mypy app/ --ignore-missing-imports
+        continue-on-error: true  # Type check warnings are advisory in Phase 1
+
+  # Railway deployment is automatic via GitHub integration.
+  # Uncomment this job only if Railway GitHub integration is NOT configured:
+  # deploy:
+  #   name: Deploy to Railway
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   environment: production
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Deploy to Railway (production)
+  #       run: npx --yes @railway/cli@latest up --service nowry-api --detach
+  #       env:
+  #         RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}

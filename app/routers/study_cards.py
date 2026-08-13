@@ -1,16 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.StudyCard import StudyCard
-from app.config.database import cards_collection, decks_collection
+from app.models.deck_config import resolve_deck_budget
+from app.config.database import cards_collection, decks_collection, books_collection
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
+
+from app.auth.dependencies import require_ownership
 
 router = APIRouter(
     prefix="/study-cards",
     tags=["study cards"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -23,6 +27,129 @@ def get_cards_collection() -> Collection:
 
 def get_decks_collection() -> Collection:
     return decks_collection
+
+
+async def _verify_deck_ownership(deck_id: str, user_id: str):
+    """Verify that a deck exists and belongs to the user."""
+    if not deck_id:
+        return
+    try:
+        obj_id = ObjectId(deck_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid deck ID format")
+
+    deck = await decks_collection.find_one({"_id": obj_id, "deleted_at": None})
+    if not deck:
+        raise HTTPException(status_code=404, detail="Deck not found")
+    if str(deck.get("user_id")) != str(user_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this deck"
+        )
+
+
+async def _select_session_cards(
+    collection: Collection,
+    user_id: str,
+    deck_or: list,
+    new_cap: int,
+    review_cap: int,
+    now_dt: datetime,
+    today_start: datetime,
+) -> tuple[list, list]:
+    """Pick the new + review cards for a study session, locking today's plan.
+
+    New-card selection is sticky for the day:
+      1. Cards already introduced today (`introduced_at >= today_start`) are the
+         day's pool. Cards in that pool that have not been graded yet
+         (`last_reviewed is None`) are still pending.
+      2. If the day's pool is smaller than `new_cap`, top it up with fresh
+         never-seen cards (`introduced_at` unset, `last_reviewed` None) and
+         stamp them with `introduced_at = now` so they persist across sessions.
+      3. The session returns all pending cards from the locked pool.
+
+    Review cards keep the simple "due now, capped by remaining daily budget"
+    behaviour — they are intrinsically deterministic by `next_review`.
+    """
+    base_match = {"user_id": user_id, "deleted_at": None, "$or": deck_or}
+
+    # 1. Calculate how many NEW cards were studied today to adjust the remaining budget
+    new_studied_today = await collection.count_documents({
+        **base_match,
+        "last_reviewed": {"$gte": today_start},
+        "repetitions": {"$lte": 1},
+    })
+    new_remaining = max(0, new_cap - new_studied_today)
+
+    # 2. Get the currently active "sticky pool" for today
+    # We fetch cards introduced today that HAVEN'T been reviewed yet.
+    # We fetch up to `new_remaining` to fill our budget.
+    todays_pending_pool = await collection.find({
+        **base_match,
+        "introduced_at": {"$gte": today_start},
+        "last_reviewed": None,
+    }).sort("introduced_at", 1).to_list(length=new_remaining)
+
+    # 3. If we still have slots to fill after checking the sticky pool, top it up
+    slots_to_fill = max(0, new_remaining - len(todays_pending_pool))
+    new_cards_raw = list(todays_pending_pool)
+    if slots_to_fill > 0:
+        # A card is eligible to be (re)introduced today if it has never been
+        # graded (last_reviewed is None). This covers both brand-new cards and
+        # cards that were stamped on a previous day but never actually studied.
+        fresh_query = {
+            "user_id": user_id,
+            "deleted_at": None,
+            "last_reviewed": None,
+            "$and": [
+                {"$or": deck_or},
+                {"$or": [
+                    {"introduced_at": None},
+                    {"introduced_at": {"$exists": False}},
+                    {"introduced_at": {"$lt": today_start}},
+                ]},
+            ],
+        }
+        fresh_cards = await collection.find(fresh_query).sort("created_at", 1).limit(slots_to_fill).to_list(length=slots_to_fill)
+        if fresh_cards:
+            fresh_ids = [c["_id"] for c in fresh_cards]
+            await collection.update_many(
+                {"_id": {"$in": fresh_ids}},
+                {"$set": {"introduced_at": now_dt}},
+            )
+            for c in fresh_cards:
+                c["introduced_at"] = now_dt
+            new_cards_raw.extend(fresh_cards)
+
+    # We already have new_cards_raw from steps above
+
+    # --- Review cards: due now, capped by remaining daily review budget ---
+    reviews_done_today = await collection.count_documents({
+        **base_match,
+        "last_reviewed": {"$gte": today_start},
+        "repetitions": {"$gt": 1},
+    })
+    review_remaining = max(0, review_cap - reviews_done_today)
+
+    review_cards_raw: list = []
+    if review_remaining > 0:
+        review_query = {
+            **base_match,
+            "last_reviewed": {"$ne": None},
+            "next_review": {"$lte": now_dt},
+        }
+        review_cards_raw = await collection.find(review_query).sort("next_review", 1).limit(review_remaining).to_list(length=review_remaining)
+
+    return new_cards_raw, review_cards_raw
+
+
+def _get_deck_budget(deck_doc: dict) -> tuple[int, int]:
+    """Return (new_per_day, max_reviews_per_day) from a deck document.
+
+    Thin wrapper around the shared `resolve_deck_budget` so this router cannot
+    drift from the dashboard counts in routers/decks.py.
+    """
+    _, new_per_day, max_reviews = resolve_deck_budget(deck_doc)
+    return new_per_day, max_reviews
 
 
 @router.post("", summary="Create a new study card", response_model=StudyCard)
@@ -79,17 +206,18 @@ async def create_study_card(
     logger.info(f"User {user_id} creating study card: {card.title}")
 
     card.user_id = user_id
-    card.created_at = datetime.utcnow()
+    card.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
     card.ease_factor = 2.5
     card.interval = 1
     card.repetitions = 0
 
-    card_dict = card.dict(by_alias=True, exclude={"id"})
+    card_dict = card.model_dump(by_alias=True, exclude={"id"})
     result = await collection.insert_one(card_dict)
     card_id = result.inserted_id
 
     # Sync with Deck if deck_id is provided
     if card.deck_id:
+        await _verify_deck_ownership(card.deck_id, user_id)
         await d_collection.update_one(
             {"_id": ObjectId(card.deck_id)},
             {"$inc": {"total_cards": 1}, "$push": {"cards": card_id}},
@@ -120,48 +248,63 @@ async def get_statistics(
         user_id = current_user.get("user_id")
         logger.info(f"Fetching statistics for user {user_id}")
 
-        # Get all cards for the user
-        all_cards = await collection.find({"user_id": user_id}).to_list(None)
+        # Weekly progress + streak are computed server-side via an aggregation
+        # instead of pulling up to 2000 raw card docs into a Python loop
+        # (PERF-01 / D-01 finding #1). $match is copied VERBATIM from the
+        # replaced .find() filter (user_id, deleted_at, last_reviewed) as the
+        # pipeline's FIRST stage — the sole BOLA enforcement point for this
+        # aggregation (T-33-01). $group buckets by (day, type) so weekly
+        # buckets and the streak can both be derived from pre-grouped counts.
+        # No `timezone` param on $dateToString — the Motor client stores
+        # naive-UTC datetimes (no tz_aware), so the default UTC formatting
+        # matches the day boundaries already used throughout this file
+        # (A2 spot-check: a review at 2026-07-30T00:00:00 UTC groups into
+        # "2026-07-30", the same calendar day datetime.now(utc).replace(tzinfo=None)
+        # would bucket it into).
+        from datetime import datetime, timedelta, timezone
 
-        # Get books collection for book stats
-        from app.config.database import books_collection
+        ninety_days_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
+        weekly_pipeline = [
+            {"$match": {
+                "user_id": user_id,
+                "deleted_at": None,
+                "last_reviewed": {"$gte": ninety_days_ago},
+            }},
+            {"$group": {
+                "_id": {
+                    "day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed"}},
+                    "type": {"$ifNull": ["$card_type", "flashcard"]},
+                },
+                "count": {"$sum": 1},
+            }},
+        ]
+        # Bounded: 90 days * at most 3 card types per day.
+        grouped_counts = await collection.aggregate(weekly_pipeline).to_list(length=700)
 
-        all_books = await books_collection.find({"user_id": user_id}).to_list(None)
+        day_type_totals: dict = {}
+        for row in grouped_counts:
+            day = row["_id"]["day"]
+            card_type = row["_id"]["type"]
+            day_type_totals.setdefault(day, {})[card_type] = row.get("count", 0)
+
+        # books_collection is a per-user own-book fetch (bounded, cheap at
+        # current scale) — left unchanged, only hoisted to a module-level
+        # import so it is patchable in tests.
+        all_books = await books_collection.find({"user_id": user_id, "deleted_at": None}).to_list(length=500)
 
         # Calculate weekly progress (last 7 days) - separated by type
-        from datetime import datetime, timedelta
-
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(timezone.utc).replace(tzinfo=None).replace(hour=0, minute=0, second=0, microsecond=0)
         weekly_data = []
 
         for i in range(6, -1, -1):  # Last 7 days (6 days ago to today)
             day_start = today - timedelta(days=i)
             day_end = day_start + timedelta(days=1)
+            date_str = day_start.strftime("%Y-%m-%d")
+            type_counts = day_type_totals.get(date_str, {})
 
-            # Count by card type
-            flashcards_count = sum(
-                1
-                for card in all_cards
-                if card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") in [None, "flashcard"]
-            )
-
-            quizzes_count = sum(
-                1
-                for card in all_cards
-                if card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") == "quiz"
-            )
-
-            visual_count = sum(
-                1
-                for card in all_cards
-                if card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                and card.get("card_type") == "visual"
-            )
+            flashcards_count = type_counts.get("flashcard", 0)
+            quizzes_count = type_counts.get("quiz", 0)
+            visual_count = type_counts.get("visual", 0)
 
             # Count books accessed/updated on this day
             books_count = sum(
@@ -175,7 +318,7 @@ async def get_statistics(
             weekly_data.append(
                 {
                     "day": day_start.strftime("%A")[:3],  # Mon, Tue, etc.
-                    "date": day_start.strftime("%Y-%m-%d"),
+                    "date": date_str,
                     "cards": total_count,  # Keep for backwards compatibility
                     "flashcards": flashcards_count,
                     "quizzes": quizzes_count,
@@ -184,14 +327,20 @@ async def get_statistics(
                 }
             )
 
-        # Get recent performance (last 10 reviews) - include type
-        reviewed_cards = [card for card in all_cards if card.get("last_reviewed")]
-        reviewed_cards.sort(
-            key=lambda x: x.get("last_reviewed", datetime.min), reverse=True
-        )
+        # Recent performance stays its OWN small bounded query (needs record
+        # fields the grouped counts don't carry: title/ease_factor/type) —
+        # not folded into the $group above (RESEARCH.md recommends against
+        # over-engineering a single giant $facet).
+        recent_cards = await collection.find(
+            {
+                "user_id": user_id,
+                "deleted_at": None,
+                "last_reviewed": {"$ne": None},
+            }
+        ).sort("last_reviewed", -1).limit(10).to_list(length=10)
 
         recent_performance = []
-        for card in reviewed_cards[:10]:
+        for card in recent_cards:
             # Calculate performance score based on ease_factor
             ease = card.get("ease_factor", 2.5)
             score = min(10, max(1, int((ease - 1.3) / (2.5 - 1.3) * 10)))
@@ -235,27 +384,61 @@ async def get_statistics(
         # Keep only last 10 total
         recent_performance = recent_performance[:10]
 
-        # Overall stats
-        total_cards = len(all_cards)
-        reviewed_count = len(reviewed_cards)
+        # Overall stats — use count_documents so deleted cards are excluded and
+        # the counts are not skewed by the 90-day window on all_cards.
+        total_cards = await collection.count_documents(
+            {"user_id": user_id, "deleted_at": None}
+        )
+        reviewed_count = await collection.count_documents(
+            {"user_id": user_id, "deleted_at": None, "last_reviewed": {"$ne": None}}
+        )
         new_cards = total_cards - reviewed_count
 
-        # Current streak (days with at least 1 review)
+        # Get GLOBAL due cards count (accurate across all cards)
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        due_today_count = await collection.count_documents({
+            "user_id": user_id,
+            "deleted_at": None,
+            "$or": [
+                {"next_review": {"$exists": False}},
+                {"next_review": None},
+                {"next_review": {"$lte": now_dt}}
+            ]
+        })
+
+        # Current streak (consecutive days ending today with >=1 review),
+        # derived from the same grouped day/type counts computed above
+        # instead of re-scanning raw docs. Naturally bounded to the same
+        # 90-day window as the aggregation's $match (last_reviewed >=
+        # ninety_days_ago), matching the prior Python-loop's implicit cap.
+        reviewed_days = set(day_type_totals.keys())
         streak = 0
         check_date = today
         while True:
-            day_start = check_date
-            day_end = check_date + timedelta(days=1)
-            reviewed_today = any(
-                card.get("last_reviewed")
-                and day_start <= card["last_reviewed"] < day_end
-                for card in all_cards
-            )
-            if reviewed_today:
+            if check_date.strftime("%Y-%m-%d") in reviewed_days:
                 streak += 1
                 check_date -= timedelta(days=1)
             else:
                 break
+
+        # last_session_struggle: front of the card most recently reviewed
+        # yesterday or today AND with repetitions <= 1 (wrong answer resets
+        # repetitions to 1 in SM-2).  Truncated to 60 chars.
+        yesterday_start = today - timedelta(days=1)
+        struggle_cards = await collection.find(
+            {
+                "user_id": user_id,
+                "deleted_at": None,
+                "last_reviewed": {"$gte": yesterday_start},
+                "repetitions": {"$lte": 1},
+            }
+        ).sort("last_reviewed", -1).to_list(length=50)
+
+        last_session_struggle: Optional[str] = None
+        if struggle_cards:
+            front: str = (struggle_cards[0].get("front") or "").strip()
+            if front:
+                last_session_struggle = front[:60] if len(front) <= 60 else front[:60]
 
         return {
             "weekly_progress": weekly_data,
@@ -264,7 +447,9 @@ async def get_statistics(
                 "total_cards": total_cards,
                 "reviewed_cards": reviewed_count,
                 "new_cards": new_cards,
+                "due_today": due_today_count,
                 "current_streak": streak,
+                "last_session_struggle": last_session_struggle,
             },
         }
 
@@ -275,55 +460,232 @@ async def get_statistics(
         )
 
 
-@router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)
-async def get_study_card(
-    id: str,
+@router.get("/tags", summary="Get all tags used by the current user's cards")
+async def get_card_tags(
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
-    logger.info(f"User {user_id} fetching study card with ID: {id}")
 
-    try:
-        card = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid card ID")
+    # Mirror the same active-deck filter used in list_study_cards so tag counts
+    # match the number of cards actually returned when a tag is selected.
+    # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
+    # doc per deck), not a per-deck card fan-out; a single user's deck count
+    # stays far below 500 at this app's current scale. Retained as-is, not
+    # lowered — truncating would silently drop a legitimate power user's own
+    # decks (D-01 finding #2).
+    active_decks = await decks_collection.find(
+        {"user_id": user_id, "deleted_at": None}, {"_id": 1}
+    ).to_list(length=500)
+    active_deck_ids = []
+    for d in active_decks:
+        active_deck_ids.append(d["_id"])
+        active_deck_ids.append(str(d["_id"]))
 
-    if not card:
-        raise HTTPException(status_code=404, detail="Study card not found")
+    pipeline = [
+        {"$match": {
+            "user_id": user_id,
+            "deleted_at": None,
+            "tags": {"$exists": True, "$ne": []},
+            "$or": [
+                {"deck_id": None},
+                {"deck_id": {"$exists": False}},
+                {"deck_id": {"$in": active_deck_ids}},
+            ],
+        }},
+        {"$unwind": "$tags"},
+        {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$project": {"_id": 0, "tag": "$_id", "count": 1}}
+    ]
+    tags = await collection.aggregate(pipeline).to_list(length=500)
+    return tags
 
-    if str(card.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Not authorized to view this card")
 
-    card["_id"] = str(card["_id"])
-    if card.get("deck_id"):
-        card["deck_id"] = str(card["deck_id"])
-    if card.get("user_id"):
-        card["user_id"] = str(card["user_id"])
+@router.get("/daily-review", summary="Get today's locked daily review session across all decks")
+async def get_daily_review_cards(
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> dict:
+    """Aggregate today's session across every active deck.
 
+    Each deck contributes its own locked new-card pool (capped at the deck's
+    `new_per_day`) and its own remaining review budget. The selection is sticky
+    for the day via `introduced_at` — the same cards reappear across sessions
+    until they are graded.
+    """
+    user_id = user.get("user_id")
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
+    # doc per deck), not a per-deck card fan-out; a single user's deck count
+    # stays far below 500 at this app's current scale. Retained as-is, not
+    # lowered — truncating would silently drop a legitimate power user's own
+    # decks (D-01 finding #2).
+    active_decks = await decks_collection.find(
+        {"user_id": user_id, "deleted_at": None}
+    ).to_list(length=500)
+
+    all_new: list = []
+    all_review: list = []
+
+    for deck in active_decks:
+        new_cap, review_cap = _get_deck_budget(deck)
+        deck_oid = deck["_id"]
+        deck_or = [{"deck_id": deck_oid}, {"deck_id": str(deck_oid)}]
+
+        new_raw, review_raw = await _select_session_cards(
+            collection=collection,
+            user_id=user_id,
+            deck_or=deck_or,
+            new_cap=new_cap,
+            review_cap=review_cap,
+            now_dt=now_dt,
+            today_start=today_start,
+        )
+        all_new.extend(new_raw)
+        all_review.extend(review_raw)
+
+    cards = all_new + all_review
+    for c in cards:
+        c["_id"] = str(c["_id"])
+        if c.get("deck_id"):
+            c["deck_id"] = str(c["deck_id"])
+        if c.get("user_id"):
+            c["user_id"] = str(c["user_id"])
+
+    return {
+        "cards": cards,
+        "total": len(cards),
+        "page": 1,
+        "has_more": False,
+    }
+
+
+@router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)
+async def get_study_card(
+    card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
     return card
 
 
-@router.get("", summary="List all study cards", response_model=List[StudyCard])
+@router.get("", summary="List all study cards")
 async def list_study_cards(
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=500),
     skip: int = Query(0, ge=0),
     tags: Optional[List[str]] = Query(None),
     search: Optional[str] = Query(None),
+    deck_id: Optional[str] = Query(None),
+    due_only: bool = Query(False),
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
-):
+) -> dict:
     user_id = user.get("user_id")
     logger.info(f"Listing study cards for user: {user_id}")
 
-    query = {"user_id": user_id}
+    query: dict = {
+        "user_id": user_id,
+        "deleted_at": None,
+    }
+
+    if deck_id is not None:
+        # Direct deck filter — skip the active-decks query entirely
+        try:
+            deck_oid = ObjectId(deck_id)
+            deck_filter: list = [deck_oid, deck_id]
+        except Exception:
+            deck_filter = [deck_id]
+        query["$or"] = [{"deck_id": v} for v in deck_filter]
+    else:
+        # Collect active deck IDs (both ObjectId and string forms) to exclude orphans
+        # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
+        # doc per deck), not a per-deck card fan-out; a single user's deck count
+        # stays far below 500 at this app's current scale. Retained as-is, not
+        # lowered — truncating would silently drop a legitimate power user's own
+        # decks (D-01 finding #2).
+        active_decks = await decks_collection.find(
+            {"user_id": user_id, "deleted_at": None}, {"_id": 1}
+        ).to_list(length=500)
+        active_deck_ids: list = []
+        for d in active_decks:
+            active_deck_ids.append(d["_id"])
+            active_deck_ids.append(str(d["_id"]))
+        query["$or"] = [
+            {"deck_id": None},
+            {"deck_id": {"$exists": False}},
+            {"deck_id": {"$in": active_deck_ids}},
+        ]
+
     if tags:
         query["tags"] = {"$in": tags}
+
+    due_clause: Optional[dict] = None
+    if due_only:
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        due_clause = {"$or": [
+            {"next_review": {"$exists": False}},
+            {"next_review": None},
+            {"next_review": {"$lte": now_dt}},
+        ]}
+
     if search:
-        query["$or"] = [
-            {"title": {"$regex": search, "$options": "i"}},
-            {"content": {"$regex": search, "$options": "i"}},
-        ]
+        import re
+        safe_search = re.escape(search)
+        search_or = {"$or": [
+            {"title": {"$regex": safe_search, "$options": "i"}},
+            {"content": {"$regex": safe_search, "$options": "i"}},
+        ]}
+        and_clauses: list = [{"$or": query.pop("$or")}, search_or]
+        if due_clause is not None:
+            and_clauses.append(due_clause)
+        query["$and"] = and_clauses
+    elif due_clause is not None:
+        # Wrap existing top-level $or and the due clause together
+        query["$and"] = [{"$or": query.pop("$or")}, due_clause]
+
+    # When fetching due cards for a specific deck, apply the deck's daily budget:
+    # new cards (never reviewed) are capped at new_per_day,
+    # review cards (reviewed before, now past due) are capped at max_reviews_per_day.
+    if deck_id is not None and due_only:
+        deck_doc = await decks_collection.find_one(
+            {"_id": ObjectId(deck_id) if (deck_id and ObjectId.is_valid(deck_id)) else None, "deleted_at": None}
+        )
+        new_cap, review_cap = _get_deck_budget(deck_doc) if deck_doc else (20, 100)
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        deck_obj_id = ObjectId(deck_id) if (deck_id and ObjectId.is_valid(deck_id)) else None
+        deck_or = [{"deck_id": deck_obj_id}]
+        if deck_id:
+            deck_or.append({"deck_id": deck_id})
+        new_cards_raw, review_cards_raw = await _select_session_cards(
+            collection=collection,
+            user_id=user_id,
+            deck_or=deck_or,
+            new_cap=new_cap,
+            review_cap=review_cap,
+            now_dt=now_dt,
+            today_start=today_start,
+        )
+
+        cards = new_cards_raw + review_cards_raw
+        for c in cards:
+            c["_id"] = str(c["_id"])
+            if c.get("deck_id"):
+                c["deck_id"] = str(c["deck_id"])
+            if c.get("user_id"):
+                c["user_id"] = str(c["user_id"])
+
+        return {
+            "cards": cards,
+            "total": len(cards),
+            "page": 1,
+            "has_more": False,
+        }
+
+    # Generic path — paginated, no daily budget applied
+    total = await collection.count_documents(query)
 
     cursor = collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
     cards = await cursor.to_list(length=limit)
@@ -335,7 +697,12 @@ async def list_study_cards(
         if c.get("user_id"):
             c["user_id"] = str(c.get("user_id"))
 
-    return cards
+    return {
+        "cards": cards,
+        "total": total,
+        "page": (skip // limit) + 1 if limit > 0 else 1,
+        "has_more": skip + len(cards) < total,
+    }
 
 
 @router.patch("/{id}", summary="Update a study card", response_model=StudyCard)
@@ -344,23 +711,8 @@ async def update_study_card(
     updates: dict,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} updating study card with ID: {id}")
-
-    try:
-        existing_card = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid card ID")
-
-    if not existing_card:
-        raise HTTPException(status_code=404, detail="Study card not found")
-
-    if str(existing_card.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this card"
-        )
 
     # Handle deck_id change
     new_deck_id = updates.get("deck_id")
@@ -369,12 +721,14 @@ async def update_study_card(
     if "deck_id" in updates and str(new_deck_id) != str(old_deck_id):
         # Remove from old deck
         if old_deck_id:
+            await _verify_deck_ownership(old_deck_id, existing_card.get("user_id"))
             await d_collection.update_one(
                 {"_id": ObjectId(old_deck_id)},
                 {"$inc": {"total_cards": -1}, "$pull": {"cards": ObjectId(id)}},
             )
         # Add to new deck
         if new_deck_id:
+            await _verify_deck_ownership(new_deck_id, existing_card.get("user_id"))
             updates["deck_id"] = ObjectId(new_deck_id)
             await d_collection.update_one(
                 {"_id": ObjectId(new_deck_id)},
@@ -388,7 +742,7 @@ async def update_study_card(
         updates.pop(field, None)
 
     if "last_reviewed" in updates:
-        updates["next_review"] = datetime.utcnow() + timedelta(
+        updates["next_review"] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
             days=existing_card.get("interval", 1)
         )
 
@@ -411,65 +765,60 @@ async def delete_study_card(
     id: str,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
-    user: dict = Depends(get_firebase_user),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} deleting study card with ID: {id}")
-
-    try:
-        existing_card = await collection.find_one({"_id": ObjectId(id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid card ID")
-
-    if not existing_card:
-        raise HTTPException(status_code=404, detail="Study card not found")
-
-    if str(existing_card.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to delete this card"
-        )
 
     # Sync with Deck if needed
     deck_id = existing_card.get("deck_id")
     if deck_id:
+        await _verify_deck_ownership(deck_id, existing_card.get("user_id"))
         await d_collection.update_one(
             {"_id": ObjectId(deck_id)},
             {"$inc": {"total_cards": -1}, "$pull": {"cards": ObjectId(id)}},
         )
 
-    await collection.delete_one({"_id": ObjectId(id)})
+    now = datetime.now(timezone.utc)
+    user_id = existing_card.get("user_id")
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    await collection.update_one(
+        {"_id": ObjectId(existing_card["_id"])},
+        soft_delete_update,
+    )
     return None
 
 
-# Review endpoint for SM-2 algorithm
 @router.post("/{id}/review", summary="Review a card with SM-2 grading")
 async def review_card(
     id: str,
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
+    mode: str = Query("study", pattern="^(study|browse|cram)$"),
     collection: Collection = Depends(get_cards_collection),
-    current_user: dict = Depends(get_firebase_user),
+    card: dict = Depends(require_ownership(get_cards_collection, "id")),
+    user: dict = Depends(get_firebase_user),
 ):
     """
     Review a card and update its SM-2 spaced repetition parameters.
 
     - **grade**: User's self-assessment (again, hard, good, easy)
+    - **mode**: Active session mode (study, browse, cram). Only `study`
+      (the default) may grade a card and mutate its SM-2 schedule;
+      `browse`/`cram` are rejected with 403 before any write (D-04/D-05).
     """
+    if mode != "study":
+        raise HTTPException(
+            status_code=403,
+            detail="Reviews cannot be graded in Browse or Cram mode.",
+        )
+
     try:
         from app.utils.sm2 import calculate_next_review
-
-        user_id = current_user.get("user_id")
-        logger.info(f"Reviewing card {id} with grade {grade} for user {user_id}")
-
-        # Fetch the card
-        card = await collection.find_one({"_id": ObjectId(id)})
-        if not card:
-            raise HTTPException(status_code=404, detail="Card not found")
-
-        # Authorization check
-        if str(card.get("user_id")) != str(user_id):
-            raise HTTPException(
-                status_code=403, detail="Not authorized to review this card"
-            )
+        from app.routers.agent import grant_xp
 
         # Get current SM-2 parameters
         ease_factor = card.get("ease_factor", 2.5)
@@ -504,6 +853,19 @@ async def review_card(
             },
         )
 
+        # Award XP for reviewing a card — genuinely fire-and-forget: the SM-2
+        # update above already committed, so a grant_xp failure must never
+        # turn an already-persisted review into a client-facing 500 (which
+        # would cause the frontend's retry queue to resubmit and re-apply
+        # the same grade a second time — see 32-REVIEW.md CR-01).
+        user_id = user.get("user_id")
+        try:
+            await grant_xp(user_id, 2)
+        except Exception as xp_err:
+            logger.warning(
+                f"grant_xp failed for user {user_id} after review of card {id}: {xp_err}"
+            )
+
         logger.info(f"Successfully updated card {id}")
 
         return {"message": "Card reviewed successfully", "sm2_data": sm2_result}
@@ -512,3 +874,4 @@ async def review_card(
     except Exception as e:
         logger.error(f"Error reviewing card: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error reviewing card: {str(e)}")
+

@@ -1,9 +1,13 @@
+import re
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 
+DATE_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 from app.auth.firebase_auth import get_firebase_user
+from app.models.common import MessageResponse, OkResponse, FullAnnualPlanResponse
 from app.config.database import (
     annual_plans_collection,
     focus_areas_collection,
@@ -11,6 +15,8 @@ from app.config.database import (
     goals_collection,
     activities_collection,
     daily_routines_collection,
+    quarter_reports_collection,
+    books_collection,
 )
 from app.models.AnnualPlan import AnnualPlan
 from app.models.FocusArea import FocusArea
@@ -18,6 +24,63 @@ from app.models.Priority import Priority
 from app.models.Goal import Goal
 from app.models.Activity import Activity
 from app.models.DailyRoutine import DailyRoutineTemplate
+from app.models.Goal import Milestone
+from app.models.QuarterReport import QuarterReport
+from pydantic import BaseModel
+
+async def verify_annual_plan_ownership(plan_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(plan_id)
+    except InvalidId:
+        obj_id = plan_id
+    # Try ObjectId lookup first; fall back to string _id (existing docs may have string _id)
+    plan = await annual_plans_collection.find_one({"_id": obj_id})
+    if not plan:
+        plan = await annual_plans_collection.find_one({"_id": plan_id})
+    if not plan or str(plan.get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to access this plan data")
+
+async def verify_focus_area_ownership(fa_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(fa_id)
+    except InvalidId:
+        obj_id = fa_id
+    # Try ObjectId lookup first; fall back to string _id (PyObjectId model_dump serializes to str)
+    fa = await focus_areas_collection.find_one({"_id": obj_id})
+    if not fa:
+        fa = await focus_areas_collection.find_one({"_id": fa_id})
+    if not fa: raise HTTPException(status_code=404, detail="Focus area not found")
+    await verify_annual_plan_ownership(fa["annual_plan_id"], user_id)
+
+async def verify_goal_ownership(goal_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(goal_id)
+    except InvalidId:
+        obj_id = goal_id
+    # Try ObjectId lookup first; fall back to string _id (existing docs may have string _id)
+    goal = await goals_collection.find_one({"_id": obj_id})
+    if not goal:
+        goal = await goals_collection.find_one({"_id": goal_id})
+    if not goal: raise HTTPException(status_code=404, detail="Goal not found")
+    await verify_focus_area_ownership(goal["focus_area_id"], user_id)
+
+async def verify_priority_ownership(priority_id: str, user_id: str):
+    from bson.errors import InvalidId
+    try:
+        obj_id = ObjectId(priority_id)
+    except InvalidId:
+        obj_id = priority_id
+    p = await priorities_collection.find_one({"_id": obj_id})
+    if not p:
+        # Fallback: legacy priority stored with string _id
+        p = await priorities_collection.find_one({"_id": priority_id})
+    if not p:
+        raise HTTPException(status_code=404, detail="Priority not found")
+    await verify_annual_plan_ownership(p["annual_plan_id"], user_id)
+
 
 router = APIRouter(
     prefix="/annual-plan",
@@ -37,7 +100,7 @@ async def get_daily_routine(
     
     if not routine:
         new_routine = DailyRoutineTemplate(user_id=user_id)
-        result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
+        result = await daily_routines_collection.insert_one(new_routine.model_dump(by_alias=True))
         routine = await daily_routines_collection.find_one({"_id": result.inserted_id})
         
     return routine
@@ -58,7 +121,7 @@ async def update_daily_routine(
             "morning_routine": routine.morning_routine,
             "afternoon_routine": routine.afternoon_routine,
             "evening_routine": routine.evening_routine,
-            "updated_at": datetime.now()
+            "updated_at": datetime.now(timezone.utc)
         }}
     )
     
@@ -79,10 +142,38 @@ async def update_daily_routine(
             afternoon_routine=routine.afternoon_routine,
             evening_routine=routine.evening_routine
         )
-        insert_result = await daily_routines_collection.insert_one(new_routine.dict(by_alias=True))
+        insert_result = await daily_routines_collection.insert_one(new_routine.model_dump(by_alias=True))
         return await daily_routines_collection.find_one({"_id": insert_result.inserted_id})
 
     return await daily_routines_collection.find_one({"user_id": user_id})
+
+
+@router.patch("/daily-routine/completions", response_model=OkResponse)
+async def update_routine_completions(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_firebase_user),
+):
+    """
+    Update only the completion list for a specific date.
+    Uses dot-notation $set so other dates are untouched.
+    Expected payload: { "date": "YYYY-MM-DD", "items": ["morning_0", "evening_2"] }
+    """
+    user_id = current_user.get("user_id")
+    date_key = payload.get("date")
+    if not date_key or not DATE_KEY_RE.match(date_key):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    MAX_COMPLETION_ITEMS = 200
+    items = payload.get("items", [])
+    if not isinstance(items, list) or len(items) > MAX_COMPLETION_ITEMS:
+        raise HTTPException(status_code=400, detail=f"items must be a list of at most {MAX_COMPLETION_ITEMS} entries")
+
+    await daily_routines_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {f"daily_completions.{date_key}": items}},
+        upsert=True,
+    )
+    return {"ok": True}
 
 
 # --- Annual Plan ---
@@ -90,15 +181,126 @@ async def update_daily_routine(
 @router.get("", response_model=AnnualPlan)
 async def get_annual_plan(
     current_user: dict = Depends(get_firebase_user),
-    year: int = datetime.now().year
+    year: Optional[int] = None,
 ):
+    if year is None:
+        year = datetime.now().year
     user_id = current_user.get("user_id")
-    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year})
-    
+    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
+
     if not plan:
         raise HTTPException(status_code=404, detail="No annual plan found for this year")
-    
+
     return plan
+
+
+@router.get("/full", response_model=FullAnnualPlanResponse)
+async def get_full_annual_plan(
+    current_user: dict = Depends(get_firebase_user),
+    year: Optional[int] = None,
+):
+    """
+    Aggregation endpoint — returns the plan, focus areas, priorities, and all
+    goals for every focus area in a single round-trip.
+
+    Replaces the 3-level sequential waterfall:
+      /annual-plan  →  /focus-areas + /priorities  →  /goals × N
+
+    All DB queries run concurrently via asyncio.gather so the response time is
+    bounded by the slowest single query, not the sum of all of them.
+    """
+    import asyncio
+
+    if year is None:
+        year = datetime.now().year
+    user_id = current_user.get("user_id")
+    plan = await annual_plans_collection.find_one({"user_id": user_id, "year": year, "deleted_at": None})
+
+    if not plan:
+        # No plan for this year — return empty state (200), not 404.
+        # 404 would trigger browser error logging; "no plan yet" is valid for new/reactivated users.
+        return FullAnnualPlanResponse()
+
+    plan_id = str(plan["_id"])
+
+    # Level 2: focus areas, priorities, and quarter reports in parallel
+    areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
+    # D-03 sort — is_active DESC groups active before inactive within non-completed
+    # (aggregation $ifNull normalizes missing is_active on legacy docs — WR-02 fix)
+    priorities_coro = priorities_collection.aggregate(
+        _priorities_sort_pipeline({"annual_plan_id": plan_id, "deleted_at": None}, 50)
+    ).to_list(length=50)
+    reports_coro = quarter_reports_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
+
+    areas, priorities, reports = await asyncio.gather(areas_coro, priorities_coro, reports_coro)
+
+    # Level 3: goals for every area — all in parallel
+    goal_lists = await asyncio.gather(
+        *[goals_collection.find({"focus_area_id": str(area["_id"]), "deleted_at": None}).to_list(length=100) for area in areas]
+    )
+
+    # Attach goals to each area and build flat goals list
+    goals_by_area = {}
+    all_goals = []
+    goal_ids = []
+    for area, area_goals in zip(areas, goal_lists):
+        area_id = str(area["_id"])
+        goals_by_area[area_id] = area_goals
+        all_goals.extend(area_goals)
+        goal_ids.extend([str(g["_id"]) for g in area_goals])
+
+    # Level 4: activities for all goals
+    all_activities = []
+    if goal_ids:
+        all_activities = await activities_collection.find({"goal_id": {"$in": goal_ids}, "deleted_at": None}).to_list(length=500)
+
+    def serialize(doc):
+        """Convert ObjectId and other non-serializable types to strings."""
+        if doc is None:
+            return None
+        result = {}
+        for k, v in doc.items():
+            if hasattr(v, '__str__') and type(v).__name__ == 'ObjectId':
+                result[k] = str(v)
+            elif isinstance(v, list):
+                result[k] = [serialize(i) if isinstance(i, dict) else i for i in v]
+            elif isinstance(v, dict):
+                result[k] = serialize(v)
+            else:
+                result[k] = v
+        return result
+
+    # Calculate Overdue Quarter Logic purely on the backend
+    now = datetime.now()
+    current_q_year = now.year
+    current_q = (now.month - 1) // 3 + 1
+    
+    overdue_q = None
+    overdue_year = None
+    
+    plan_year = plan.get("year", current_q_year)
+    past_quarters = [q for q in [1, 2, 3, 4] if current_q_year > plan_year or (current_q_year == plan_year and current_q > q)]
+    
+    for pq in past_quarters:
+        has_report = any(r.get("quarter") == pq and r.get("year") == plan_year for r in reports)
+        has_goals = any(g.get("quarter") == pq and g.get("year") == plan_year for g in all_goals)
+        if not has_report and has_goals:
+            overdue_q = pq
+            overdue_year = plan_year
+            break
+            
+    plan_serialized = serialize(plan)
+    if overdue_q:
+        plan_serialized["overdue_quarter"] = {"quarter": overdue_q, "year": overdue_year}
+
+    return {
+        "plan": plan_serialized,
+        "focus_areas": [serialize(a) for a in areas],
+        "priorities": [serialize(p) for p in priorities],
+        "goals": [{**serialize(g), "_computed_progress": g.get("progress", 0)} for g in all_goals],
+        "activities": [serialize(act) for act in all_activities],
+        "quarter_reports": [serialize(r) for r in reports],
+    }
 
 @router.post("", response_model=AnnualPlan, status_code=201)
 async def create_annual_plan(
@@ -119,7 +321,7 @@ async def create_annual_plan(
         year=year,
         title=plan_data.get("title", f"My {year} Plan")
     )
-    result = await annual_plans_collection.insert_one(new_plan.dict(by_alias=True))
+    result = await annual_plans_collection.insert_one(new_plan.model_dump(by_alias=True))
     plan = await annual_plans_collection.find_one({"_id": result.inserted_id})
     
     return plan
@@ -145,7 +347,7 @@ async def update_annual_plan(
 
     update_data = {
         "title": plan_update.title,
-        "updated_at": datetime.now()
+        "updated_at": datetime.now(timezone.utc)
     }
     
     await annual_plans_collection.update_one(
@@ -162,24 +364,24 @@ async def update_annual_plan_by_id(
     current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
-    
-    # Try to find plan by string ID first (seems to be stored as string in DB)
-    print(f"Looking for plan with ID: {id}, user: {user_id}")
-    existing_plan = await annual_plans_collection.find_one({"_id": id})
-    
-    # If not found, try as ObjectId
-    if not existing_plan:
+
+    # Track which _id form matched so update and return use the same key
+    existing_plan, id_key = None, id
+    found_by_string = await annual_plans_collection.find_one({"_id": id})
+    if found_by_string:
+        existing_plan = found_by_string
+    else:
         try:
             object_id = ObjectId(id)
             existing_plan = await annual_plans_collection.find_one({"_id": object_id})
-        except:
+            if existing_plan:
+                id_key = object_id
+        except Exception:
             pass
-    
-    print(f"Found plan: {existing_plan}")
-    
+
     if not existing_plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-        
+
     if existing_plan["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -187,14 +389,262 @@ async def update_annual_plan_by_id(
     update_data = {}
     if "title" in plan_update:
         update_data["title"] = plan_update["title"]
-    update_data["updated_at"] = datetime.now()
-    
+    update_data["updated_at"] = datetime.now(timezone.utc)
+
     await annual_plans_collection.update_one(
-        {"_id": id},  # Use string ID
+        {"_id": id_key},
         {"$set": update_data}
     )
+
+    return await annual_plans_collection.find_one({"_id": id_key})
+
+
+@router.delete("/{id}", response_model=MessageResponse)
+async def delete_annual_plan(
+    id: str,
+    current_user: dict = Depends(get_firebase_user),
+):
+    """
+    Soft delete an annual plan and cascade to all related focus areas, goals,
+    activities, and priorities. All data will be recoverable within 30 days.
+    """
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(id, user_id)
+
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+
+    # 1. Soft-delete the plan itself
+    await annual_plans_collection.update_one({"_id": obj_id}, soft_delete_update)
+
+    # 2. CASCADE: Soft-delete all focus areas belonging to this plan
+    await focus_areas_collection.update_many(
+        {"annual_plan_id": id, "deleted_at": None},
+        soft_delete_update,
+    )
+
+    # 3. Get focus_area IDs to cascade further (include already-deleted ones for completeness)
+    focus_area_ids = [
+        str(fa["_id"])
+        for fa in await focus_areas_collection.find(
+            {"annual_plan_id": id}
+        ).to_list(length=1000)
+    ]
+
+    if focus_area_ids:
+        # 4. CASCADE: Soft-delete all goals linked to these focus areas
+        await goals_collection.update_many(
+            {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None},
+            soft_delete_update,
+        )
+        # 5. CASCADE: Soft-delete all activities linked to these focus areas
+        await activities_collection.update_many(
+            {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None},
+            soft_delete_update,
+        )
+        # 6. CASCADE: Soft-delete all priorities linked to these focus areas
+        await priorities_collection.update_many(
+            {"focus_area_id": {"$in": focus_area_ids}, "deleted_at": None},
+            soft_delete_update,
+        )
+
+    return {"message": "Annual plan and all related data deleted successfully"}
+
+
+# --- Quarter Reports ---
+
+@router.post("/close-quarter", response_model=QuarterReport)
+async def close_quarter(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_firebase_user),
+):
+    user_id = current_user.get("user_id")
+    year = payload.get("year")
+    quarter = payload.get("quarter")
+    annual_plan_id = payload.get("annual_plan_id")
+    migrated_goals = payload.get("migrated_goals", [])
+    reflections = payload.get("reflections", {})
+
+    if not all([year, quarter, annual_plan_id]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    # Determine quarter dates
+    if quarter == 1:
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year, 3, 31, 23, 59, 59)
+    elif quarter == 2:
+        start_date = datetime(year, 4, 1)
+        end_date = datetime(year, 6, 30, 23, 59, 59)
+    elif quarter == 3:
+        start_date = datetime(year, 7, 1)
+        end_date = datetime(year, 9, 30, 23, 59, 59)
+    else:
+        start_date = datetime(year, 10, 1)
+        end_date = datetime(year, 12, 31, 23, 59, 59)
+
+    # 1. Fetch all goals currently in this quarter BEFORE migrating them
+    focus_areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=100)
+    fa_ids = [str(fa["_id"]) for fa in focus_areas]
     
-    return await annual_plans_collection.find_one({"_id": id})
+    current_goals = await goals_collection.find({
+        "focus_area_id": {"$in": fa_ids},
+        "quarter": quarter,
+        "year": year,
+        "deleted_at": None
+    }).to_list(length=500)
+
+    # 2. Calculate metrics
+    total_goals = len(current_goals)
+    completed_goals = 0
+    total_milestones = 0
+    completed_milestones = 0
+    
+    for g in current_goals:
+        if g.get("status") == "completed" or g.get("progress", 0) == 100:
+            completed_goals += 1
+            
+        milestones = g.get("milestones", [])
+        total_milestones += len(milestones)
+        completed_milestones += sum(1 for m in milestones if m.get("completed"))
+
+    if total_goals == 0:
+        progress_percentage = 0
+    else:
+        progress_percentage = int((sum(g.get("progress", 0) for g in current_goals) / total_goals))
+
+    def serialize_goal(g):
+        g_dict = dict(g)
+        g_dict["_id"] = str(g_dict["_id"])
+        if "target_date" in g_dict and isinstance(g_dict["target_date"], datetime):
+            g_dict["target_date"] = g_dict["target_date"].isoformat()
+        if "created_at" in g_dict and isinstance(g_dict["created_at"], datetime):
+            g_dict["created_at"] = g_dict["created_at"].isoformat()
+        if "updated_at" in g_dict and isinstance(g_dict["updated_at"], datetime):
+            g_dict["updated_at"] = g_dict["updated_at"].isoformat()
+        if "completed_at" in g_dict and isinstance(g_dict["completed_at"], datetime):
+            g_dict["completed_at"] = g_dict["completed_at"].isoformat()
+        return g_dict
+
+    goals_summary = [serialize_goal(g) for g in current_goals]
+
+    # 3. Perform the migration
+    for m_goal in migrated_goals:
+        goal_id = m_goal.get("id")
+        new_quarter = m_goal.get("new_quarter")
+        new_target_date = m_goal.get("new_target_date")
+        if goal_id and new_quarter and new_target_date:
+            try:
+                obj_id = ObjectId(goal_id)
+            except Exception:
+                obj_id = goal_id
+
+            # parse date string if it's string format (from frontend)
+            dt = new_target_date
+            if isinstance(dt, str):
+                dt = dt.replace('Z', '+00:00')
+                dt = datetime.fromisoformat(dt)
+
+            update_payload = {
+                "$set": {
+                    "quarter": new_quarter,
+                    "target_date": dt,
+                    "updated_at": datetime.now(timezone.utc)
+                },
+                "$inc": {"migration_count": 1}
+            }
+            
+            res = await goals_collection.update_one({"_id": obj_id}, update_payload)
+            if res.matched_count == 0:
+                await goals_collection.update_one({"_id": str(goal_id)}, update_payload)
+
+    # New: Aggregate Knowledge (Books finished in this quarter)
+    books = await books_collection.find({
+        "user_id": user_id,
+        "status": "completed",
+        "updated_at": {"$gte": start_date, "$lte": end_date}
+    }).to_list(length=100)
+    
+    def serialize_book(b):
+        b["_id"] = str(b["_id"])
+        if "created_at" in b and isinstance(b["created_at"], datetime):
+            b["created_at"] = b["created_at"].isoformat()
+        if "updated_at" in b and isinstance(b["updated_at"], datetime):
+            b["updated_at"] = b["updated_at"].isoformat()
+        return b
+        
+    knowledge_summary = {
+        "books_finished": [serialize_book(b) for b in books],
+        "cards_mastered_count": 0 # Placeholder for study center integration if needed later
+    }
+
+    # New: Aggregate Routines (Days active in this quarter)
+    routine_doc = await daily_routines_collection.find_one({"user_id": user_id})
+    routines_summary = {"average_completion_rate": 0.0, "active_days": 0}
+    if routine_doc and "daily_completions" in routine_doc:
+        completions = routine_doc["daily_completions"]
+        active_days = 0
+        total_items_checked = 0
+        for date_str, items in completions.items():
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d")
+                if start_date <= d <= end_date:
+                    if len(items) > 0:
+                        active_days += 1
+                        total_items_checked += len(items)
+            except:
+                continue
+                
+        # Simple heuristic: active vs total days in quarter (~90 days)
+        routines_summary = {
+            "active_days": active_days,
+            "total_items_checked": total_items_checked,
+            "completion_rate": min(100, int((active_days / 90) * 100)) if active_days > 0 else 0
+        }
+
+    # 4. Create and save QuarterReport
+    report = QuarterReport(
+        user_id=user_id,
+        annual_plan_id=annual_plan_id,
+        year=year,
+        quarter=quarter,
+        total_goals=total_goals,
+        completed_goals=completed_goals,
+        total_milestones=total_milestones,
+        completed_milestones=completed_milestones,
+        progress_percentage=progress_percentage,
+        goals_summary=goals_summary,
+        reflections=reflections,
+        routines_summary=routines_summary,
+        knowledge_summary=knowledge_summary
+    )
+    
+    result = await quarter_reports_collection.insert_one(report.model_dump(by_alias=True))
+    created_report = await quarter_reports_collection.find_one({"_id": result.inserted_id})
+    return created_report
+
+@router.get("/quarter-reports/{annual_plan_id}", response_model=List[QuarterReport])
+async def get_quarter_reports(
+    annual_plan_id: str,
+    current_user: dict = Depends(get_firebase_user),
+):
+    user_id = current_user.get("user_id")
+    reports = await quarter_reports_collection.find({
+        "annual_plan_id": annual_plan_id,
+        "user_id": user_id,
+        "deleted_at": None
+    }).sort("quarter", 1).to_list(length=10)
+    return reports
 
 
 # --- Focus Areas ---
@@ -204,7 +654,9 @@ async def get_focus_areas(
     annual_plan_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=10)
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(annual_plan_id, user_id)
+    areas = await focus_areas_collection.find({"annual_plan_id": annual_plan_id, "deleted_at": None}).to_list(length=10)
     return areas
 
 @router.post("/focus-areas", response_model=FocusArea)
@@ -212,12 +664,16 @@ async def create_focus_area(
     focus_area: FocusArea,
     current_user: dict = Depends(get_firebase_user),
 ):
-    # Check limit (max 3)
-    count = await focus_areas_collection.count_documents({"annual_plan_id": focus_area.annual_plan_id})
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(focus_area.annual_plan_id, user_id)
+    
+    # Check limit (max 3) — must match the same not-deleted filter used everywhere else,
+    # otherwise soft-deleted areas keep counting against the limit forever.
+    count = await focus_areas_collection.count_documents({"annual_plan_id": focus_area.annual_plan_id, "deleted_at": None})
     if count >= 3:
         raise HTTPException(status_code=400, detail="Maximum 3 focus areas allowed")
         
-    result = await focus_areas_collection.insert_one(focus_area.dict(by_alias=True))
+    result = await focus_areas_collection.insert_one(focus_area.model_dump(by_alias=True))
     created = await focus_areas_collection.find_one({"_id": result.inserted_id})
     return created
 
@@ -227,6 +683,9 @@ async def update_focus_area(
     focus_area: FocusArea,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_focus_area_ownership(id, user_id)
+    
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -235,39 +694,105 @@ async def update_focus_area(
     result = await focus_areas_collection.update_one(
         {"_id": obj_id},
         {"$set": {
-            "name": focus_area.name, 
+            "name": focus_area.name,
             "description": focus_area.description,
             "color": focus_area.color,
             "icon": focus_area.icon,
-            "updated_at": datetime.now()
+            "updated_at": datetime.now(timezone.utc)
         }}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Focus Area not found")
         
     return await focus_areas_collection.find_one({"_id": obj_id})
 
-@router.delete("/focus-areas/{id}")
+@router.delete("/focus-areas/{id}", response_model=MessageResponse)
 async def delete_focus_area(
     id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    # Cascade delete priorities and goals?
-    # For now, just delete the area. Logic for cascading should be handled carefully.
-    # Ideally we check if there are goals.
-    await focus_areas_collection.delete_one({"_id": ObjectId(id)})
-    return {"message": "Focus area deleted"}
+    """
+    Soft delete a focus area and cascade to related goals, activities, and priorities.
+    All related data will be soft-deleted and can be recovered within 30 days.
+    """
+    from datetime import datetime, timezone
+
+    user_id = current_user.get("user_id")
+    now = datetime.now(timezone.utc)
+
+    # 1. Verify ownership
+    focus_area = await focus_areas_collection.find_one({
+        "_id": ObjectId(id),
+        "user_id": user_id,
+        "deleted_at": None
+    })
+    
+    if not focus_area:
+        raise HTTPException(status_code=404, detail="Focus area not found")
+    
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now
+        }
+    }
+    
+    # 2. Soft delete the focus area
+    await focus_areas_collection.update_one(
+        {"_id": ObjectId(id)},
+        soft_delete_update
+    )
+    
+    # 3. CASCADE: Soft delete all related goals
+    await goals_collection.update_many(
+        {"focus_area_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # 4. CASCADE: Soft delete all activities in these goals
+    await activities_collection.update_many(
+        {"focus_area_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    # 5. CASCADE: Soft delete all related priorities
+    await priorities_collection.update_many(
+        {"focus_area_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    return {"message": "Focus area and all related data deleted successfully"}
 
 
 # --- Priorities ---
+
+def _priorities_sort_pipeline(match_filter: dict, limit: int) -> list:
+    """D-03 compound sort — is_active DESC groups active before inactive within
+    non-completed. Uses an aggregation $ifNull instead of a plain .find().sort()
+    so priority documents that predate Phase 24 (missing is_active entirely,
+    which BSON sorts as null — behind explicit false) are treated as active,
+    matching the Pydantic `is_active: bool = True` response default (WR-02 fix).
+    """
+    return [
+        {"$match": match_filter},
+        {"$addFields": {"_is_active_sort": {"$ifNull": ["$is_active", True]}}},
+        {"$sort": {"is_completed": 1, "_is_active_sort": -1, "order": 1, "created_at": 1}},
+        {"$project": {"_is_active_sort": 0}},
+        {"$limit": limit},
+    ]
 
 @router.get("/priorities", response_model=List[Priority])
 async def get_priorities(
     annual_plan_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    priorities = await priorities_collection.find({"annual_plan_id": annual_plan_id}).to_list(length=50)
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(annual_plan_id, user_id)
+    priorities = await priorities_collection.aggregate(
+        _priorities_sort_pipeline({"annual_plan_id": annual_plan_id, "deleted_at": None}, 50)
+    ).to_list(length=50)
     return priorities
 
 @router.post("/priorities", response_model=Priority)
@@ -275,73 +800,191 @@ async def create_priority(
     priority: Priority,
     current_user: dict = Depends(get_firebase_user),
 ):
-    result = await priorities_collection.insert_one(priority.dict(by_alias=True))
+    user_id = current_user.get("user_id")
+    await verify_annual_plan_ownership(priority.annual_plan_id, user_id)
+    result = await priorities_collection.insert_one(priority.model_dump(by_alias=True))
     return await priorities_collection.find_one({"_id": result.inserted_id})
 
 @router.put("/priorities/{id}", response_model=Priority)
 async def update_priority(
     id: str,
-    priority: Priority,
+    priority_update: dict,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_priority_ownership(id, user_id)
     try:
         obj_id = ObjectId(id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID format")
 
+    # Check if priority exists
+    existing = await priorities_collection.find_one({"_id": obj_id})
+    if not existing:
+        # Try finding with string ID
+        existing = await priorities_collection.find_one({"_id": id})
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Priority not found: {id}")
+        # Use string ID for update
+        obj_id = id
+
+    # Build update dict with only provided fields
+    update_data = {"updated_at": datetime.now(timezone.utc)}
+
+    if "title" in priority_update:
+        update_data["title"] = priority_update["title"]
+    if "description" in priority_update:
+        update_data["description"] = priority_update["description"]
+    if "deadline" in priority_update:
+        update_data["deadline"] = priority_update["deadline"]
+    if "is_completed" in priority_update:
+        update_data["is_completed"] = priority_update["is_completed"]
+        update_data["completed_at"] = datetime.now(timezone.utc) if priority_update["is_completed"] else None
+    if "is_active" in priority_update:
+        # No completed_at-style timestamp needed — is_active is a manual "not right now"
+        # toggle (D-04), not a completion event. Reject non-boolean values outright
+        # instead of coercing (bool("false") == True would silently invert intent — T-24-01/WR-01).
+        raw_is_active = priority_update["is_active"]
+        if not isinstance(raw_is_active, bool):
+            raise HTTPException(status_code=400, detail="is_active must be a boolean")
+        update_data["is_active"] = raw_is_active
+    if "linked_entity_id" in priority_update:
+        update_data["linked_entity_id"] = priority_update["linked_entity_id"]
+    if "linked_entity_type" in priority_update:
+        update_data["linked_entity_type"] = priority_update["linked_entity_type"]
+    if "annual_plan_id" in priority_update:
+        # Reparenting to a new plan requires proving the caller owns the *target*
+        # plan too — verify_priority_ownership above only confirmed the *current*
+        # parent (CR-02: otherwise a user could move their priority into any
+        # other user's annual_plan_id).
+        await verify_annual_plan_ownership(priority_update["annual_plan_id"], user_id)
+        update_data["annual_plan_id"] = priority_update["annual_plan_id"]
+    if "focus_area_id" in priority_update:
+        await verify_focus_area_ownership(priority_update["focus_area_id"], user_id)
+        update_data["focus_area_id"] = priority_update["focus_area_id"]
+
     result = await priorities_collection.update_one(
         {"_id": obj_id},
-        {"$set": {
-            "title": priority.title,
-            "description": priority.description,
-            "deadline": priority.deadline,
-            "is_completed": priority.is_completed,
-            "completed_at": datetime.now() if priority.is_completed else None,
-            "updated_at": datetime.now()
-        }}
+        {"$set": update_data}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Priority not found")
 
     return await priorities_collection.find_one({"_id": obj_id})
 
-@router.delete("/priorities/{id}")
+@router.delete("/priorities/{id}", response_model=MessageResponse)
 async def delete_priority(id: str, current_user: dict = Depends(get_firebase_user)):
+    user_id = current_user.get("user_id")
+    await verify_priority_ownership(id, user_id)
+
     try:
         obj_id = ObjectId(id)
-        result = await priorities_collection.delete_one({"_id": obj_id})
-        if result.deleted_count == 0:
-            # Try as string if ObjectId deletion failed (no match)
-            result = await priorities_collection.delete_one({"_id": id})
     except Exception:
-        # Invalid ObjectId format, try as string
-        result = await priorities_collection.delete_one({"_id": id})
-        
-    if result.deleted_count == 0:
+        obj_id = id
+
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    result = await priorities_collection.update_one({"_id": obj_id}, soft_delete_update)
+    if result.matched_count == 0:
+        # Try string ID as fallback
+        result = await priorities_collection.update_one({"_id": id}, soft_delete_update)
+
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Priority not found")
-        
+
     return {"message": "Priority deleted"}
+
+
+class PriorityReorderRequest(BaseModel):
+    """Payload for PATCH /annual-plan/priorities/reorder."""
+    annual_plan_id: str
+    priority_ids: List[str]
+
+
+# NOTE: this route must remain ABOVE any future PATCH /priorities/{id} to avoid
+# FastAPI matching "reorder" as the {id} path parameter.
+@router.patch("/priorities/reorder", response_model=OkResponse)
+async def reorder_priorities(
+    payload: PriorityReorderRequest,
+    current_user: dict = Depends(get_firebase_user),
+) -> OkResponse:
+    """
+    Accept an ordered list of priority IDs and write sequential `order`
+    values (0-indexed). Validates that all IDs belong to the given plan
+    before performing any writes (D-09/D-10).
+    """
+    from bson.errors import InvalidId
+
+    user_id = current_user.get("user_id")
+
+    # Guard: oversized payload (DoS defense — T-20-03)
+    if len(payload.priority_ids) > 50:
+        raise HTTPException(status_code=422, detail="priority_ids must contain at most 50 items")
+
+    # Guard: duplicate IDs would clobber `order` redundantly and can mask a
+    # client-side bug producing the ordered list (IN-03)
+    if len(set(payload.priority_ids)) != len(payload.priority_ids):
+        raise HTTPException(status_code=422, detail="priority_ids must not contain duplicates")
+
+    # Auth + plan ownership (D-12)
+    await verify_annual_plan_ownership(payload.annual_plan_id, user_id)
+
+    # Build ObjectId list with string fallback for legacy docs (D-09, Pattern 4)
+    obj_ids = []
+    for pid in payload.priority_ids:
+        try:
+            obj_ids.append(ObjectId(pid))
+        except InvalidId:
+            obj_ids.append(pid)
+
+    # Include both ObjectId and string forms in $in — covers legacy string-_id docs
+    all_id_forms = obj_ids + payload.priority_ids
+    valid_count = await priorities_collection.count_documents({
+        "_id": {"$in": all_id_forms},
+        "annual_plan_id": payload.annual_plan_id,
+        "deleted_at": None,
+    })
+    if valid_count < len(payload.priority_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="One or more priority IDs do not belong to this plan",
+        )
+
+    # Sequential update_one loop — all-or-nothing validation already passed (D-10)
+    for index, (pid, obj_id) in enumerate(zip(payload.priority_ids, obj_ids)):
+        result = await priorities_collection.update_one(
+            {"_id": obj_id},
+            {"$set": {"order": index, "updated_at": datetime.now(timezone.utc)}},
+        )
+        if result.matched_count == 0:
+            # Fallback: document has string _id (legacy doc)
+            await priorities_collection.update_one(
+                {"_id": pid},
+                {"$set": {"order": index, "updated_at": datetime.now(timezone.utc)}},
+            )
+
+    return {"ok": True}
 
 
 # --- Goals ---
 
 @router.get("/goals", response_model=List[Goal])
 async def get_goals(
-    focus_area_id: Optional[str] = None,
+    focus_area_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    query = {}
-    if focus_area_id:
-        query["focus_area_id"] = focus_area_id
-    
-    # We might want to filter by user ownership via join or just trust focus_area_id logic if we validated it.
-    # Strictly speaking we should validate focus_area belongs to a plan owned by user. 
-    # Skipping detailed ownership validation for brevity but keeping it secure by design implies focus_area IDs are hard to guess? 
-    # No, we should rely on user_id. But Goal doesn't have user_id directly. 
-    # For MVP we filter by focus_area_id.
-    
-    goals = await goals_collection.find(query).to_list(length=100)
+    user_id = current_user.get("user_id")
+    await verify_focus_area_ownership(focus_area_id, user_id)
+    goals = await goals_collection.find(
+        {"focus_area_id": focus_area_id, "deleted_at": None}
+    ).to_list(length=100)
     return goals
 
 @router.post("/goals", response_model=Goal)
@@ -349,83 +992,145 @@ async def create_goal(
     goal: Goal,
     current_user: dict = Depends(get_firebase_user),
 ):
-    result = await goals_collection.insert_one(goal.dict(by_alias=True))
+    user_id = current_user.get("user_id")
+    await verify_focus_area_ownership(goal.focus_area_id, user_id)
+    result = await goals_collection.insert_one(goal.model_dump(by_alias=True))
     return await goals_collection.find_one({"_id": result.inserted_id})
 
 @router.put("/goals/{id}", response_model=Goal)
 async def update_goal(
     id: str,
-    goal: Goal,
+    goal_update: dict,
     current_user: dict = Depends(get_firebase_user),
 ):
-    # Try validating/converting to ObjectId
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(id, user_id)
+
+    # Resolve the id to an ObjectId when possible; fall back to the raw string
+    # for legacy documents stored with a string _id. This never raises — both
+    # branches are tried against the DB below, so an invalid ObjectId string
+    # degrades to "no match" rather than crashing (Rule 3 / CR-01 fix).
     try:
         obj_id = ObjectId(id)
-        # Try updating with ObjectId
-        result = await goals_collection.update_one(
-            {"_id": obj_id},
-            {"$set": {
-                "title": goal.title,
-                "description": goal.description,
-                "image_url": goal.image_url,
-                "target_date": goal.target_date,
-                "progress": goal.progress,
-                "status": goal.status,
-                "milestones": goal.milestones,
-                "parent_id": goal.parent_id,
-                "quarter": goal.quarter,
-                "year": goal.year,
-                "type": goal.type,
-                "updated_at": datetime.now()
-            }}
-        )
-        # If no match, maybe it's stored as a string?
-        if result.matched_count == 0:
-             result = await goals_collection.update_one(
-                {"_id": id},
-                {"$set": {
-                    "title": goal.title,
-                    "description": goal.description,
-                    "image_url": goal.image_url,
-                    "target_date": goal.target_date,
-                    "progress": goal.progress,
-                    "status": goal.status,
-                    "milestones": goal.milestones,
-                    "updated_at": datetime.now()
-                }}
-            )
-             if result.matched_count > 0:
-                 # It was a string ID
-                 obj_id = id
-             else:
-                 raise HTTPException(status_code=404, detail="Goal not found")
-
     except Exception:
-        # If ObjectId conversion failed completely, try as string directly
+        obj_id = id
+
+    # Build update dict with only provided fields — always constructed,
+    # regardless of which id form matched (fixes UnboundLocalError, CR-01).
+    update_data = {"updated_at": datetime.now(timezone.utc)}
+
+    if "title" in goal_update:
+        update_data["title"] = goal_update["title"]
+    if "description" in goal_update:
+        update_data["description"] = goal_update["description"]
+    if "image_url" in goal_update:
+        update_data["image_url"] = goal_update["image_url"]
+    if "target_date" in goal_update:
+        update_data["target_date"] = goal_update["target_date"]
+    if "progress" in goal_update:
+        update_data["progress"] = goal_update["progress"]
+    if "status" in goal_update:
+        update_data["status"] = goal_update["status"]
+    if "milestones" in goal_update:
+        update_data["milestones"] = goal_update["milestones"]
+    if "parent_id" in goal_update:
+        update_data["parent_id"] = goal_update["parent_id"]
+    if "quarter" in goal_update:
+        update_data["quarter"] = goal_update["quarter"]
+    if "year" in goal_update:
+        update_data["year"] = goal_update["year"]
+    if "type" in goal_update:
+        update_data["type"] = goal_update["type"]
+
+    result = await goals_collection.update_one(
+        {"_id": obj_id},
+        {"$set": update_data}
+    )
+    # If no match on the resolved id form and it was an ObjectId, retry as a
+    # legacy string _id before giving up.
+    if result.matched_count == 0 and isinstance(obj_id, ObjectId):
         result = await goals_collection.update_one(
             {"_id": id},
-            {"$set": {
-                "title": goal.title,
-                "description": goal.description,
-                "image_url": goal.image_url,
-                "target_date": goal.target_date,
-                "progress": goal.progress,
-                "status": goal.status,
-                "milestones": goal.milestones,
-                "updated_at": datetime.now()
-            }}
+            {"$set": update_data}
         )
-        if result.matched_count == 0:
-             raise HTTPException(status_code=404, detail="Goal not found")
-        obj_id = id
-        
+        if result.matched_count > 0:
+            obj_id = id
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    # --- Priority cascade on status change ---
+    # When a goal is completed, archive all priorities linked to it.
+    # When a goal is un-completed, reactivate those priorities.
+    if "status" in goal_update:
+        new_status = goal_update["status"]
+        goal_id_str = str(id)
+        now = datetime.now(timezone.utc)
+
+        if new_status == "completed":
+            priority_update = {
+                "is_completed": True,
+                "completed_at": now,
+                "updated_at": now,
+            }
+        else:
+            # Goal moved back to in_progress or not_started → reactivate
+            priority_update = {
+                "is_completed": False,
+                "completed_at": None,
+                "updated_at": now,
+            }
+
+        await priorities_collection.update_many(
+            {"linked_entity_id": goal_id_str, "linked_entity_type": "goal"},
+            {"$set": priority_update},
+        )
+
     updated_goal = await goals_collection.find_one({"_id": obj_id})
     return updated_goal
 
-@router.delete("/goals/{id}")
+@router.delete("/goals/{id}", response_model=MessageResponse)
 async def delete_goal(id: str, current_user: dict = Depends(get_firebase_user)):
-    await goals_collection.delete_one({"_id": ObjectId(id)})
-    return {"message": "Goal deleted"}
+    """
+    Soft delete a goal and cascade to related activities.
+    All related data will be soft-deleted and can be recovered within 30 days.
+    """
+    from datetime import datetime, timezone
+
+    user_id = current_user.get("user_id")
+    now = datetime.now(timezone.utc)
+
+    # 1. Verify ownership
+    goal = await goals_collection.find_one({
+        "_id": ObjectId(id),
+        "user_id": user_id,
+        "deleted_at": None
+    })
+    
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now
+        }
+    }
+    
+    # 2. Soft delete the goal
+    await goals_collection.update_one(
+        {"_id": ObjectId(id)},
+        soft_delete_update
+    )
+    
+    # 3. CASCADE: Soft delete all related activities
+    await activities_collection.update_many(
+        {"goal_id": id, "deleted_at": None},
+        soft_delete_update
+    )
+    
+    return {"message": "Goal and all activities deleted successfully"}
 
 
 # --- Activities ---
@@ -435,7 +1140,9 @@ async def get_activities(
     goal_id: str,
     current_user: dict = Depends(get_firebase_user),
 ):
-    activities = await activities_collection.find({"goal_id": goal_id}).to_list(length=50)
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+    activities = await activities_collection.find({"goal_id": goal_id, "deleted_at": None}).to_list(length=50)
     return activities
 
 @router.post("/goals/{goal_id}/activities", response_model=Activity)
@@ -444,8 +1151,10 @@ async def create_activity(
     activity: Activity,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
     activity.goal_id = goal_id
-    result = await activities_collection.insert_one(activity.dict(by_alias=True))
+    result = await activities_collection.insert_one(activity.model_dump(by_alias=True))
     return await activities_collection.find_one({"_id": result.inserted_id})
 
 @router.put("/activities/{id}", response_model=Activity)
@@ -454,10 +1163,16 @@ async def update_activity(
     activity: Activity,
     current_user: dict = Depends(get_firebase_user),
 ):
+    user_id = current_user.get("user_id")
     try:
         obj_id = ObjectId(id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    existing_act = await activities_collection.find_one({"_id": obj_id})
+    if not existing_act:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    await verify_goal_ownership(existing_act["goal_id"], user_id)
 
     result = await activities_collection.update_one(
         {"_id": obj_id},
@@ -467,19 +1182,245 @@ async def update_activity(
             "days_of_week": activity.days_of_week,
             "time_of_day": activity.time_of_day,
             "is_active": activity.is_active,
-            "updated_at": datetime.now()
+            "updated_at": datetime.now(timezone.utc)
         }}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Activity not found")
 
     return await activities_collection.find_one({"_id": obj_id})
 
-@router.delete("/activities/{id}")
+@router.delete("/activities/{id}", response_model=MessageResponse)
 async def delete_activity(id: str, current_user: dict = Depends(get_firebase_user)):
-    await activities_collection.delete_one({"_id": ObjectId(id)})
+    user_id = current_user.get("user_id")
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    result = await activities_collection.update_one({"_id": ObjectId(id)}, soft_delete_update)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Activity not found")
     return {"message": "Activity deleted"}
+
+
+# --- Milestones ---
+
+class MilestoneCreate(BaseModel):
+    title: str
+    due_date: Optional[str] = None
+    is_key_result: bool = False
+
+
+class MilestonePatch(BaseModel):
+    title: Optional[str] = None
+    due_date: Optional[str] = None
+    completed: Optional[bool] = None
+    is_key_result: Optional[bool] = None
+
+
+class MilestoneResponse(BaseModel):
+    id: str
+    title: str
+    due_date: Optional[str] = None
+    completed: bool
+    is_key_result: bool
+
+
+def _resolve_goal_id(goal_id: str):
+    """Return an ObjectId when the string is a valid 24-hex ObjectId, otherwise return the raw string."""
+    from bson.errors import InvalidId
+    try:
+        return ObjectId(goal_id)
+    except InvalidId:
+        return goal_id
+
+
+async def _fetch_goal_doc(goal_id: str) -> dict:
+    """Fetch goal document by ObjectId or string fallback. Raises 404 if not found."""
+    obj_id = _resolve_goal_id(goal_id)
+    goal = await goals_collection.find_one({"_id": obj_id, "deleted_at": None})
+    if not goal and isinstance(obj_id, ObjectId):
+        # Fallback: some legacy docs may be stored with string _id
+        goal = await goals_collection.find_one({"_id": goal_id, "deleted_at": None})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return goal
+
+
+@router.post(
+    "/goals/{goal_id}/milestones",
+    response_model=MilestoneResponse,
+    status_code=201,
+)
+async def create_milestone(
+    goal_id: str,
+    payload: MilestoneCreate,
+    current_user: dict = Depends(get_firebase_user),
+) -> MilestoneResponse:
+    """
+    Append a new milestone to a goal's milestones array.
+
+    Ownership is verified by tracing: goal → focus_area → annual_plan → user_id.
+    Each milestone receives a stable `id` (str(ObjectId())) so it can be
+    addressed by subsequent PATCH / DELETE calls.
+    """
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+
+    new_milestone = Milestone(
+        id=str(ObjectId()),
+        title=payload.title,
+        due_date=payload.due_date,
+        is_key_result=payload.is_key_result,
+        completed=False,
+    )
+    milestone_doc = new_milestone.model_dump()
+
+    obj_id = _resolve_goal_id(goal_id)
+    result = await goals_collection.update_one(
+        {"_id": obj_id, "deleted_at": None},
+        {
+            "$push": {"milestones": milestone_doc},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+
+    if result.matched_count == 0:
+        # Fallback: string _id
+        result = await goals_collection.update_one(
+            {"_id": goal_id, "deleted_at": None},
+            {
+                "$push": {"milestones": milestone_doc},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    return MilestoneResponse(
+        id=new_milestone.id,
+        title=new_milestone.title,
+        due_date=new_milestone.due_date,
+        completed=new_milestone.completed,
+        is_key_result=new_milestone.is_key_result,
+    )
+
+
+@router.patch(
+    "/goals/{goal_id}/milestones/{milestone_id}",
+    response_model=MilestoneResponse,
+)
+async def update_milestone(
+    goal_id: str,
+    milestone_id: str,
+    payload: MilestonePatch,
+    current_user: dict = Depends(get_firebase_user),
+) -> MilestoneResponse:
+    """
+    Partially update a single milestone within a goal.
+
+    Only fields present in the request body are written; unset fields are
+    left unchanged. Uses MongoDB positional operator `$` to target the
+    milestone by its `id` field without replacing the whole array.
+    """
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+
+    goal = await _fetch_goal_doc(goal_id)
+
+    milestones: list = goal.get("milestones", [])
+    target = next((m for m in milestones if m.get("id") == milestone_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    # Merge patch fields onto the existing milestone
+    updated = dict(target)
+    if payload.title is not None:
+        updated["title"] = payload.title
+    if payload.due_date is not None:
+        updated["due_date"] = payload.due_date
+    if payload.completed is not None:
+        updated["completed"] = payload.completed
+    if payload.is_key_result is not None:
+        updated["is_key_result"] = payload.is_key_result
+
+    obj_id = _resolve_goal_id(goal_id)
+    result = await goals_collection.update_one(
+        {"_id": obj_id, "milestones.id": milestone_id, "deleted_at": None},
+        {
+            "$set": {
+                "milestones.$": updated,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    if result.matched_count == 0:
+        # Fallback: string _id
+        result = await goals_collection.update_one(
+            {"_id": goal_id, "milestones.id": milestone_id, "deleted_at": None},
+            {
+                "$set": {
+                    "milestones.$": updated,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal or milestone not found")
+
+    return MilestoneResponse(
+        id=updated["id"],
+        title=updated["title"],
+        due_date=updated.get("due_date"),
+        completed=updated["completed"],
+        is_key_result=updated["is_key_result"],
+    )
+
+
+@router.delete(
+    "/goals/{goal_id}/milestones/{milestone_id}",
+    response_model=MessageResponse,
+)
+async def delete_milestone(
+    goal_id: str,
+    milestone_id: str,
+    current_user: dict = Depends(get_firebase_user),
+) -> MessageResponse:
+    """
+    Remove a single milestone from a goal's milestones array by its `id`.
+
+    Uses MongoDB `$pull` so only the targeted sub-document is removed.
+    """
+    user_id = current_user.get("user_id")
+    await verify_goal_ownership(goal_id, user_id)
+
+    obj_id = _resolve_goal_id(goal_id)
+    result = await goals_collection.update_one(
+        {"_id": obj_id, "deleted_at": None},
+        {
+            "$pull": {"milestones": {"id": milestone_id}},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    if result.matched_count == 0:
+        result = await goals_collection.update_one(
+            {"_id": goal_id, "deleted_at": None},
+            {
+                "$pull": {"milestones": {"id": milestone_id}},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+
+    return MessageResponse(message="Milestone deleted")
 
 
 

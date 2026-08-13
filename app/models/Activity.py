@@ -1,12 +1,13 @@
 from pydantic import BaseModel, Field
 from bson import ObjectId
 from .types import PyObjectId
+from .mixins import SoftDeleteMixin
 from typing import Optional
 from datetime import datetime
 
-class Activity(BaseModel):
+class Activity(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
-    goal_id: str
+    goal_id: Optional[str] = None  # Stamped from URL path param in create_activity; optional here so body validation passes
     title: str
     description: Optional[str] = ""
     frequency: str = "daily"  # daily, weekly, custom
@@ -14,6 +15,8 @@ class Activity(BaseModel):
     time_of_day: Optional[str] = "anytime"  # morning, afternoon, evening, anytime
     duration_minutes: Optional[int] = 30
     is_active: bool = True
+    streak: int = 0
+    last_completed_date: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 

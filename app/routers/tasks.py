@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.Task import Task
@@ -8,9 +8,12 @@ from app.config.database import db
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
 
+from app.auth.dependencies import require_ownership
+
 router = APIRouter(
     prefix="/tasks",
     tags=["tasks"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -31,10 +34,10 @@ async def create_task(
     logger.info(f"User {user_id} creating task: {task.title}")
 
     task.user_id = user_id
-    task.created_at = datetime.utcnow()
-    task.updated_at = datetime.utcnow()
+    task.created_at = datetime.now(timezone.utc)
+    task.updated_at = datetime.now(timezone.utc)
 
-    task_dict = task.dict(by_alias=True, exclude={"id"})
+    task_dict = task.model_dump(by_alias=True, exclude={"id"})
     result = await collection.insert_one(task_dict)
 
     created_task = await collection.find_one({"_id": result.inserted_id})
@@ -56,7 +59,7 @@ async def list_tasks(
     logger.info(f"Listing tasks for user: {user_id}")
 
     # Build query
-    query = {"user_id": user_id}
+    query = {"user_id": user_id, "deleted_at": None}
     if completed is not None:
         query["is_completed"] = completed
     if category:
@@ -75,19 +78,9 @@ async def list_tasks(
 @router.get("/{id}", summary="Get a task by ID", response_model=Task)
 async def get_task(
     id: str,
-    collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_firebase_user),
+    task: dict = Depends(require_ownership(get_tasks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} fetching task with ID: {id}")
-
-    task = await collection.find_one({"_id": ObjectId(id)})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Authorization check
-    if str(task.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Not authorized to view this task")
+    logger.info(f"Fetching task with ID: {id}")
 
     task["_id"] = str(task["_id"])
     if task.get("user_id"):
@@ -101,27 +94,30 @@ async def update_task(
     id: str,
     updates: dict,
     collection: Collection = Depends(get_tasks_collection),
+    task: dict = Depends(require_ownership(get_tasks_collection, "id")),
     user: dict = Depends(get_firebase_user),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} updating task {id}")
+    logger.info(f"Updating task {id}")
 
-    # Fetch the task
-    task = await collection.find_one({"_id": ObjectId(id)})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    updates["updated_at"] = datetime.now(timezone.utc)
 
-    # Authorization check
-    if str(task.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this task"
-        )
+    # Prevent Mass Assignment of internal fields
+    for field in ["_id", "id", "user_id", "created_at"]:
+        updates.pop(field, None)
 
-    # Add updated timestamp
-    updates["updated_at"] = datetime.utcnow()
+    # Detect task completion to award XP
+    was_completed = task.get("is_completed", False)
+    is_now_completed = updates.get("is_completed", was_completed)
+    just_completed = (not was_completed) and is_now_completed
 
     # Update the task
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
+
+    # Award XP when a task is marked complete for the first time
+    if just_completed:
+        from app.routers.agent import grant_xp
+        user_id = user.get("user_id")
+        await grant_xp(user_id, 50)
 
     # Return updated task
     updated_task = await collection.find_one({"_id": ObjectId(id)})
@@ -132,25 +128,26 @@ async def update_task(
     return updated_task
 
 
-@router.delete("/{id}", summary="Delete a task")
+
+@router.delete("/{id}", summary="Delete a task", status_code=204)
 async def delete_task(
     id: str,
     collection: Collection = Depends(get_tasks_collection),
-    user: dict = Depends(get_firebase_user),
+    task: dict = Depends(require_ownership(get_tasks_collection, "id")),
 ):
-    user_id = user.get("user_id")
-    logger.info(f"User {user_id} deleting task {id}")
+    logger.info(f"Deleting task {id}")
 
-    # Fetch the task
-    task = await collection.find_one({"_id": ObjectId(id)})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Authorization check
-    if str(task.get("user_id")) != str(user_id):
-        raise HTTPException(
-            status_code=403, detail="Not authorized to delete this task"
-        )
-
-    await collection.delete_one({"_id": ObjectId(id)})
-    return {"message": "Task deleted successfully"}
+    user_id = task.get("user_id")
+    now = datetime.now(timezone.utc)
+    soft_delete_update = {
+        "$set": {
+            "deleted_at": now,
+            "deleted_by": user_id,
+            "updated_at": now,
+        }
+    }
+    await collection.update_one(
+        {"_id": ObjectId(task["_id"])},
+        soft_delete_update,
+    )
+    return None

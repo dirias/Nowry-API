@@ -1,10 +1,11 @@
 from pydantic import BaseModel, Field
 from bson import ObjectId
 from .types import PyObjectId
+from .mixins import SoftDeleteMixin
 from typing import Optional
 from datetime import datetime
 
-class FocusArea(BaseModel):
+class FocusArea(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     annual_plan_id: str
     name: str 

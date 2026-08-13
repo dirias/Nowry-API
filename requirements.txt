@@ -2,6 +2,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+eval-type-backport  # Required by pydantic v2 to resolve `X | Y` union syntax on Python <3.10
 pymongo
 motor
 python-multipart
@@ -10,12 +11,29 @@ black
 groq
 
 # --- AI / LangGraph ---
+anthropic>=0.40.0
+google-generativeai>=0.7.2
+google-cloud-texttospeech==2.36.0
+google-auth>=2.0.0
+# Pinned (not >=) to 2.1.1: requires Python >=3.10, which satisfies both the
+# production image (python:3.10-slim, see Nowry-API/dockerfile) and the 3.13
+# build environment. Do NOT bump to 2.2.0+ — that requires >=3.12 and would
+# break the 3.10 production image. Note no release of this package supports
+# Python 3.9; the minimum across all versions is 3.10.
+# NOTE: this is the official/maintained package (github.com/pemistahl/lingua-py),
+# imported as `lingua` — do not confuse with the unrelated "lingua-py" PyPI
+# package, a low-adoption third-party binding of the same underlying Rust lib.
+lingua-language-detector==2.1.1
 langgraph>=0.0.53
 langchain>=0.2.12
 langchain-core>=0.2.24
 langchain-community>=0.2.9
 langchain-groq>=0.1.6
 httpx>=0.27.0
+
+# --- Monitoring ---
+sentry-sdk[fastapi]>=2.0.0
+langfuse>=4.7.0
 
 # --- Utils / Logging ---
 python-dotenv>=1.0.1
@@ -27,10 +45,14 @@ bcrypt
 feedparser
 
 # --- Testing ---
-#pytest>=8.2.0
-#pytest-asyncio>=0.23.7
+pytest>=8.2.0
+pytest-asyncio>=0.23.7
+
+# --- Stripe ---
+stripe>=11.0.0
+
 gunicorn
 slowapi
-cloudinary
+cloudinary>=1.40.0,<2.0
 firebase-admin
 email-validator

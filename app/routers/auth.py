@@ -7,11 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config.database import users_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.config.subscription_plans import SubscriptionTier
+from app.models.common import UserAuthResponse
 
 router = APIRouter(
     prefix="/auth",
@@ -24,6 +25,7 @@ class RegisterRequest(BaseModel):
     firebase_uid: str
     email: EmailStr
     username: str
+    photo_url: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -31,7 +33,7 @@ class LoginRequest(BaseModel):
     email: EmailStr
 
 
-@router.post("/register")
+@router.post("/register", response_model=UserAuthResponse)
 async def register_user(
     request: RegisterRequest,
     firebase_user: dict = Depends(get_firebase_user)
@@ -69,6 +71,7 @@ async def register_user(
             "firebase_uid": existing_user.get("firebase_uid"),
             "email": existing_user.get("email"),
             "username": existing_user.get("username"),
+            "photo_url": existing_user.get("photo_url"),
             "wizard_completed": existing_user.get("wizard_completed", False)
         }
     
@@ -77,14 +80,18 @@ async def register_user(
         "firebase_uid": request.firebase_uid,
         "email": request.email,
         "username": request.username,
+        # Seed full_name from username so the Settings field is never blank.
+        # Users can update it to their real name at any time.
+        "full_name": request.username,
+        "photo_url": request.photo_url,
         "role": "user",
         "subscription": {
             "tier": SubscriptionTier.FREE,
             "status": "active"
         },
         "wizard_completed": False,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc)
     }
     
     result = await users_collection.insert_one(user_doc)
@@ -100,7 +107,7 @@ async def register_user(
     }
 
 
-@router.post("/login")
+@router.post("/login", response_model=UserAuthResponse)
 async def login_user(
     request: LoginRequest,
     firebase_user: dict = Depends(get_firebase_user)

@@ -6,6 +6,8 @@ from app.ai_orchestrator.visualizer.visualizer_node import generate_visual_node
 class VisualizerState(TypedDict):
     text: str
     viz_type: str
+    tier: str
+    llm_client: Any
     mermaid_code: Optional[str]
     explanation: Optional[str]
     error: Optional[str]

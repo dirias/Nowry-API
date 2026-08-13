@@ -1,19 +1,45 @@
 # app/config/auth_config.py
+import logging
 import os
 from dotenv import load_dotenv
 from fastapi import HTTPException, Header
 import jwt
 
+from app.config.environment import is_production
+
 load_dotenv()
 
-# Use a fixed secret key from environment or a consistent fallback for development
-SECRET_KEY = os.getenv("SECRET_KEY", "nowry_super_secret_key_12345")
+logger = logging.getLogger(__name__)
+
+# Obviously-a-dev-value fallback — never used in production (see below).
+_DEV_ONLY_SECRET_KEY = "DEV-ONLY-INSECURE-nowry-secret-key-do-not-use-in-prod"
+
+_env_secret_key = os.getenv("SECRET_KEY", "").strip()
+
+if is_production():
+    if not _env_secret_key:
+        raise RuntimeError(
+            "SECRET_KEY environment variable is not set. Refusing to start "
+            "in production with no signing key. Generate one with: "
+            "openssl rand -hex 32"
+        )
+    SECRET_KEY = _env_secret_key
+else:
+    if _env_secret_key:
+        SECRET_KEY = _env_secret_key
+    else:
+        logger.warning(
+            "SECRET_KEY is not set — falling back to an insecure DEV-ONLY "
+            "signing key. This is only safe for local development. Set "
+            "SECRET_KEY before deploying (e.g. `openssl rand -hex 32`)."
+        )
+        SECRET_KEY = _DEV_ONLY_SECRET_KEY
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Secure cookie is required for production (HTTPS), but disabled for dev (HTTP)
-# Secure cookie is required for production (HTTPS), but disabled for dev (HTTP)
-SECURE_COOKIE = os.getenv("ENV") == "production"
+SECURE_COOKIE = is_production()
 SAMESITE_COOKIE = "none" if SECURE_COOKIE else "lax"
 
 

@@ -1,8 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from app.auth.firebase_auth import get_firebase_user
 from app.utils.storage import get_storage_backend
+from app.utils.logger import get_logger
 from typing import Dict, Any
 import os
+
+logger = get_logger(__name__)
 
 router = APIRouter(
     prefix="/image",
@@ -16,6 +19,10 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 def validate_image_file(file: UploadFile) -> None:
     """Validate image file type and size"""
+    # Check MIME type
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid MIME type. Must be an image.")
+        
     # Check file extension
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
@@ -99,7 +106,7 @@ async def upload_image(
         }
         
     except Exception as e:
-        print(f"Error uploading image: {e}")
+        logger.error(f"Error uploading image: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
@@ -109,6 +116,14 @@ async def delete_image(
     current_user: dict = Depends(get_firebase_user),
 ) -> Dict[str, str]:
     """Delete an image from storage"""
+    user_id = current_user.get("user_id")
+
+    # Security Fix: Prevent IDOR by asserting the image being deleted belongs solely to the mapped User ID folder
+    if not public_id.startswith(f"nowry/{user_id}/"):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to delete this image."
+        )
+
     try:
         storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
         success = await storage.delete(public_id)
@@ -119,5 +134,5 @@ async def delete_image(
             raise HTTPException(status_code=404, detail="Image not found")
             
     except Exception as e:
-        print(f"Error deleting image: {e}")
+        logger.error(f"Error deleting image: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")

@@ -4,14 +4,38 @@ from dotenv import load_dotenv
 # Load env before importing other modules that rely on env vars
 load_dotenv()
 
+from app.config.environment import get_environment, is_production
+
+# Initialize Sentry BEFORE FastAPI app creation — gated on env var presence
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+_SENTRY_DSN = os.getenv("SENTRY_DSN")
+if _SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=_SENTRY_DSN,
+        integrations=[
+            FastApiIntegration(),
+        ],
+        traces_sample_rate=0.1 if is_production() else 1.0,
+        environment=get_environment(),
+        debug=False,
+    )
+
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from app.config.database import create_indexes
+from app.core.limiter import limiter
+from app.core import langfuse_client as _langfuse_module
+from app.core import prompt_manager
+
+logger = logging.getLogger(__name__)
 from app.routers import (
     books,
     users,
@@ -27,40 +51,98 @@ from app.routers import (
     annual_planning,
     image_upload,
     auth,
+    public_content,
+    moderation,
+    blackboards,
+    import_apkg,
+    agent,
+    quiz,
+    quiz_ai,
+    study_sessions,
+    stripe_webhooks,
+    subscriptions,
+    tts,
+    tts_segment,
+    illustrations,
+    sheets,
+    goal_ai,
+    comments,
 )
 
 
 
-# Initialize Rate Limiter
-limiter = Limiter(key_func=get_remote_address)
+async def _flush_langfuse_queue() -> None:
+    """
+    Graceful shutdown: flush pending Langfuse traces with 5s timeout.
+    Prevents Railway SIGKILL from silently dropping the last trace batch.
+    Uses run_in_executor to avoid blocking the event loop during shutdown.
+    """
+    client = _langfuse_module._langfuse_client
+    if not client:
+        return
+    try:
+        logger.info("Flushing Langfuse queue (5s timeout)...")
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, client.flush),
+            timeout=5.0,
+        )
+        logger.info("Langfuse queue flushed successfully.")
+    except asyncio.TimeoutError:
+        logger.warning("Langfuse queue flush timed out after 5s. Some traces may be lost.")
+    except Exception as e:
+        logger.warning("Langfuse queue flush failed: %s", e)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     await create_indexes()
+    # [Phase 10] Pre-warm all 8 prompt templates into _prompt_cache and langfuse_cache.json.
+    # Non-raising: falls back to core/prompts.py constants on any Langfuse error (D-07).
+    await prompt_manager.prewarm()
     yield
-    # Shutdown (if needed)
+    # Shutdown
+    await _flush_langfuse_queue()
 
 
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Stripe webhook router MUST be registered before any middleware.
+# Stripe sends POST /stripe/webhook with a Stripe-Signature header (not a Firebase token).
+# Any auth or CORS middleware registered first would reject Stripe's requests with 401.
+app.include_router(stripe_webhooks.router)
+
 app.add_middleware(SlowAPIMiddleware)
 
 # CORS Configuration
-# Get allowed origins from env or default to localhost
-allowed_origins_env = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000",
-)
-allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",")]
+# Origins that are always allowed, regardless of environment configuration.
+# ALLOWED_ORIGINS (comma-separated) can add more (e.g. one-off preview URLs).
+DEFAULT_ALLOWED_ORIGINS: list[str] = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "https://nowry.app",
+    "https://www.nowry.app",
+    "https://dev.nowry.app",
+    "https://www.dev.nowry.app",
+]
+
+allowed_origins_env: str = os.getenv("ALLOWED_ORIGINS", "")
+env_origins: list[str] = [
+    origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()
+]
+# dict.fromkeys preserves order while removing duplicates.
+allowed_origins: list[str] = list(dict.fromkeys(DEFAULT_ALLOWED_ORIGINS + env_origins))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    # Vercel preview deployments (e.g. https://nowry-git-<branch>-<team>.vercel.app)
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -78,6 +160,21 @@ app.include_router(news.router)
 app.include_router(bugs.router)
 app.include_router(annual_planning.router)
 app.include_router(image_upload.router)
+app.include_router(public_content.router)  # Public content sharing
+app.include_router(moderation.router)  # Content moderation
+app.include_router(blackboards.router)  # Blackboard brainstorm canvas
+app.include_router(import_apkg.router)  # Anki .apkg import
+app.include_router(agent.router)         # Study Buddy AI companion
+app.include_router(quiz.router, prefix="/v1/assistant/quiz", tags=["quiz"])      # Active Study Partner (deck)
+app.include_router(quiz_ai.router, prefix="/v1/assistant/quiz", tags=["quiz"])   # Active Study Partner (AI)
+app.include_router(study_sessions.router, prefix="/v1/study-sessions", tags=["study-sessions"])  # Session history
+app.include_router(subscriptions.router)  # Stripe checkout, portal, and subscription status
+app.include_router(tts.router)            # AMagic TTS — POST /book/{book_id}/tts
+app.include_router(tts_segment.router)    # Language segmentation — POST /v1/tts/segment
+app.include_router(illustrations.router)  # Illustration Magic — POST /book/{book_id}/diagram
+app.include_router(sheets.router)         # Micro Sheets — CRUD /sheets
+app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (Pro-only)
+app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  # Text-anchored annotations
 
 
 @app.get("/")

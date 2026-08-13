@@ -5,7 +5,7 @@ Based on the SuperMemo 2 algorithm for optimal flashcard scheduling.
 Reference: https://www.supermemo.com/en/archives1990-2015/english/ol/sm2
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 GradeType = Literal["again", "hard", "good", "easy"]
@@ -62,12 +62,12 @@ def calculate_next_review(
         new_repetitions = repetitions + 1
 
     # Calculate next review date
-    next_review = datetime.utcnow() + timedelta(days=new_interval)
+    next_review = datetime.now(timezone.utc) + timedelta(days=new_interval)
 
     return {
         "next_review": next_review,
         "ease_factor": round(new_ease_factor, 2),
         "interval": new_interval,
         "repetitions": new_repetitions,
-        "last_reviewed": datetime.utcnow(),
+        "last_reviewed": datetime.now(timezone.utc),
     }

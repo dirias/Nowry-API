@@ -1,6 +1,7 @@
-from app.ai_orchestrator.llm_clients.groq_client import Groq_client
 import json
 from fastapi import HTTPException
+from app.core import prompt_manager
+from app.core.evaluation_helper import score_trace
 
 
 def quiz_node(state):
@@ -17,27 +18,28 @@ def quiz_node(state):
             status_code=400, detail="No text provided for quiz generation"
         )
 
-    from app.core.prompts import QUIZ_GENERATION_TEMPLATE
-
     # Prepare custom instructions
     custom_instr = ""
     if custom_prompt:
         custom_instr = f"Additional Instructions: {custom_prompt}\n\n"
 
-    system_prompt = QUIZ_GENERATION_TEMPLATE.format(
+    # Build system prompt via centralized prompt manager (D-13)
+    system_prompt = prompt_manager.get_prompt(
+        "nowry-quiz-magic",
         difficulty=difficulty,
         num_questions=num_questions,
-        custom_instructions=custom_instr
+        custom_instructions=custom_instr,
     )
 
     request_string = f"{system_prompt}\n\nProvided Context:\n{sample_text}"
 
-    groq_client = Groq_client()
-    # Assuming the client handles the call. We might need to adjust if Groq_client API differs.
-    # Based on text_node.py it uses .request(prompt)
+    # Use state-injected LLM client (injected by AIOrchestrator.invoke based on tier)
+    llm_client = state.get("llm_client")
+    if not llm_client:
+        raise HTTPException(status_code=500, detail="LLM client not injected into state")
 
     try:
-        ai_response = groq_client.request(request_string)
+        ai_response = llm_client.request(request_string)
         # Extract content
         raw_output = ai_response.choices[0].message.content.strip()
 
@@ -54,11 +56,22 @@ def quiz_node(state):
         if start_idx != -1 and end_idx != -1:
             json_str = raw_output[start_idx : end_idx + 1]
             quiz_data = json.loads(json_str)
+            # D-04: no comment on success
+            score_trace(name="format-valid", value=True)
             return {"generated_quiz": quiz_data}
         else:
             raise ValueError("No JSON array found in response")
 
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
+        # D-02 CRITICAL: record the failure score BEFORE raising -- the trace
+        # context (propagate_attributes) is still active here, but NOT after
+        # the HTTPException propagates out of graph.invoke().
+        snippet = raw_output[:300]
+        score_trace(
+            name="format-valid",
+            value=False,
+            comment=f"{e}\nRaw output (truncated): {snippet}",
+        )
         print(f"Quiz JSON Generation failed: {e}")
         print(f"Raw Output: {raw_output}")
         # Fallback or error

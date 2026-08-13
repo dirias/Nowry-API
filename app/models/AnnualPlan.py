@@ -1,10 +1,11 @@
 from pydantic import BaseModel, Field
 from bson import ObjectId
 from .types import PyObjectId
+from .mixins import SoftDeleteMixin
 from typing import Optional
 from datetime import datetime
 
-class AnnualPlan(BaseModel):
+class AnnualPlan(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: str
     year: int

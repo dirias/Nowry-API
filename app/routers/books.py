@@ -1,15 +1,29 @@
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
-from app.models.Book import Book
+from app.models.Book import Book, BookSummary
+from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection
 from app.auth.firebase_auth import get_firebase_user
+from app.auth.dependencies import require_ownership, track_ai_usage
+from app.utils.logger import get_logger
+from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
+from app.core.langfuse_client import get_langfuse_client
+from langfuse import propagate_attributes
+from app.core import prompt_manager
+
+logger = get_logger(__name__)
+
+_GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 
 router = APIRouter(
     prefix="/book",
     tags=["books"],
+    dependencies=[Depends(get_firebase_user)],
     responses={404: {"description": "Not found"}},
 )
 
@@ -49,9 +63,10 @@ async def create_book(
 
     # Check limit if not unlimited (-1)
     if book_limit != -1:
-        current_book_count = await books_collection.count_documents(
-            {"user_id": user_id}
-        )
+        current_book_count = await books_collection.count_documents({
+            "user_id": user_id,
+            "deleted_at": None  # Only count non-deleted books
+        })
         if current_book_count >= book_limit:
             raise HTTPException(
                 status_code=403,
@@ -59,31 +74,24 @@ async def create_book(
             )
     # --------------------------------
     
-    print(f"[DEBUG CREATE] Attempting to insert book: {book.title}")
+    logger.info(f"Creating book: {book.title}")
     # Exclude _id to let MongoDB generate it as ObjectId
-    book_dict = book.dict(by_alias=True, exclude={'id'})
-    print(f"[DEBUG CREATE] Book dict keys: {book_dict.keys()}")
-    
+    book_dict = book.model_dump(by_alias=True, exclude={'id'})
+
     new_book = await books_collection.insert_one(book_dict)
     book_id = str(new_book.inserted_id)
-    print(f"[DEBUG CREATE] Book inserted with ID: {book_id}")
-    print(f"[DEBUG CREATE] Insert result acknowledged: {new_book.acknowledged}")
-    
-    print(f"[DEBUG CREATE] Insert result acknowledged: {new_book.acknowledged}")
-    
+    logger.info(f"Book inserted with ID: {book_id}")
+
     # We no longer create a "first page" as the book uses full_content now.
-    
+
     # Fetch and return the created book
-    print(f"[DEBUG CREATE] Fetching created book from database...")
     created_book = await books_collection.find_one({"_id": new_book.inserted_id})
-    print(f"[DEBUG CREATE] Created book found in DB: {created_book is not None}")
-    
+
     if created_book:
         created_book["_id"] = str(created_book["_id"])
-        print(f"[DEBUG CREATE] Returning book: {created_book['_id']}")
         return created_book
-    
-    print(f"[DEBUG CREATE] ERROR: Book was inserted but not found in database!")
+
+    logger.error(f"Book was inserted (ID: {book_id}) but not found in database after insert")
     raise HTTPException(status_code=500, detail="Failed to create book")
 
 
@@ -91,25 +99,17 @@ async def create_book(
 async def edit_book(
     book_id: str,
     book_data: Book,
+    background_tasks: BackgroundTasks,
     books_collection: Collection = Depends(get_books_collection),
+    existing_book: dict = Depends(require_ownership(get_books_collection, "book_id")),
+    current_user: dict = Depends(get_firebase_user),
 ):
-    # Check if the book exists (Try both ObjectId and String ID)
-    query = {"_id": ObjectId(book_id)}
-    existing_book = await books_collection.find_one(query)
-    
-    if existing_book is None:
-        # Fallback to string ID
-        query = {"_id": book_id}
-        existing_book = await books_collection.find_one(query)
-        
-    if existing_book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-
     # Update the book data using partial update (exclude_unset=True)
-    update_data = book_data.dict(exclude_unset=True)
+    update_data = book_data.model_dump(exclude_unset=True)
     
-    # Remove immutable/system fields that shouldn't be updated by user
-    fields_to_remove = ["id", "_id", "user_id", "created_at"]
+    # Remove immutable/system fields that shouldn't be updated by user.
+    # forked_from is permanently set at fork time and must never be overwritten.
+    fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from"]
     for field in fields_to_remove:
         update_data.pop(field, None)
     
@@ -120,7 +120,7 @@ async def edit_book(
     update_data["updated_at"] = datetime.now()
 
     res = await books_collection.update_one(
-        query, # Use the query that successfully found the book
+        {"_id": ObjectId(existing_book["_id"]) if len(existing_book["_id"]) == 24 else existing_book["_id"]},
         {"$set": update_data},
     )
 
@@ -128,109 +128,115 @@ async def edit_book(
         raise HTTPException(status_code=404, detail="Book not found")
 
     # Fetch and return the updated book
-    # Fetch and return the updated book
-    updated_book = await books_collection.find_one(query)
+    updated_book = await books_collection.find_one({"_id": ObjectId(existing_book["_id"]) if len(existing_book["_id"]) == 24 else existing_book["_id"]})
     if updated_book:
         updated_book["_id"] = str(updated_book["_id"])
+
+        # Trigger background RAG indexing if content changed
+        if "full_content" in update_data and update_data["full_content"]:
+            from app.utils.book_rag import index_book
+            user_id: str = current_user["uid"]
+            background_tasks.add_task(
+                index_book,
+                book_id=str(existing_book["_id"]),
+                user_id=user_id,
+                raw_content=update_data["full_content"],
+            )
+
         return updated_book
     
     raise HTTPException(status_code=500, detail="Error fetching updated book")
 
 
-@router.delete("/delete/{book_id}", summary="Delete a book by ID")
+@router.delete("/delete/{book_id}", summary="Soft delete a book by ID", status_code=204)
 async def delete_book(
     book_id: str,
     books_collection: Collection = Depends(get_books_collection),
+    book: dict = Depends(require_ownership(get_books_collection, "book_id")),
 ):
-    # Strategy 1: Delete by ObjectId
-    try:
-        obj_id = ObjectId(book_id)
-        deleted_book = await books_collection.find_one_and_delete({"_id": obj_id})
-        if deleted_book:
-            print(f"[DEBUG DELETE] Book deleted successfully by ObjectId: {book_id}")
-            return {"message": "Book deleted successfully"}
-    except Exception as e:
-        print(f"[DEBUG DELETE] Invalid ObjectId format or error: {e}")
+    """
+    Soft delete a book (sets deleted_at timestamp).
+    Also auto-unpublishes if the book was public.
+    """
+    now = datetime.now(timezone.utc)
 
-    # Strategy 2: Delete by String ID (Fallback for potential import mismatches)
-    print(f"[DEBUG DELETE] Fallback: Attempting delete by String ID: {book_id}")
-    deleted_book_str = await books_collection.find_one_and_delete({"_id": book_id})
-    
-    if deleted_book_str:
-        print(f"[DEBUG DELETE] Book deleted successfully by String ID: {book_id}")
-        return {"message": "Book deleted successfully"}
-    
-    print(f"[DEBUG DELETE] Book not found (tried both ObjectId and String): {book_id}")
+    try:
+        # Soft delete + auto-unpublish
+        result = await books_collection.update_one(
+            {"_id": ObjectId(book["_id"]) if len(book["_id"]) == 24 else book["_id"]},
+            {
+                "$set": {
+                    "deleted_at": now,
+                    "deleted_by": book.get("user_id"),
+                    "is_public": False,  # Auto-unpublish
+                    "updated_at": now
+                }
+            }
+        )
+
+        if result.modified_count > 0:
+            logger.info(f"Book soft-deleted successfully: {book_id}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error soft-deleting book {book_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error deleting book")
+
     raise HTTPException(status_code=404, detail="Book not found")
 
 
-@router.get("/search", summary="Search books by title", response_model=List[Book])
+@router.get("/search", summary="Search books by title", response_model=List[BookSummary])
 async def search_books(
-    title: str, books_collection: Collection = Depends(get_books_collection)
+    title: str,
+    books_collection: Collection = Depends(get_books_collection),
+    current_user: dict = Depends(get_firebase_user),
 ):
-    # Search books by title (case-insensitive)
-    cursor = books_collection.find({"title": {"$regex": title, "$options": "i"}})
+    user_id = current_user.get("user_id")
+    import re
+    safe_title = re.escape(title)
+    
+    # Search books by title (case-insensitive), excluding full_content for performance, and locked to the user
+    cursor = books_collection.find(
+        {"title": {"$regex": safe_title, "$options": "i"}, "user_id": user_id, "deleted_at": None},
+        {"full_content": 0}
+    )
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
     return books
 
 
-@router.get("/all", summary="Get all books", response_model=List[Book])
+@router.get("/all", summary="Get all books", response_model=List[BookSummary])
 async def get_all_books(
     books_collection: Collection = Depends(get_books_collection),
     current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
-    # Retrieve all books for the current user
-    cursor = books_collection.find({"user_id": user_id})
+    
+    # Debug: Check total books for this user (including deleted)
+    total_count = await books_collection.count_documents({"user_id": user_id})
+    logger.debug(f"Total books for user {user_id}: {total_count}")
+
+    # Retrieve all books for the current user that are NOT soft-deleted
+    # Exclude full_content significantly improves performance for large documents
+    cursor = books_collection.find(
+        {
+            "user_id": user_id,
+            "deleted_at": None  # Only books where deleted_at is None
+        },
+        {"full_content": 0}
+    )
     books = await cursor.to_list(length=100)  # Limit to 100 books for safety
+
     for book in books:
         book["_id"] = str(book["_id"])
+    
     return books
 
 
 @router.get("/{book_id}", response_model=Book)
 async def get_book_by_id(
-    book_id: str,
-    books_collection: Collection = Depends(get_books_collection),
+    book: dict = Depends(require_ownership(get_books_collection, "book_id")),
 ):
-    # Find the book by its ID in the MongoDB collection
-    # Find the book by its ID in the MongoDB collection
-    print(f"[DEBUG] Searching for book with ID: {book_id} (Code Version: Fallback-Enabled)")
-    object_id = None
-    try:
-        object_id = ObjectId(book_id)
-        print(f"[DEBUG] Converted to ObjectId: {object_id}")
-    except Exception as e:
-        print(f"[DEBUG] '{book_id}' is not a valid ObjectId: {e}")
-    
-    book = None
-    if object_id:
-        book = await books_collection.find_one({"_id": object_id})
-    
-    if not book:
-        print(f"[DEBUG] Book not found by ObjectId. Trying String ID: {book_id}")
-        book = await books_collection.find_one({"_id": book_id})
-
-    print(f"[DEBUG] Book found: {book is not None}")
-    
-    if not book:
-        # DB Dump for debugging
-        print(f"[DEBUG] --- START DB DUMP (First 20) ---")
-        try:
-            all_books_cursor = books_collection.find({}, {"_id": 1, "title": 1})
-            all_books = await all_books_cursor.to_list(length=20)
-            for b in all_books:
-                # Print repr to see types clearly (ObjectId(...) vs 'string')
-                print(f" - ID: {repr(b['_id'])} | Title: {b.get('title', 'No Title')}")
-        except Exception as ex:
-            print(f"[DEBUG] Error dumping DB: {ex}")
-        print(f"[DEBUG] --- END DB DUMP ---")
-        
-        raise HTTPException(status_code=404, detail="Book not found")
-
-    if book:
-        book["_id"] = str(book["_id"])
-        return book
+    return book
 
 
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
@@ -327,11 +333,24 @@ async def import_book_from_file(
             },
         }
 
-    # SAVE MODE: Create the book and pages
     # SAVE MODE: Create the book with full_content
-    # Concatenate all pages into one continuous HTML string
-    # Concatenate all pages into one continuous HTML string with separators
-    full_content = "\n".join([p.get("content", "") for p in extracted_pages])
+    # Convert extracted pages to clean JSON format (Content-First)
+    from app.utils.html_to_lexical import html_to_lexical_json
+    import json
+    
+    # Combine all pages into single HTML
+    combined_html = "\n".join([p.get("content", "") for p in extracted_pages])
+    
+    # Convert HTML to Lexical JSON
+    try:
+        lexical_json = html_to_lexical_json(combined_html)
+        full_content = json.dumps(lexical_json)
+        logger.info(f"Converted import to JSON format: {len(lexical_json['root']['children'])} blocks")
+    except Exception as e:
+        logger.warning(f"HTML conversion failed, using simple fallback: {e}")
+        from app.utils.html_to_lexical import simple_html_to_lexical
+        lexical_json = simple_html_to_lexical(combined_html)
+        full_content = json.dumps(lexical_json)
 
     new_book = Book(
         title=book_title,
@@ -346,7 +365,7 @@ async def import_book_from_file(
     )
 
     # Exclude 'id' so MongoDB generates a proper ObjectId, identifying this as a new document
-    book_dict = new_book.dict(by_alias=True, exclude={'id'})
+    book_dict = new_book.model_dump(by_alias=True, exclude={'id'})
     result = await books_collection.insert_one(book_dict)
     book_id = str(result.inserted_id)
 
@@ -362,3 +381,147 @@ async def import_book_from_file(
             "warnings": warnings,
         },
     }
+
+
+@router.post("/{book_id}/ai-expand", response_model=AIExpandResponse)
+async def ai_expand_text(
+    book_id: str,
+    body: AIExpandRequest,
+    current_user: dict = Depends(track_ai_usage),
+) -> AIExpandResponse:
+    """Expand selected text using tier-appropriate LLM. All tiers have access; model quality differs."""
+    user_id: str = current_user.get("user_id", "")
+    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    if tier not in ("free", "plus", "pro"):
+        tier = "free"
+
+    # Ownership check
+    try:
+        book = await books_collection.find_one({"_id": ObjectId(book_id), "deleted_at": None})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid book ID.")
+    if not book or book.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Book not found.")
+
+    # Character limits: Free=500, Plus=2000, Pro=unlimited
+    char_limits: dict = {"free": 500, "plus": 2000}
+    limit = char_limits.get(tier)
+    if limit and len(body.selected_text) > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected text exceeds the {limit}-character limit for your plan.",
+        )
+
+    llm_client = get_client_for_tier(tier)
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
+
+    system_prompt = prompt_manager.get_prompt("nowry-book-expand")
+    user_prompt = (
+        f"Instruction: {body.instruction}\n\n"
+        f"Text to expand:\n{body.selected_text}"
+    )
+
+    client = get_langfuse_client()
+    model_name = TIER_MODEL_NAMES.get(tier, TIER_MODEL_NAMES["free"])
+    trace_metadata = {"feature": "book_expand", "tier": tier, "user_id": user_id, "model": model_name}
+
+    raw_text: str = ""
+    last_exc = None
+    for attempt in range(1, 3):
+        try:
+            if client:
+                try:
+                    with propagate_attributes(
+                        user_id=user_id,
+                        trace_name="book_expand",
+                        metadata=trace_metadata,
+                        tags=["book_expand", tier],
+                    ):
+                        with client.start_as_current_observation(
+                            name="book_expand",
+                            as_type="generation",
+                            model=model_name,
+                            input=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            model_parameters={"temperature": 0.7, "max_tokens": 1500},
+                        ) as generation:
+                            if tier == "free":
+                                completion = llm_client.chat.completions.create(
+                                    model=_GROQ_MODEL,
+                                    max_tokens=1500,
+                                    temperature=0.7,
+                                    messages=[
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": user_prompt},
+                                    ],
+                                )
+                                raw_text = (completion.choices[0].message.content or "").strip()
+                                usage = getattr(completion, "usage", None)
+                                usage_details = (
+                                    {
+                                        "input": getattr(usage, "prompt_tokens", 0),
+                                        "output": getattr(usage, "completion_tokens", 0),
+                                        "total": getattr(usage, "total_tokens", 0),
+                                    }
+                                    if usage
+                                    else None
+                                )
+                            else:
+                                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                                completion = llm_client.request(combined_prompt)
+                                raw_text = (completion.choices[0].message.content or "").strip()
+                                usage_details = None
+
+                            # D-13: full output, no truncation
+                            generation.update(output=raw_text, usage_details=usage_details)
+                except Exception as langfuse_exc:
+                    logger.warning(
+                        f"[ai_expand] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
+                    )
+                    if tier == "free":
+                        completion = llm_client.chat.completions.create(
+                            model=_GROQ_MODEL,
+                            max_tokens=1500,
+                            temperature=0.7,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                        )
+                        raw_text = (completion.choices[0].message.content or "").strip()
+                    else:
+                        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                        completion = llm_client.request(combined_prompt)
+                        raw_text = (completion.choices[0].message.content or "").strip()
+            else:
+                if tier == "free":
+                    completion = llm_client.chat.completions.create(
+                        model=_GROQ_MODEL,
+                        max_tokens=1500,
+                        temperature=0.7,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+                    raw_text = (completion.choices[0].message.content or "").strip()
+                else:
+                    combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                    completion = llm_client.request(combined_prompt)
+                    raw_text = (completion.choices[0].message.content or "").strip()
+
+            if raw_text:
+                break
+            logger.warning(f"[ai_expand] LLM returned empty on attempt {attempt} (tier={tier}).")
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"[ai_expand] LLM API error on attempt {attempt} (tier={tier}): {exc}")
+
+    if not raw_text:
+        logger.error(f"[ai_expand] Failed after retries. last_exc={last_exc}")
+        raise HTTPException(status_code=502, detail="AI service error. Please try again.")
+
+    return AIExpandResponse(expanded_text=raw_text)

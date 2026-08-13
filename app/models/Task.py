@@ -1,10 +1,11 @@
 from pydantic import BaseModel, Field
 from .types import PyObjectId
+from .mixins import SoftDeleteMixin
 from typing import Optional, List, Literal
 from datetime import datetime
 
 
-class Task(BaseModel):
+class Task(BaseModel, SoftDeleteMixin):
 
     id: Optional[PyObjectId] = Field(alias="_id", default=None)
     user_id: Optional[str] = None

@@ -60,20 +60,29 @@ class CloudinaryStorage(StorageBackend):
         self.cloudinary = cloudinary
     
     async def upload(
-        self, 
-        file_content: bytes, 
+        self,
+        file_content: bytes,
         filename: str,
         folder: str = "",
         **options
     ) -> Dict[str, Any]:
-        """Upload to Cloudinary"""
-        result = self.cloudinary.uploader.upload(
-            file_content,
-            folder=folder,
-            resource_type="image",
-            **options
+        """Upload to Cloudinary — runs the synchronous SDK call in a thread executor
+        so it does not block the asyncio event loop."""
+        import asyncio
+        import functools
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.cloudinary.uploader.upload,
+                file_content,
+                folder=folder,
+                resource_type="image",
+                **options,
+            ),
         )
-        
+
         return {
             'url': result.get('url'),
             'secure_url': result.get('secure_url'),
@@ -83,10 +92,49 @@ class CloudinaryStorage(StorageBackend):
             'format': result.get('format'),
             'bytes': result.get('bytes')
         }
-    
+
+    async def upload_video(
+        self,
+        file_content: bytes,
+        folder: str = "",
+        **options
+    ) -> Dict[str, Any]:
+        """Upload a video to Cloudinary — runs in a thread executor."""
+        import asyncio
+        import functools
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.cloudinary.uploader.upload,
+                file_content,
+                folder=folder,
+                resource_type="video",
+                **options,
+            ),
+        )
+
+        return {
+            'url': result.get('url'),
+            'secure_url': result.get('secure_url'),
+            'public_id': result.get('public_id'),
+            'width': result.get('width'),
+            'height': result.get('height'),
+            'format': result.get('format'),
+            'bytes': result.get('bytes')
+        }
+
     async def delete(self, public_id: str) -> bool:
         """Delete from Cloudinary"""
-        result = self.cloudinary.uploader.destroy(public_id)
+        import asyncio
+        import functools
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            functools.partial(self.cloudinary.uploader.destroy, public_id),
+        )
         return result.get('result') == 'ok'
     
     def get_thumbnail_url(self, public_id: str, width: int = 200, height: int = 200) -> str:

@@ -1,6 +1,13 @@
 # Firebase
 firebase-service-account.json
 
+# GCP Service Account keys (T-6-01: never commit credentials)
+*-service-account*.json
+*-credentials*.json
+gcp-key*.json
+# Default Firebase/GCP console download naming: <project-id>-<random-hash>.json
+nowry-88f05-*.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -164,3 +171,9 @@ cython_debug/
 
 # MongoDB data
 data/
+
+# OS junk
+.DS_Store
+
+# Anki deck exports (personal/test data, not app assets)
+*.apkg

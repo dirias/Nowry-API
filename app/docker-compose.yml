@@ -22,7 +22,7 @@ services:
     depends_on:
       - mongodb
     ports:
-      - "8000:8000"
+      - "8001:8000"
     volumes:
       - .:/app
     environment:
@@ -30,6 +30,7 @@ services:
       - MONGO_DB=mydb
       - ENV=local
       - DEBUG=True
+      - PORT=8000
 
   mongo-express:
     image: mongo-express:latest
