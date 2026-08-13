@@ -117,18 +117,32 @@ app.include_router(stripe_webhooks.router)
 app.add_middleware(SlowAPIMiddleware)
 
 # CORS Configuration
-# Get allowed origins from env or default to localhost
-allowed_origins_env = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000",
-)
-allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",")]
+# Origins that are always allowed, regardless of environment configuration.
+# ALLOWED_ORIGINS (comma-separated) can add more (e.g. one-off preview URLs).
+DEFAULT_ALLOWED_ORIGINS: list[str] = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "https://nowry.app",
+    "https://www.nowry.app",
+    "https://dev.nowry.app",
+    "https://www.dev.nowry.app",
+]
+
+allowed_origins_env: str = os.getenv("ALLOWED_ORIGINS", "")
+env_origins: list[str] = [
+    origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()
+]
+# dict.fromkeys preserves order while removing duplicates.
+allowed_origins: list[str] = list(dict.fromkeys(DEFAULT_ALLOWED_ORIGINS + env_origins))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    # Vercel preview deployments (e.g. https://nowry-git-<branch>-<team>.vercel.app)
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
