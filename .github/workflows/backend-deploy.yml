@@ -1,10 +1,14 @@
 # Backend Deploy — Nowry FastAPI
 #
-# Triggers on push to main AND on pull requests targeting main, so the security
-# gate below (bandit + pip-audit + the phase-32 regression-guard test suite)
-# surfaces findings BEFORE merge, not just after. Runs validation (pip install,
-# lint, type check) before Railway's GitHub integration automatically deploys
-# to production on push to main.
+# Triggers on push to main and dev, AND on pull requests targeting either, so
+# the security gate below (bandit + pip-audit + the phase-32 regression-guard
+# test suite) surfaces findings BEFORE merge, not just after. Runs validation
+# (pip install, lint, type check) before Railway's GitHub integration deploys.
+#
+# `dev` MUST stay in the trigger list. Railway's development service has
+# "Wait for CI" enabled: if no workflow runs for a commit, the check suite is
+# not a success and Railway silently marks the deployment SKIPPED. Removing
+# `dev` here does not just skip testing — it stops dev deploying entirely.
 #
 # Required GitHub Secrets (Settings → Secrets and Variables → Actions):
 #   RAILWAY_TOKEN  — Railway API token (only needed if NOT using Railway GitHub integration)
@@ -18,17 +22,13 @@
 # Railway auto-deploys when code is pushed to main — no additional step needed.
 # If not configured, uncomment the deploy job below and set RAILWAY_TOKEN secret.
 #
-# IMPORTANT — this job's pass/fail status does NOT by itself block Railway's
-# deploy (Railway's GitHub integration deploys independently of this Actions
-# workflow's outcome unless configured otherwise). For bandit/pip-audit/tests
-# failing here to actually stop a bad deploy, one of the following must be
-# configured OUTSIDE this file (neither is set up as of Phase 32):
-#   (a) GitHub branch protection on `main` — require this workflow ("Validate
-#       & Lint") as a required status check before merge, and/or
-#   (b) Railway dashboard → enable "wait for CI" / require this check before
-#       auto-deploying.
-# Until (a) or (b) is configured, a red check here is a strong, PR-visible
-# signal but not a hard deployment block.
+# IMPORTANT — this job's status DOES gate deployment. Railway's "Wait for CI"
+# is enabled, so a red (or absent) check suite means Railway skips the deploy
+# rather than shipping. A failure here is a hard block, not just a signal.
+#
+# The complementary gate, GitHub branch protection on `main` requiring this
+# workflow ("Validate & Lint") as a required status check before merge, is
+# still not configured as of this writing.
 
 name: Backend Deploy
 
@@ -36,9 +36,11 @@ on:
   push:
     branches:
       - main
+      - dev
   pull_request:
     branches:
       - main
+      - dev
 
 jobs:
   build:
