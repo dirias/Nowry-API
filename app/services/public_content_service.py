@@ -28,7 +28,12 @@ from app.models.PublicContent import (
     is_official_deck,
     public_curation,
 )
-from app.models.User import coerce_utc
+from app.models.User import (
+    OnboardingActivation,
+    coerce_utc,
+    normalize_onboarding_state,
+    onboarding_activation_update,
+)
 
 #: Hard ceiling on any browse page, enforced in the service so no caller can
 #: request an unbounded read even if it bypasses the router's Query bound.
@@ -55,6 +60,34 @@ MAX_FORK_CLAIM_ATTEMPTS: int = 2
 def _fork_conflict(code: str, **extra: Any) -> HTTPException:
     """Build a 409 with the stable machine-readable code the client switches on."""
     return HTTPException(status_code=409, detail={"code": code, **extra})
+
+
+def _activation_failed() -> HTTPException:
+    """Build the recoverable activation error from the fork contract.
+
+    The deck and its cards are already persisted when this is raised, so the
+    client's correct response is to repeat the identical request: the replay
+    returns the same deck and finishes the activation (ADR-006).
+    """
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "activation_failed",
+            "message": "Deck was forked but onboarding activation did not persist; retry",
+        },
+    )
+
+
+def require_official_source(original: Dict[str, Any]) -> None:
+    """Reject an onboarding fork whose source is not approved official content.
+
+    Evaluated before anything is claimed or copied, so a source that cannot
+    activate never leaves a deck behind either. The predicate itself is
+    ONB-002's — approval and official ownership are checked there and nowhere
+    else, so this workflow cannot drift from curated browse's definition.
+    """
+    if not is_official_deck(original, get_official_publisher_user_id()):
+        raise _fork_conflict("source_not_official")
 
 
 def validated_idempotency_key(raw: Optional[str]) -> Optional[str]:
@@ -789,9 +822,56 @@ class PublicContentService:
         original_content_id: str,
         forking_user_id: str,
         idempotency_key: Optional[str] = None,
+        onboarding_context: bool = False,
     ) -> ForkOutcome:
         """
         Fork public content into the caller's library, idempotently (ADR-005).
+
+        Ordinary forks are unchanged. With `onboarding_context`, this workflow
+        additionally owns onboarding activation (ADR-006), in a fixed order:
+
+        1. the source must satisfy ONB-002's official predicate, checked before
+           anything is claimed, so a source that cannot activate cannot leave a
+           deck behind either → `409 source_not_official`;
+        2. the copy must have completed — activation runs only on a resolved
+           outcome, never on a `pending` claim or a `fork_in_progress` retry;
+        3. activation must persist before this returns, so a successful
+           response always means deck, cards and activation are all durable.
+
+        Activation runs on *both* resolutions, first completion and replay,
+        which is what makes a retry repair an activation that failed after the
+        deck was already created.
+        """
+        collection = self.db[f"{content_type}s"]
+        original = await self._load_forkable_original(
+            collection, original_content_id, forking_user_id
+        )
+        if onboarding_context:
+            require_official_source(original)
+
+        outcome = await self._resolve_fork(
+            original,
+            original_content_id,
+            content_type,
+            forking_user_id,
+            idempotency_key,
+            collection,
+        )
+
+        if onboarding_context:
+            outcome.onboarding = await self._activate_onboarding(forking_user_id)
+        return outcome
+
+    async def _resolve_fork(
+        self,
+        original: dict,
+        original_content_id: str,
+        content_type: str,
+        forking_user_id: str,
+        idempotency_key: Optional[str],
+        collection,
+    ) -> ForkOutcome:
+        """Claim, copy or replay the fork itself (ADR-005).
 
         The durable identity of a fork is `(content type, source, user)`. A
         `pending` record on that key is claimed *before* any content is copied,
@@ -808,10 +888,6 @@ class PublicContentService:
         - failed / abandoned   → discard the partial copy, recreate
         - pending and fresh    → `409 fork_in_progress`, recoverable by retry
         """
-        collection = self.db[f"{content_type}s"]
-        original = await self._load_forkable_original(
-            collection, original_content_id, forking_user_id
-        )
         key = fork_key(content_type, original_content_id, forking_user_id)
 
         for _ in range(MAX_FORK_CLAIM_ATTEMPTS):
@@ -1210,6 +1286,66 @@ class PublicContentService:
                 "updated_at": datetime.now(timezone.utc),
             }},
         )
+
+    # ========== Onboarding activation (ADR-006) ==========
+
+    async def _activate_onboarding(self, user_id: str) -> OnboardingActivation:
+        """Persist onboarding activation for a verified, completed fork.
+
+        Called only after the copy is durable, so activation can never be a
+        consequence of merely reaching a screen (FR-006). Idempotent: a replay
+        that finds the user already activated returns the *original*
+        `activated_at` rather than moving it.
+
+        A failure here leaves the deck in place and raises the recoverable
+        `500 activation_failed`; the identical retry replays the same fork and
+        completes the activation.
+        """
+        now = datetime.now(timezone.utc)
+        try:
+            user = await self._persist_onboarding_activation(user_id, now)
+        except Exception:
+            raise _activation_failed()
+
+        if user is None:
+            raise _activation_failed()
+
+        state = normalize_onboarding_state(user, now)
+        if state.status != "activated" or state.activated_at is None:
+            # The write reported success but the stored document does not carry
+            # the transition; reporting success anyway would strand the journey.
+            raise _activation_failed()
+
+        return OnboardingActivation(activated_at=state.activated_at)
+
+    async def _persist_onboarding_activation(
+        self,
+        user_id: str,
+        now: datetime,
+    ) -> Optional[dict]:
+        """Apply the activation `$set`, or re-read an already-activated user.
+
+        The filter is the idempotency guarantee: a user who already carries an
+        `activated_at` is not matched, so concurrent retries cannot overwrite
+        the first activation time. A legacy `wizard_completed=True` user has no
+        `activated_at`, which Mongo matches as null, so the same call also
+        repairs that document to the full typed shape.
+
+        Every activation field lands in one update on one document, so no
+        reader can observe a half-activated user.
+        """
+        object_id = ObjectId(str(user_id))
+        users = self.db["users"]
+
+        updated = await users.find_one_and_update(
+            {"_id": object_id, "onboarding.activated_at": None},
+            {"$set": onboarding_activation_update(now)},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is not None:
+            return updated
+
+        return await users.find_one({"_id": object_id})
 
     # ========== User Libraries ==========
     

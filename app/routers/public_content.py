@@ -17,6 +17,7 @@ from app.models.PublicContent import (
     PublicPublisher,
 )
 from app.models.topics import TOPIC_TAXONOMY, TopicValue
+from app.models.User import OnboardingActivation
 from app.services.public_content_service import (
     PublicContentService,
     validated_idempotency_key,
@@ -96,16 +97,38 @@ class ForkBookResponse(BaseModel):
     forked_book: Dict[str, Any]
 
 
+class ForkRequest(BaseModel):
+    """Optional deck-fork body.
+
+    Every existing caller omits it entirely, which is why the whole body is
+    optional and `context` defaults to `None` — an ordinary library fork. The
+    only recognised value is typed, so a misspelled context is rejected loudly
+    instead of silently downgrading an onboarding fork into a normal one that
+    would never activate.
+    """
+
+    context: Optional[Literal["onboarding"]] = None
+
+
 class ForkDeckResponse(BaseModel):
     """Existing deck fork body, plus the additive `created` flag (ADR-005).
 
     `created=false` marks an idempotent replay: the same deck the user already
     forked, returned as a success instead of the previous `409 already_forked`.
+
+    `onboarding` is present only for an onboarding-context fork whose
+    activation has been persisted (ADR-006). The route serializes with
+    `response_model_exclude_none`, so the key is omitted entirely for an
+    ordinary fork and its presence is itself the proof of the transition. That
+    setting cannot disturb `forked_deck`: Pydantic applies `exclude_none` to
+    model fields, not to the entries of a plain mapping, so the deck payload
+    existing library clients read keeps every null it has today.
     """
 
     message: str
     created: bool
     forked_deck: Dict[str, Any]
+    onboarding: Optional[OnboardingActivation] = None
 
 
 class DeckCurationRequest(BaseModel):
@@ -665,9 +688,14 @@ async def fork_book(
     )
 
 
-@router.post("/decks/{deck_id}/fork", response_model=ForkDeckResponse)
+@router.post(
+    "/decks/{deck_id}/fork",
+    response_model=ForkDeckResponse,
+    response_model_exclude_none=True,
+)
 async def fork_deck(
     deck_id: str,
+    body: Optional[ForkRequest] = None,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
     service: PublicContentService = Depends(get_public_service),
@@ -681,20 +709,32 @@ async def fork_deck(
     The optional `Idempotency-Key` header only correlates retries — uniqueness
     rests on `(deck, user)`, so a lost or regenerated key changes nothing.
 
+    Sending `{"context": "onboarding"}` additionally makes this call the sole
+    owner of onboarding activation (ADR-006): the source must be approved
+    official content, and the response is successful only once the deck, its
+    cards *and* the activation are persisted. The `onboarding` block is then
+    present on both the first completion and every replay, so a client that
+    lost the first response still learns it is activated. Omitting the body
+    leaves onboarding state completely untouched.
+
     Errors: `400 cannot_fork_own_content` or `malformed_idempotency_key`; `401`;
-    `404`; `409 fork_in_progress` (recoverable — retry shortly); `500 fork_failed`.
+    `404`; `409 fork_in_progress` (recoverable — retry shortly) or
+    `409 source_not_official`; `500 fork_failed` / `activation_failed`
+    (recoverable — the identical retry reuses the deck and finishes activation).
     """
     outcome = await service.fork_content(
         content_type="deck",
         original_content_id=deck_id,
         forking_user_id=current_user["user_id"],
         idempotency_key=validated_idempotency_key(idempotency_key),
+        onboarding_context=bool(body and body.context == "onboarding"),
     )
 
     return ForkDeckResponse(
         message="Deck forked successfully",
         created=outcome.created,
         forked_deck=outcome.content,
+        onboarding=outcome.onboarding,
     )
 
 

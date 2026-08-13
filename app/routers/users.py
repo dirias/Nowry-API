@@ -783,7 +783,19 @@ async def update_general_preferences(
 
 @router.post("/complete-wizard", response_model=MessageResponse)
 async def complete_wizard(current_user: dict = Depends(get_firebase_user)):
-    """Mark the onboarding wizard as completed"""
+    """Mark the onboarding wizard as completed.
+
+    DEPRECATED — retained unchanged for clients shipped before ADR-006, and
+    removable once none remain. It can mark completion without a deck, so it
+    cannot enforce the activation invariant; activation is owned by
+    `POST /public/decks/{deck_id}/fork` with `{"context": "onboarding"}`, which
+    is the only path that can verify both a completed copy and an approved
+    official source. The redesigned onboarding client never calls this route.
+
+    Behaviour is intentionally untouched: legacy `wizard_completed=True` users
+    keep resolving to activated through `normalize_onboarding_state`, so old
+    clients see exactly what they saw before.
+    """
     user_id = current_user.get("user_id")
     
     await users_collection.update_one(

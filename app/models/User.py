@@ -142,3 +142,41 @@ def onboarding_resume_screen(state: OnboardingState) -> Optional[str]:
     if state.status == "activated":
         return None
     return state.last_meaningful_point
+
+
+# ---------------------------------------------------------------------------
+# Activation (ADR-006) — owned by the verified fork workflow, never by a client
+# ---------------------------------------------------------------------------
+
+
+class OnboardingActivation(BaseModel):
+    """The activation facts a successful onboarding fork reports back.
+
+    Deliberately narrower than :class:`OnboardingState`: the fork response
+    confirms the transition it just performed, it is not a second journey-state
+    contract. ``GET /users/onboarding`` remains the way to read full state.
+    """
+
+    status: Literal["activated"] = "activated"
+    activated_at: datetime
+
+
+def onboarding_activation_update(now: datetime) -> dict:
+    """Build the ``$set`` document that activates a journey.
+
+    Every field lands in one update on one document, so activation is atomic:
+    no reader can ever observe ``wizard_completed`` without the matching
+    ``onboarding`` fields, or the reverse. ``last_meaningful_point`` is
+    deliberately not written here — activation is not a screen, and an
+    activated journey resumes nowhere regardless of the point it stored.
+
+    Only the fork workflow may call this (FR-006): activation must be the
+    consequence of a verified official copy, never of reaching a screen.
+    """
+    return {
+        "wizard_completed": True,
+        "onboarding.status": "activated",
+        "onboarding.activated_at": now,
+        "onboarding.updated_at": now,
+        "updated_at": now,
+    }

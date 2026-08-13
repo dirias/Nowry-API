@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, List, Literal
 from datetime import datetime, timezone
 from .types import PyObjectId
 from .topics import TopicValue
+from .User import OnboardingActivation
 
 #: Editorial lifecycle of a curated deck (ADR-004). Only ``approved`` can ever
 #: contribute to official status, and only the trusted curation operation in
@@ -294,10 +295,16 @@ class ForkOutcome(BaseModel):
     fork this user already owns (ADR-005). The content document is passed
     through unmodified so existing fork consumers keep the exact body they read
     today; ``created`` is purely additive.
+
+    ``onboarding`` is set only for a fork requested with onboarding context and
+    only once activation has been persisted (ADR-006). It is ``None`` for every
+    ordinary library fork, which is why an ordinary fork can never report an
+    onboarding transition it did not perform.
     """
 
     created: bool
     content: Dict[str, Any]
+    onboarding: Optional[OnboardingActivation] = None
 
 
 class ContentLike(BaseModel):
