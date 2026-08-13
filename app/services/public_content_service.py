@@ -4,8 +4,10 @@ Handles publishing, forking, tracking, and discovery of public Books and Decks.
 """
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 from bson import ObjectId
 from fastapi import HTTPException
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.config.official_publisher import (
@@ -17,12 +19,16 @@ from app.models.PublicContent import (
     ContentLike,
     ContentView,
     DeckCuration,
+    ForkOutcome,
     PublicCuration,
     PublicMetadata,
     PublicPublisher,
+    fork_key,
+    fork_status,
     is_official_deck,
     public_curation,
 )
+from app.models.User import coerce_utc
 
 #: Hard ceiling on any browse page, enforced in the service so no caller can
 #: request an unbounded read even if it bypasses the router's Query bound.
@@ -30,6 +36,62 @@ MAX_BROWSE_PAGE_SIZE: int = 100
 
 #: Sort value that selects deterministic editorial ordering (ADR-004).
 CURATED_SORT: str = "curated"
+
+#: Upper bound on cards copied by one deck fork. Pre-existing limit, named.
+MAX_FORK_CARDS: int = 500
+
+#: How long a `pending` fork claim is respected before another request may take
+#: it over. A process that dies mid-copy would otherwise hold the durable key
+#: forever and permanently block the user from forking that deck. Long enough
+#: that a genuinely running copy is never stolen (a 500-card copy is a handful
+#: of round trips), short enough that a real crash self-heals on the next retry.
+FORK_PENDING_TAKEOVER_SECONDS: int = 120
+
+#: Attempts of the claim loop. Two is exactly enough: one to observe the state,
+#: one to act on whatever a concurrent winner wrote in between.
+MAX_FORK_CLAIM_ATTEMPTS: int = 2
+
+
+def _fork_conflict(code: str, **extra: Any) -> HTTPException:
+    """Build a 409 with the stable machine-readable code the client switches on."""
+    return HTTPException(status_code=409, detail={"code": code, **extra})
+
+
+def validated_idempotency_key(raw: Optional[str]) -> Optional[str]:
+    """Normalise a client `Idempotency-Key` header.
+
+    The header only correlates retries — the durable `(type, source, user)` key
+    is what prevents duplicates — so it is optional and every existing caller
+    that omits it is unaffected. When one *is* supplied it must be the UUID the
+    contract specifies, because a silently accepted malformed value would make
+    the diagnostic trail useless.
+    """
+    if raw is None:
+        return None
+
+    candidate = raw.strip()
+    try:
+        return str(UUID(candidate))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "malformed_idempotency_key",
+                "message": "Idempotency-Key must be a UUID",
+            },
+        )
+
+
+def _pending_claim_expired(record: Dict[str, Any], now: datetime) -> bool:
+    """True when a `pending` claim is old enough to be taken over.
+
+    A record with an unreadable timestamp is treated as expired: an unusable
+    claim must not be able to block the key indefinitely.
+    """
+    claimed_at = coerce_utc(record.get("updated_at")) or coerce_utc(record.get("forked_at"))
+    if claimed_at is None:
+        return True
+    return (now - claimed_at).total_seconds() >= FORK_PENDING_TAKEOVER_SECONDS
 
 
 def _empty_page(page: int, page_size: int) -> Dict[str, Any]:
@@ -720,176 +782,435 @@ class PublicContentService:
         await self.db["content_views"].insert_one(view.model_dump(by_alias=True))
     
     # ========== Forking/Cloning ==========
-    
+
     async def fork_content(
         self,
         content_type: str,
         original_content_id: str,
-        forking_user_id: str
-    ) -> dict:
+        forking_user_id: str,
+        idempotency_key: Optional[str] = None,
+    ) -> ForkOutcome:
         """
-        Fork/clone public content to user's library.
-        Creates a copy with attribution to original.
+        Fork public content into the caller's library, idempotently (ADR-005).
+
+        The durable identity of a fork is `(content type, source, user)`. A
+        `pending` record on that key is claimed *before* any content is copied,
+        so concurrent requests cannot both materialise a private copy: the
+        unique index rejects the second claim and that request resolves the
+        winner's record instead of creating a deck of its own.
+
+        Outcomes:
+
+        - no record            → claim, copy, complete → `created=True`
+        - completed, live copy → replay the same deck  → `created=False`
+                                 (books keep the historical `409 already_forked`)
+        - completed, copy gone → stale-record recreation → `created=True`
+        - failed / abandoned   → discard the partial copy, recreate
+        - pending and fresh    → `409 fork_in_progress`, recoverable by retry
         """
         collection = self.db[f"{content_type}s"]
-        
-        # Get original content
+        original = await self._load_forkable_original(
+            collection, original_content_id, forking_user_id
+        )
+        key = fork_key(content_type, original_content_id, forking_user_id)
+
+        for _ in range(MAX_FORK_CLAIM_ATTEMPTS):
+            existing = await self.db["content_forks"].find_one(key)
+
+            if existing is None:
+                claimed = await self._insert_fork_claim(key, original, idempotency_key)
+                if claimed is None:
+                    continue  # another request won the claim; resolve its record
+                return await self._copy_into_claim(claimed, original, content_type, collection)
+
+            replay = await self._replay_completed_fork(existing, content_type, collection)
+            if replay is not None:
+                return replay
+
+            reclaimed = await self._reclaim_stale_fork(
+                existing, content_type, collection, idempotency_key
+            )
+            if reclaimed is None:
+                raise _fork_conflict("fork_in_progress")
+            return await self._copy_into_claim(reclaimed, original, content_type, collection)
+
+        raise _fork_conflict("fork_in_progress")
+
+    async def _load_forkable_original(
+        self,
+        collection,
+        original_content_id: str,
+        forking_user_id: str,
+    ) -> dict:
+        """Load the public source document, rejecting unknown content and self-forks."""
+        try:
+            original_oid = ObjectId(str(original_content_id))
+        except Exception:
+            raise HTTPException(status_code=404, detail="Public content not found")
+
         original = await collection.find_one({
-            "_id": ObjectId(original_content_id),
+            "_id": original_oid,
             "is_public": True,
-            "deleted_at": None
+            "deleted_at": None,
         })
-        
         if not original:
             raise HTTPException(status_code=404, detail="Public content not found")
 
-        # FIX 1 — Prevent self-fork
         if str(original.get("user_id")) == str(forking_user_id):
-            raise HTTPException(
-                status_code=400,
-                detail="cannot_fork_own_content"
+            raise HTTPException(status_code=400, detail="cannot_fork_own_content")
+
+        return original
+
+    async def _live_fork_target(self, record: Dict[str, Any], collection) -> Optional[dict]:
+        """Return the fork's content document while it still exists and is not deleted."""
+        forked_id = record.get("forked_content_id")
+        if not forked_id:
+            return None
+        try:
+            forked_oid = ObjectId(str(forked_id))
+        except Exception:
+            return None
+        return await collection.find_one({"_id": forked_oid, "deleted_at": None})
+
+    async def _replay_completed_fork(
+        self,
+        record: Dict[str, Any],
+        content_type: str,
+        collection,
+    ) -> Optional[ForkOutcome]:
+        """Answer a repeat request for a fork this user already completed.
+
+        Returns `None` when the record is not a completed fork of live content,
+        which means the caller must reclaim and recreate it.
+
+        Deck forks replay as a success carrying the same deck: a retrying client
+        cannot distinguish a lost response from an unwanted duplicate, and
+        ADR-005 resolves that in favour of idempotent success. Book forks keep
+        the historical `409 already_forked` because ADR-005 scopes the response
+        change to decks and existing book clients must stay compatible.
+        """
+        if fork_status(record) != "completed":
+            return None
+
+        live = await self._live_fork_target(record, collection)
+        if live is None:
+            return None
+
+        if content_type != "deck":
+            raise _fork_conflict(
+                "already_forked",
+                forked_content_id=str(record.get("forked_content_id")),
             )
 
-        # FIX 2 — Prevent duplicate fork (unless the previous fork was deleted)
-        existing_fork = await self.db["content_forks"].find_one({
-            "original_content_id": str(original_content_id),
-            "forked_by_user_id": str(forking_user_id)
+        return ForkOutcome(created=False, content=self._serialize_doc(live))
+
+    async def _insert_fork_claim(
+        self,
+        key: Dict[str, str],
+        original: dict,
+        idempotency_key: Optional[str],
+    ) -> Optional[dict]:
+        """Insert a `pending` claim on the durable key.
+
+        Returns `None` when the unique index rejects the insert, i.e. a
+        concurrent request claimed the same key first. That rejection — not the
+        preceding read — is the guarantee, because only the database observes
+        both requests.
+        """
+        record = ContentFork(
+            original_content_type=key["original_content_type"],
+            original_content_id=key["original_content_id"],
+            original_creator_id=str(original.get("user_id")),
+            forked_by_user_id=key["forked_by_user_id"],
+            forked_content_id=None,
+            status="pending",
+            idempotency_key=idempotency_key,
+        )
+        document = record.model_dump(by_alias=True)
+
+        try:
+            await self.db["content_forks"].insert_one(document)
+        except DuplicateKeyError:
+            return None
+        return document
+
+    async def _reclaim_stale_fork(
+        self,
+        record: Dict[str, Any],
+        content_type: str,
+        collection,
+        idempotency_key: Optional[str],
+    ) -> Optional[dict]:
+        """Take over a record whose fork is not live, and clear its leftovers.
+
+        Reclaimable states: `failed`, `completed` whose content is gone (the
+        existing stale-record rule), and `pending` abandoned past the takeover
+        window. A fresh `pending` claim belongs to a request that is still
+        running and is never stolen.
+
+        The update is a compare-and-set on the exact values just observed, so
+        two requests racing to reclaim the same stale record cannot both win —
+        the loser sees `None` and is told to retry.
+        """
+        status = fork_status(record)
+        now = datetime.now(timezone.utc)
+        if status == "pending" and not _pending_claim_expired(record, now):
+            return None
+
+        claimed = await self.db["content_forks"].find_one_and_update(
+            {
+                "_id": record["_id"],
+                "status": record.get("status"),
+                "forked_content_id": record.get("forked_content_id"),
+                "updated_at": record.get("updated_at"),
+            },
+            {"$set": {
+                "status": "pending",
+                "forked_content_id": None,
+                "idempotency_key": idempotency_key,
+                "failure_code": None,
+                "forked_at": now,
+                "updated_at": now,
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if claimed is None:
+            return None
+
+        await self._discard_partial_fork(record, content_type, collection)
+        return claimed
+
+    async def _discard_partial_fork(
+        self,
+        record: Dict[str, Any],
+        content_type: str,
+        collection,
+    ) -> None:
+        """Delete the live leftovers of a fork attempt this request just took over.
+
+        Only content that is still live, owned by the same user and attributed
+        to the same source is removed — that is the partial copy this workflow
+        created and abandoned, never a document the user chose to keep. Content
+        the user deleted themselves is already soft-deleted and is left to its
+        retention window. Without this, a retry after a partial copy would leave
+        two visible decks for one fork.
+        """
+        forked_id = record.get("forked_content_id")
+        if not forked_id:
+            return
+        try:
+            forked_oid = ObjectId(str(forked_id))
+        except Exception:
+            return
+
+        owner = record.get("forked_by_user_id")
+        partial = await collection.find_one({
+            "_id": forked_oid,
+            "user_id": owner,
+            "deleted_at": None,
         })
+        if partial is None:
+            return
+        attribution = (partial.get("forked_from") or {}).get("id")
+        if str(attribution) != str(record.get("original_content_id")):
+            return
 
-        if existing_fork:
-            # Verify if the forked content actually still exists and isn't deleted
-            forked_id = existing_fork.get("forked_content_id")
-            if forked_id:
-                forked_doc = await collection.find_one({
-                    "_id": ObjectId(forked_id),
-                    "deleted_at": None
-                })
-                
-                if forked_doc:
-                    # Previous fork is still active - block duplicate
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "already_forked",
-                            "forked_content_id": str(forked_id)
-                        }
-                    )
-                else:
-                    # Stale fork - forked content was deleted or is missing.
-                    # Clean up the stale record to allow a fresh fork.
-                    await self.db["content_forks"].delete_one({"_id": existing_fork["_id"]})
+        if content_type == "deck":
+            await self.db["cards"].delete_many({
+                "deck_id": {"$in": [str(forked_oid), forked_oid]},
+                "user_id": owner,
+            })
+        await collection.delete_one({"_id": forked_oid, "user_id": owner})
 
+    async def _copy_into_claim(
+        self,
+        record: Dict[str, Any],
+        original: dict,
+        content_type: str,
+        collection,
+    ) -> ForkOutcome:
+        """Materialise the content for a claim this request holds.
 
-        # Create a copy
+        The claim stays `pending` until every document is written, so an
+        interrupted copy is never reported as success and never replayed as a
+        completed fork — the next attempt sees a partial record and recreates it.
+        """
+        try:
+            forked_oid = await self._insert_fork_copy(original, content_type, collection, record)
+            if content_type == "deck":
+                await self._copy_fork_cards(original, forked_oid, record, collection)
+            await self._complete_fork_claim(record, forked_oid, original, collection)
+        except HTTPException:
+            raise
+        except Exception as error:
+            await self._fail_fork_claim(record, type(error).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "fork_failed", "message": "Fork could not be completed"},
+            )
+
+        forked = await collection.find_one({"_id": forked_oid})
+        return ForkOutcome(created=True, content=self._serialize_doc(forked))
+
+    async def _insert_fork_copy(
+        self,
+        original: dict,
+        content_type: str,
+        collection,
+        record: Dict[str, Any],
+    ) -> ObjectId:
+        """Insert the private copy and record its id on the pending claim."""
+        forking_user_id = record["forked_by_user_id"]
+        now = datetime.now(timezone.utc)
+
         forked_content = dict(original)
-        forked_content.pop("_id")  # Remove original ID
-        forked_content["user_id"] = forking_user_id  # New owner
-        forked_content["is_public"] = False  # Forked content is private by default
+        forked_content.pop("_id")
+        forked_content["user_id"] = forking_user_id
+        forked_content["is_public"] = False
         forked_content["published_at"] = None
         forked_content["public_metadata"] = None
-        forked_content["created_at"] = datetime.now(timezone.utc)
-        forked_content["updated_at"] = datetime.now(timezone.utc)
-        
-        # Add attribution
+        forked_content["created_at"] = now
+        forked_content["updated_at"] = now
+
         title_field = "title" if content_type == "book" else "name"
         forked_content[title_field] = f"{forked_content[title_field]} (Forked)"
 
-        # Look up the original author's display name from the users collection
-        author_name: Optional[str] = None
         original_user_id = original.get("user_id")
-        if original_user_id:
-            try:
-                user_oid = (
-                    ObjectId(str(original_user_id))
-                    if not isinstance(original_user_id, ObjectId)
-                    else original_user_id
-                )
-                user_doc = await self.db["users"].find_one({"_id": user_oid})
-            except Exception:
-                user_doc = None
-            if user_doc:
-                author_name = (
-                    user_doc.get("full_name")
-                    or user_doc.get("display_name")
-                    or user_doc.get("username")
-                    or user_doc.get("displayName")
-                    or "Anonymous User"
-                )
-
-        # Record immutable fork attribution before insert
         forked_content["forked_from"] = {
             "id": str(original["_id"]),
             "title": original.get("title") or original.get("name"),
-            "author_name": author_name,
+            "author_name": await self._original_author_name(original_user_id),
             "author_id": str(original_user_id) if original_user_id else None,
         }
 
-        # For decks, reset card refs — they will be repopulated after insert
+        # For decks, reset card refs — they are repopulated after the card copy
         if content_type == "deck":
             forked_content["cards"] = []
             forked_content["total_cards"] = 0
 
-        # Insert forked content
         result = await collection.insert_one(forked_content)
-        
-        # Track the fork
-        fork_record = ContentFork(
-            original_content_type=content_type,
-            original_content_id=original_content_id,
-            original_creator_id=str(original["user_id"]),
-            forked_content_id=str(result.inserted_id),
-            forked_by_user_id=forking_user_id
+
+        # Publish the id on the still-pending claim so an interrupted attempt
+        # leaves a trail its successor can clean up.
+        await self.db["content_forks"].update_one(
+            {"_id": record["_id"]},
+            {"$set": {
+                "forked_content_id": str(result.inserted_id),
+                "updated_at": datetime.now(timezone.utc),
+            }},
         )
-        
-        await self.db["content_forks"].insert_one(fork_record.model_dump(by_alias=True))
-        
-        # Increment fork count
+        return result.inserted_id
+
+    async def _original_author_name(self, original_user_id: Any) -> Optional[str]:
+        """Resolve the source author's display name for fork attribution."""
+        if not original_user_id:
+            return None
+        try:
+            user_oid = (
+                original_user_id
+                if isinstance(original_user_id, ObjectId)
+                else ObjectId(str(original_user_id))
+            )
+            user_doc = await self.db["users"].find_one({"_id": user_oid})
+        except Exception:
+            user_doc = None
+        if not user_doc:
+            return None
+        return (
+            user_doc.get("full_name")
+            or user_doc.get("display_name")
+            or user_doc.get("username")
+            or user_doc.get("displayName")
+            or "Anonymous User"
+        )
+
+    async def _copy_fork_cards(
+        self,
+        original: dict,
+        forked_oid: ObjectId,
+        record: Dict[str, Any],
+        collection,
+    ) -> None:
+        """Copy the source deck's cards to the fork with SRS state reset."""
+        original_oid = original["_id"]
+        forking_user_id = record["forked_by_user_id"]
+        original_cards = await self.db["cards"].find(
+            {"deck_id": {"$in": [original_oid, str(original_oid)]}}
+        ).to_list(length=MAX_FORK_CARDS)
+
+        if not original_cards:
+            return
+
+        now = datetime.now(timezone.utc)
+        new_cards: List[dict] = []
+        for card in original_cards:
+            new_card = dict(card)
+            new_card.pop("_id")
+            new_card["deck_id"] = str(forked_oid)
+            new_card["user_id"] = forking_user_id
+            new_card["created_at"] = now
+            new_card["updated_at"] = now
+            # Reset SRS state for the new owner
+            new_card["next_review"] = None
+            new_card["last_reviewed"] = None
+            new_card["introduced_at"] = None
+            new_card["interval"] = 1
+            new_card["ease_factor"] = 2.5
+            new_card["repetitions"] = 0
+            new_cards.append(new_card)
+
+        insert_result = await self.db["cards"].insert_many(new_cards)
+
         await collection.update_one(
-            {"_id": ObjectId(original_content_id)},
-            {"$inc": {"public_metadata.forks": 1}}
+            {"_id": forked_oid},
+            {"$set": {
+                "total_cards": len(new_cards),
+                "cards": [str(oid) for oid in insert_result.inserted_ids],
+            }},
         )
 
-        # Copy cards for deck forks
-        if content_type == "deck":
-            forked_deck_id = str(result.inserted_id)
-            original_cards = await self.db["cards"].find(
-                {"deck_id": {"$in": [ObjectId(original_content_id), original_content_id]}}
-            ).to_list(length=500)
+    async def _complete_fork_claim(
+        self,
+        record: Dict[str, Any],
+        forked_oid: ObjectId,
+        original: dict,
+        collection,
+    ) -> None:
+        """Mark the claim completed and count the fork.
 
-            if original_cards:
-                now = datetime.now(timezone.utc)
-                new_cards: List[dict] = []
-                for card in original_cards:
-                    new_card = dict(card)
-                    new_card.pop("_id")
-                    new_card["deck_id"] = forked_deck_id
-                    new_card["user_id"] = forking_user_id
-                    new_card["created_at"] = now
-                    new_card["updated_at"] = now
-                    # Reset SRS state for the new owner
-                    new_card["next_review"] = None
-                    new_card["last_reviewed"] = None
-                    new_card["introduced_at"] = None
-                    new_card["interval"] = 1
-                    new_card["ease_factor"] = 2.5
-                    new_card["repetitions"] = 0
-                    new_cards.append(new_card)
+        Completion is the last write of the workflow: only after it can a later
+        request replay this fork instead of recreating it. The popularity
+        counter is incremented here so a replay never inflates it.
+        """
+        await self.db["content_forks"].update_one(
+            {"_id": record["_id"]},
+            {"$set": {
+                "status": "completed",
+                "forked_content_id": str(forked_oid),
+                "failure_code": None,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+        await collection.update_one(
+            {"_id": original["_id"]},
+            {"$inc": {"public_metadata.forks": 1}},
+        )
 
-                insert_result = await self.db["cards"].insert_many(new_cards)
-                new_card_ids = [str(oid) for oid in insert_result.inserted_ids]
+    async def _fail_fork_claim(self, record: Dict[str, Any], failure_code: str) -> None:
+        """Record why a claim could not be completed, leaving it recreatable.
 
-                await collection.update_one(
-                    {"_id": result.inserted_id},
-                    {"$set": {
-                        "total_cards": len(new_cards),
-                        "cards": new_card_ids
-                    }}
-                )
+        The record keeps whatever `forked_content_id` the attempt reached so the
+        next attempt can discard that partial copy.
+        """
+        await self.db["content_forks"].update_one(
+            {"_id": record["_id"]},
+            {"$set": {
+                "status": "failed",
+                "failure_code": failure_code,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
 
-        # Return the forked content
-        forked = await collection.find_one({"_id": result.inserted_id})
-        return self._serialize_doc(forked)
-    
     # ========== User Libraries ==========
     
     async def get_user_liked_content(

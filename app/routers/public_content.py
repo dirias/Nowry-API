@@ -2,7 +2,7 @@
 Public Content API Router
 Handles browse, publish, fork, and engagement for public Books and Decks
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from typing import Any, Dict, Optional, List, Literal
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,7 +17,10 @@ from app.models.PublicContent import (
     PublicPublisher,
 )
 from app.models.topics import TOPIC_TAXONOMY, TopicValue
-from app.services.public_content_service import PublicContentService
+from app.services.public_content_service import (
+    PublicContentService,
+    validated_idempotency_key,
+)
 from app.auth.firebase_auth import get_current_user, optional_auth
 from app.config.database import cards_collection, decks_collection
 
@@ -83,6 +86,26 @@ class PublicDeckBrowsePage(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
+
+class ForkBookResponse(BaseModel):
+    """Existing book fork body, plus the additive `created` flag (ADR-005)."""
+
+    message: str
+    created: bool
+    forked_book: Dict[str, Any]
+
+
+class ForkDeckResponse(BaseModel):
+    """Existing deck fork body, plus the additive `created` flag (ADR-005).
+
+    `created=false` marks an idempotent replay: the same deck the user already
+    forked, returned as a success instead of the previous `409 already_forked`.
+    """
+
+    message: str
+    created: bool
+    forked_deck: Dict[str, Any]
 
 
 class DeckCurationRequest(BaseModel):
@@ -609,48 +632,70 @@ async def unlike_deck(
 
 # ========== Forking/Cloning (Auth Required) ==========
 
-@router.post("/books/{book_id}/fork")
+@router.post("/books/{book_id}/fork", response_model=ForkBookResponse)
 async def fork_book(
     book_id: str,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
-    service: PublicContentService = Depends(get_public_service)
-):
+    service: PublicContentService = Depends(get_public_service),
+) -> ForkBookResponse:
     """
     Fork/clone a public book to your library.
     Creates a private copy with attribution.
+
+    Book forks keep their existing behaviour: a book this user already forked
+    still returns `409 already_forked`. The durable `(type, source, user)` key
+    protects them from duplicates all the same, so a concurrent retry can no
+    longer produce two copies.
+
+    Errors: `400 cannot_fork_own_content` or `malformed_idempotency_key`; `401`;
+    `404`; `409 already_forked` or `fork_in_progress`; `500 fork_failed`.
     """
-    result = await service.fork_content(
+    outcome = await service.fork_content(
         content_type="book",
         original_content_id=book_id,
-        forking_user_id=current_user["user_id"]
+        forking_user_id=current_user["user_id"],
+        idempotency_key=validated_idempotency_key(idempotency_key),
     )
-    
-    return {
-        "message": "Book forked successfully",
-        "forked_book": result
-    }
+
+    return ForkBookResponse(
+        message="Book forked successfully",
+        created=outcome.created,
+        forked_book=outcome.content,
+    )
 
 
-@router.post("/decks/{deck_id}/fork")
+@router.post("/decks/{deck_id}/fork", response_model=ForkDeckResponse)
 async def fork_deck(
     deck_id: str,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
-    service: PublicContentService = Depends(get_public_service)
-):
+    service: PublicContentService = Depends(get_public_service),
+) -> ForkDeckResponse:
     """
-    Fork/clone a public deck to your library.
-    Creates a private copy with attribution.
+    Fork/clone a public deck to your library. Idempotent (ADR-005).
+
+    Repeating the request for a deck this user already forked returns `200` with
+    `created=false` and the same private deck, so a retry after a lost response
+    cannot create a second copy and cannot be mistaken for a duplicate attempt.
+    The optional `Idempotency-Key` header only correlates retries — uniqueness
+    rests on `(deck, user)`, so a lost or regenerated key changes nothing.
+
+    Errors: `400 cannot_fork_own_content` or `malformed_idempotency_key`; `401`;
+    `404`; `409 fork_in_progress` (recoverable — retry shortly); `500 fork_failed`.
     """
-    result = await service.fork_content(
+    outcome = await service.fork_content(
         content_type="deck",
         original_content_id=deck_id,
-        forking_user_id=current_user["user_id"]
+        forking_user_id=current_user["user_id"],
+        idempotency_key=validated_idempotency_key(idempotency_key),
     )
-    
-    return {
-        "message": "Deck forked successfully",
-        "forked_deck": result
-    }
+
+    return ForkDeckResponse(
+        message="Deck forked successfully",
+        created=outcome.created,
+        forked_deck=outcome.content,
+    )
 
 
 # ========== User Library (Auth Required) ==========

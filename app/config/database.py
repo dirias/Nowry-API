@@ -53,6 +53,9 @@ comments_collection = db["comments"]
 # Shared across Uvicorn workers; buckets self-purge via a TTL on expires_at.
 rate_limits_collection = db["rate_limits"]
 
+# Fork idempotency records — one per (content type, source, user) (ADR-005).
+content_forks_collection = db["content_forks"]
+
 #: Index names for curated official browse (ADR-004). Named so deployment can
 #: verify them, and so the verification step below can report a missing one.
 CURATED_BROWSE_INDEX = "decks_curated_browse"
@@ -113,6 +116,55 @@ async def create_curation_indexes(collection) -> list:
     return missing
 
 
+#: Durable fork identity from ADR-005. Named so deployment can verify it and so
+#: a failure can name the reconciliation that unblocks it.
+FORK_UNIQUE_INDEX = "content_forks_unique_source_user"
+
+
+async def create_fork_indexes(collection) -> list:
+    """Create and verify the unique fork key on the content_forks collection.
+
+    Returns the names that are missing after the attempt — empty on success.
+
+    `(original_content_type, original_content_id, forked_by_user_id)` UNIQUE is
+    the only thing that actually closes the concurrent-fork race: a read-before-
+    write check and a disabled button are both bypassed by two requests in
+    flight at once.
+
+    Creation fails while historical duplicates exist, so the failure is logged
+    with the remedy rather than raised — an index problem must not take the API
+    down at startup, and until it succeeds forking simply keeps its previous,
+    weaker guarantee. Run the reconciliation first:
+
+        .venv/bin/python -m app.migrations.reconcile_duplicate_forks --apply
+    """
+    try:
+        await collection.create_index(
+            [
+                ("original_content_type", 1),
+                ("original_content_id", 1),
+                ("forked_by_user_id", 1),
+            ],
+            name=FORK_UNIQUE_INDEX,
+            unique=True,
+        )
+    except Exception:
+        logger.error(
+            "Failed to create %s — historical duplicate fork records must be "
+            "reconciled first: python -m app.migrations.reconcile_duplicate_forks --apply",
+            FORK_UNIQUE_INDEX,
+            exc_info=True,
+        )
+
+    existing = await collection.index_information()
+    missing = [name for name in (FORK_UNIQUE_INDEX,) if name not in existing]
+    if missing:
+        logger.error("Fork idempotency index missing after creation: %s", missing)
+    else:
+        logger.info("Fork idempotency index verified on content_forks collection.")
+    return missing
+
+
 async def create_indexes():
     # User indexes
     await users_collection.create_index("firebase_uid", unique=True)
@@ -136,6 +188,9 @@ async def create_indexes():
 
     # Curated official browse + unique approved (topic, rank) — ADR-004
     await create_curation_indexes(decks_collection)
+
+    # Unique fork key — ADR-005
+    await create_fork_indexes(content_forks_collection)
 
     # Annual Planning indexes
     await annual_plans_collection.create_index("user_id")

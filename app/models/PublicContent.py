@@ -2,8 +2,8 @@
 Models for public content sharing and discovery
 """
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Optional, List, Literal
-from datetime import datetime
+from typing import Any, Dict, Optional, List, Literal
+from datetime import datetime, timezone
 from .types import PyObjectId
 from .topics import TopicValue
 
@@ -11,6 +11,14 @@ from .topics import TopicValue
 #: contribute to official status, and only the trusted curation operation in
 #: ``PublicContentService.set_deck_curation`` may write it.
 CurationStatus = Literal["draft", "in_review", "approved", "rejected"]
+
+#: Lifecycle of one fork attempt (ADR-005). The record is claimed as ``pending``
+#: *before* any content is copied, so a concurrent request cannot materialise a
+#: second private copy while the first is still running.
+ForkStatus = Literal["pending", "completed", "failed"]
+
+#: Content types that can be forked. Part of the durable uniqueness key.
+ForkContentType = Literal["book", "deck"]
 
 #: Upper bound for the editorial learning outcome, matching the bound already
 #: used for the public description.
@@ -202,28 +210,94 @@ class ContentReport(BaseModel):
         json_encoders = {PyObjectId: str}
 
 
+def _utc_now() -> datetime:
+    """Server clock as an aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
 class ContentFork(BaseModel):
     """
-    Tracks when users fork/clone public content.
-    Useful for analytics and showing popularity.
+    One user's fork of one piece of public content.
+
+    This is the durable idempotency record from ADR-005. The tuple
+    ``(original_content_type, original_content_id, forked_by_user_id)`` is
+    unique — see ``FORK_UNIQUE_INDEX`` in ``app/config/database.py`` — and the
+    record is inserted in ``pending`` state *before* any content is copied. That
+    ordering, not an application-level pre-check, is what makes two concurrent
+    requests for the same source and user produce at most one private copy.
+
+    ``idempotency_key`` correlates client retries for diagnostics only. It is
+    deliberately **not** part of the uniqueness key: a client that loses or
+    regenerates its header must still not be able to create a second fork.
     """
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
-    
-    # Original content
-    original_content_type: Literal["book", "deck"]
+
+    # Original content — the first two thirds of the durable uniqueness key
+    original_content_type: ForkContentType
     original_content_id: str
     original_creator_id: str
-    
-    # Fork details
-    forked_content_id: str
+
+    # Fork details. `forked_content_id` is null while the claim is held and no
+    # copy exists yet; a `pending` record that carries one describes an
+    # in-flight or abandoned partial copy that a later attempt must clean up.
+    forked_content_id: Optional[str] = None
     forked_by_user_id: str
-    
+
+    status: ForkStatus = "pending"
+    idempotency_key: Optional[str] = None
+    failure_code: Optional[str] = None
+
     # Timestamps
-    forked_at: datetime = Field(default_factory=datetime.utcnow)
-    
+    forked_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
     class Config:
         populate_by_name = True
         json_encoders = {PyObjectId: str}
+
+
+def fork_key(
+    content_type: str,
+    original_content_id: str,
+    forked_by_user_id: str,
+) -> Dict[str, str]:
+    """Build the durable fork identity from ADR-005.
+
+    The single source of truth for the key shape, shared by the fork service,
+    the unique index and the reconciliation migration so they cannot drift.
+    """
+    return {
+        "original_content_type": str(content_type),
+        "original_content_id": str(original_content_id),
+        "forked_by_user_id": str(forked_by_user_id),
+    }
+
+
+def fork_status(record: Dict[str, Any]) -> ForkStatus:
+    """Read the lifecycle state of a stored fork record.
+
+    Records written before ADR-005 carry no ``status``. They were only ever
+    inserted after a completed copy, so a legacy record that names forked
+    content is ``completed``; one that does not names nothing usable and is
+    treated as ``failed`` so a retry can recreate it.
+    """
+    stored = record.get("status")
+    if stored in ("pending", "completed", "failed"):
+        return stored
+    return "completed" if record.get("forked_content_id") else "failed"
+
+
+class ForkOutcome(BaseModel):
+    """Result of a fork request.
+
+    ``created`` distinguishes a first completion from an idempotent replay of a
+    fork this user already owns (ADR-005). The content document is passed
+    through unmodified so existing fork consumers keep the exact body they read
+    today; ``created`` is purely additive.
+    """
+
+    created: bool
+    content: Dict[str, Any]
 
 
 class ContentLike(BaseModel):
