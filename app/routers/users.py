@@ -20,6 +20,12 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 from app.models.User import User
+from app.models.topics import (
+    MAX_INTERESTS,
+    TopicValue,
+    normalize_interests,
+    normalize_topic,
+)
 from app.models.common import (
     MessageResponse,
     AvatarUploadResponse,
@@ -188,12 +194,13 @@ class GeneralPreferencesUpdate(BaseModel):
         default=None,
         pattern='^#[0-9a-fA-F]{6}$'
     )
-    primary_topic: str | None = Field(
+    primary_topic: TopicValue | None = Field(
         default=None,
-        description="Single primary learning topic (the single study focus)"
+        description="Primary learning topic; derived from interests[0] when omitted"
     )
-    interests: list[str] | None = Field(
+    interests: list[TopicValue] | None = Field(
         default=None,
+        max_length=MAX_INTERESTS,
         description="Multi-select interest topics used to personalize the home news feed"
     )
     study_goal: str | None = Field(
@@ -250,10 +257,21 @@ class GeneralPreferencesUpdate(BaseModel):
 
 
 class GeneralPreferencesResponse(BaseModel):
+    """
+    Read model for general + agent preferences.
+
+    The topic fields carry the same taxonomy as the request model, but are
+    sanitised in ``mode='before'`` validators rather than rejected. Documents
+    written before the taxonomy was enforced hold mixed-case duplicates
+    (``['technology', 'Technology']``) and free-text primary topics; a strict
+    Literal would turn every GET on a not-yet-migrated document into a 500.
+    Legacy values are coerced where they resolve and dropped where they do not,
+    so the endpoint always returns canonical data.
+    """
     language: str
     theme_color: str
-    primary_topic: str | None = None
-    interests: list[str] = Field(default_factory=list)
+    primary_topic: TopicValue | None = None
+    interests: list[TopicValue] = Field(default_factory=list)
     study_goal: str | None = None
     favorite_news: list[dict] = Field(default_factory=list)
     agent_knowledge_access: bool = False
@@ -271,6 +289,18 @@ class GeneralPreferencesResponse(BaseModel):
     # AI Quiz question count — always returned; effective value depends on tier (free=10 fixed).
     agent_ai_quiz_question_count: int = 10
     updated_at: datetime
+
+    @field_validator('interests', mode='before')
+    @classmethod
+    def _sanitize_interests(cls, value: object) -> list[str]:
+        """Coerce legacy interests to the taxonomy instead of rejecting them."""
+        return normalize_interests(value)
+
+    @field_validator('primary_topic', mode='before')
+    @classmethod
+    def _sanitize_primary_topic(cls, value: object) -> str | None:
+        """Coerce a legacy primary topic to the taxonomy, or null it if unknown."""
+        return normalize_topic(value)
 
 
 
@@ -697,6 +727,12 @@ async def update_general_preferences(
     for field_name, db_path in field_map.items():
         if field_name in data.model_fields_set:
             set_doc[db_path] = getattr(data, field_name)
+
+    # Defensive sync: primary_topic and interests[0] drifted apart in the previous
+    # wizard because they were two independent questions. Deriving here guarantees
+    # agent.py never reads a primary_topic absent from interests.
+    if 'interests' in data.model_fields_set and 'primary_topic' not in data.model_fields_set:
+        set_doc['preferences.general.primary_topic'] = data.interests[0] if data.interests else None
 
     result = await users_collection.find_one_and_update(
         {"_id": ObjectId(user_id)},
