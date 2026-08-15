@@ -882,8 +882,7 @@ class PublicContentService:
         Outcomes:
 
         - no record            → claim, copy, complete → `created=True`
-        - completed, live copy → replay the same deck  → `created=False`
-                                 (books keep the historical `409 already_forked`)
+        - completed, live copy → replay the same content → `created=False`
         - completed, copy gone → stale-record recreation → `created=True`
         - failed / abandoned   → discard the partial copy, recreate
         - pending and fresh    → `409 fork_in_progress`, recoverable by retry
@@ -899,7 +898,7 @@ class PublicContentService:
                     continue  # another request won the claim; resolve its record
                 return await self._copy_into_claim(claimed, original, content_type, collection)
 
-            replay = await self._replay_completed_fork(existing, content_type, collection)
+            replay = await self._replay_completed_fork(existing, collection)
             if replay is not None:
                 return replay
 
@@ -951,7 +950,6 @@ class PublicContentService:
     async def _replay_completed_fork(
         self,
         record: Dict[str, Any],
-        content_type: str,
         collection,
     ) -> Optional[ForkOutcome]:
         """Answer a repeat request for a fork this user already completed.
@@ -959,11 +957,14 @@ class PublicContentService:
         Returns `None` when the record is not a completed fork of live content,
         which means the caller must reclaim and recreate it.
 
-        Deck forks replay as a success carrying the same deck: a retrying client
-        cannot distinguish a lost response from an unwanted duplicate, and
-        ADR-005 resolves that in favour of idempotent success. Book forks keep
-        the historical `409 already_forked` because ADR-005 scopes the response
-        change to decks and existing book clients must stay compatible.
+        Both content types replay as a success carrying the same content, with
+        `created=False`. A retrying client cannot distinguish a lost response
+        from an unwanted duplicate, and ADR-005 resolves that in favour of
+        idempotent success — a rationale that never depended on the content
+        type. ONB-003 originally kept `409 already_forked` for books, reading
+        ADR-005 as deck-scoped; ONB-014 removed that split because it left one
+        button in `PublicView` behaving two ways, and one fork service is a
+        worse place to encode the difference than the client would be.
         """
         if fork_status(record) != "completed":
             return None
@@ -971,12 +972,6 @@ class PublicContentService:
         live = await self._live_fork_target(record, collection)
         if live is None:
             return None
-
-        if content_type != "deck":
-            raise _fork_conflict(
-                "already_forked",
-                forked_content_id=str(record.get("forked_content_id")),
-            )
 
         return ForkOutcome(created=False, content=self._serialize_doc(live))
 

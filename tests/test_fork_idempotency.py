@@ -607,7 +607,14 @@ async def test_book_fork_without_header_behaves_as_before():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_book_fork_still_returns_already_forked():
+async def test_duplicate_book_fork_replays_the_same_book():
+    """ONB-014: books replay like decks — `created=False`, same book, no copy.
+
+    This asserted `409 already_forked` until ONB-014. ADR-005's rationale — a
+    retrying client cannot tell a lost response from an unwanted duplicate —
+    never depended on the content type, and the split left one Fork button in
+    `PublicView` behaving two different ways.
+    """
     book = {
         "_id": SOURCE_OID, "user_id": OWNER_ID, "title": "A Public Book",
         "is_public": True, "deleted_at": None,
@@ -622,16 +629,14 @@ async def test_duplicate_book_fork_still_returns_already_forked():
         content=content, forks=forks, content_type="book"
     )
 
-    with pytest.raises(HTTPException) as error:
-        await service.fork_content(
-            content_type="book",
-            original_content_id=str(SOURCE_OID),
-            forking_user_id=FORKER_ID,
-        )
+    outcome = await service.fork_content(
+        content_type="book",
+        original_content_id=str(SOURCE_OID),
+        forking_user_id=FORKER_ID,
+    )
 
-    assert error.value.status_code == 409
-    assert error.value.detail["code"] == "already_forked"
-    assert error.value.detail["forked_content_id"] == str(FORKED_OID)
+    assert outcome.created is False
+    assert str(outcome.content["_id"]) == str(FORKED_OID)
     assert content.inserts == 0
 
 

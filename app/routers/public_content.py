@@ -666,13 +666,13 @@ async def fork_book(
     Fork/clone a public book to your library.
     Creates a private copy with attribution.
 
-    Book forks keep their existing behaviour: a book this user already forked
-    still returns `409 already_forked`. The durable `(type, source, user)` key
-    protects them from duplicates all the same, so a concurrent retry can no
-    longer produce two copies.
+    Forking is idempotent on the durable `(type, source, user)` key (ADR-005):
+    a book this user already forked replays as `200` with `created=false` and
+    the same private book, rather than the historical `409 already_forked`.
+    ONB-014 aligned books with decks so one client action has one outcome.
 
     Errors: `400 cannot_fork_own_content` or `malformed_idempotency_key`; `401`;
-    `404`; `409 already_forked` or `fork_in_progress`; `500 fork_failed`.
+    `404`; `409 fork_in_progress`; `500 fork_failed`.
     """
     outcome = await service.fork_content(
         content_type="book",
