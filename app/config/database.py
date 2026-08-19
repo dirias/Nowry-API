@@ -53,6 +53,118 @@ comments_collection = db["comments"]
 # Shared across Uvicorn workers; buckets self-purge via a TTL on expires_at.
 rate_limits_collection = db["rate_limits"]
 
+# Fork idempotency records — one per (content type, source, user) (ADR-005).
+content_forks_collection = db["content_forks"]
+
+#: Index names for curated official browse (ADR-004). Named so deployment can
+#: verify them, and so the verification step below can report a missing one.
+CURATED_BROWSE_INDEX = "decks_curated_browse"
+CURATED_APPROVED_RANK_INDEX = "decks_curation_approved_topic_rank"
+
+
+async def create_curation_indexes(collection) -> list:
+    """Create and verify the curated-browse indexes on the decks collection.
+
+    Returns the names that are missing after the attempt — empty on success.
+
+    The unique index is partial: it constrains `(topic, rank)` only among
+    *approved* decks, so drafts and rejected candidates may freely reuse a rank
+    while an approved pair stays unambiguous. Creation failure is logged rather
+    than raised: an index problem must not take the whole API down at startup,
+    and the returned list makes the gap visible to the caller.
+    """
+    await collection.create_index(
+        [
+            ("is_public", 1),
+            ("deleted_at", 1),
+            ("public_metadata.curation.status", 1),
+            ("public_metadata.curation.topic", 1),
+            ("public_metadata.curation.rank", 1),
+            ("_id", 1),
+        ],
+        name=CURATED_BROWSE_INDEX,
+    )
+
+    try:
+        await collection.create_index(
+            [
+                ("public_metadata.curation.topic", 1),
+                ("public_metadata.curation.rank", 1),
+            ],
+            name=CURATED_APPROVED_RANK_INDEX,
+            unique=True,
+            partialFilterExpression={"public_metadata.curation.status": "approved"},
+        )
+    except Exception:
+        logger.error(
+            "Failed to create %s — duplicate approved (topic, rank) pairs must be "
+            "resolved before curated ordering is unambiguous.",
+            CURATED_APPROVED_RANK_INDEX,
+            exc_info=True,
+        )
+
+    existing = await collection.index_information()
+    missing = [
+        name
+        for name in (CURATED_BROWSE_INDEX, CURATED_APPROVED_RANK_INDEX)
+        if name not in existing
+    ]
+    if missing:
+        logger.error("Curated browse indexes missing after creation: %s", missing)
+    else:
+        logger.info("Curated browse indexes verified on decks collection.")
+    return missing
+
+
+#: Durable fork identity from ADR-005. Named so deployment can verify it and so
+#: a failure can name the reconciliation that unblocks it.
+FORK_UNIQUE_INDEX = "content_forks_unique_source_user"
+
+
+async def create_fork_indexes(collection) -> list:
+    """Create and verify the unique fork key on the content_forks collection.
+
+    Returns the names that are missing after the attempt — empty on success.
+
+    `(original_content_type, original_content_id, forked_by_user_id)` UNIQUE is
+    the only thing that actually closes the concurrent-fork race: a read-before-
+    write check and a disabled button are both bypassed by two requests in
+    flight at once.
+
+    Creation fails while historical duplicates exist, so the failure is logged
+    with the remedy rather than raised — an index problem must not take the API
+    down at startup, and until it succeeds forking simply keeps its previous,
+    weaker guarantee. Run the reconciliation first:
+
+        .venv/bin/python -m app.migrations.reconcile_duplicate_forks --apply
+    """
+    try:
+        await collection.create_index(
+            [
+                ("original_content_type", 1),
+                ("original_content_id", 1),
+                ("forked_by_user_id", 1),
+            ],
+            name=FORK_UNIQUE_INDEX,
+            unique=True,
+        )
+    except Exception:
+        logger.error(
+            "Failed to create %s — historical duplicate fork records must be "
+            "reconciled first: python -m app.migrations.reconcile_duplicate_forks --apply",
+            FORK_UNIQUE_INDEX,
+            exc_info=True,
+        )
+
+    existing = await collection.index_information()
+    missing = [name for name in (FORK_UNIQUE_INDEX,) if name not in existing]
+    if missing:
+        logger.error("Fork idempotency index missing after creation: %s", missing)
+    else:
+        logger.info("Fork idempotency index verified on content_forks collection.")
+    return missing
+
+
 async def create_indexes():
     # User indexes
     await users_collection.create_index("firebase_uid", unique=True)
@@ -73,6 +185,12 @@ async def create_indexes():
     # Content reports (moderation): status, created_at
     await db["content_reports"].create_index("status")
     await db["content_reports"].create_index("created_at")
+
+    # Curated official browse + unique approved (topic, rank) — ADR-004
+    await create_curation_indexes(decks_collection)
+
+    # Unique fork key — ADR-005
+    await create_fork_indexes(content_forks_collection)
 
     # Annual Planning indexes
     await annual_plans_collection.create_index("user_id")

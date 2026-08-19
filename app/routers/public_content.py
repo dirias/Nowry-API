@@ -2,13 +2,26 @@
 Public Content API Router
 Handles browse, publish, fork, and engagement for public Books and Decks
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from typing import Optional, List, Literal
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from typing import Any, Dict, Optional, List, Literal
+from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 from bson import ObjectId
 
+from app.auth.dependencies import require_admin
 from app.config.database import db
-from app.services.public_content_service import PublicContentService
+from app.models.PublicContent import (
+    MAX_LEARNING_OUTCOME_LENGTH,
+    CurationStatus,
+    PublicCuration,
+    PublicPublisher,
+)
+from app.models.topics import TOPIC_TAXONOMY, TopicValue
+from app.models.User import OnboardingActivation
+from app.services.public_content_service import (
+    PublicContentService,
+    validated_idempotency_key,
+)
 from app.auth.firebase_auth import get_current_user, optional_auth
 from app.config.database import cards_collection, decks_collection
 
@@ -39,7 +52,136 @@ class BrowseFilters(BaseModel):
     language: Optional[str] = None
     difficulty: Optional[Literal["beginner", "intermediate", "advanced"]] = None
     search: Optional[str] = None
-    sort_by: Literal["recent", "popular", "top_rated"] = "recent"
+    sort_by: Literal["recent", "popular", "top_rated", "curated"] = "recent"
+
+
+class PublicDeckBrowseItem(BaseModel):
+    """One deck in the public browse envelope.
+
+    The curated contract fields are typed; every other stored deck field passes
+    through unchanged so existing browse consumers keep the shape they already
+    read. `public_metadata` stays a passthrough mapping deliberately — legacy
+    documents contain values outside today's literals, and a strict model would
+    fail the whole page rather than one field.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = Field(alias="_id")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    total_cards: Optional[int] = None
+    public_metadata: Optional[Dict[str, Any]] = None
+
+    # Server-derived — never read from the stored document (ADR-004).
+    is_official: bool = False
+    curation: Optional[PublicCuration] = None
+    publisher: Optional[PublicPublisher] = None
+
+
+class PublicDeckBrowsePage(BaseModel):
+    """Existing page envelope, now with typed items."""
+
+    items: List[PublicDeckBrowseItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class ForkBookResponse(BaseModel):
+    """Existing book fork body, plus the additive `created` flag (ADR-005)."""
+
+    message: str
+    created: bool
+    forked_book: Dict[str, Any]
+
+
+class ForkRequest(BaseModel):
+    """Optional deck-fork body.
+
+    Every existing caller omits it entirely, which is why the whole body is
+    optional and `context` defaults to `None` — an ordinary library fork. The
+    only recognised value is typed, so a misspelled context is rejected loudly
+    instead of silently downgrading an onboarding fork into a normal one that
+    would never activate.
+    """
+
+    context: Optional[Literal["onboarding"]] = None
+
+
+class ForkDeckResponse(BaseModel):
+    """Existing deck fork body, plus the additive `created` flag (ADR-005).
+
+    `created=false` marks an idempotent replay: the same deck the user already
+    forked, returned as a success instead of the previous `409 already_forked`.
+
+    `onboarding` is present only for an onboarding-context fork whose
+    activation has been persisted (ADR-006). The route serializes with
+    `response_model_exclude_none`, so the key is omitted entirely for an
+    ordinary fork and its presence is itself the proof of the transition. That
+    setting cannot disturb `forked_deck`: Pydantic applies `exclude_none` to
+    model fields, not to the entries of a plain mapping, so the deck payload
+    existing library clients read keeps every null it has today.
+    """
+
+    message: str
+    created: bool
+    forked_deck: Dict[str, Any]
+    onboarding: Optional[OnboardingActivation] = None
+
+
+class DeckCurationRequest(BaseModel):
+    """Editorial curation payload.
+
+    `extra="forbid"` is load-bearing: an attempt to smuggle `reviewed_by`,
+    `reviewed_at` or `is_official` is rejected loudly instead of being silently
+    dropped. Those values are server-derived without exception.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: CurationStatus
+    topic: TopicValue
+    learning_outcome: str = Field(min_length=1, max_length=MAX_LEARNING_OUTCOME_LENGTH)
+    rank: int = Field(ge=1)
+
+
+class DeckCurationResponse(BaseModel):
+    deck_id: str
+    status: CurationStatus
+    topic: TopicValue
+    learning_outcome: str
+    rank: int
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    is_official: bool
+
+
+def _validate_curated_browse(official: bool, sort_by: str, category: Optional[str]) -> None:
+    """Reject invalid official/sort/category combinations with a 400.
+
+    Distinct from an uncovered topic: a *valid* taxonomy topic with no approved
+    decks is a successful empty page (FR-059), while a nonsensical query is a
+    client error.
+    """
+    if sort_by == "curated" and not official:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "curated_sort_requires_official",
+                "message": "sort_by=curated is only valid with official=true",
+            },
+        )
+
+    if official and category is not None and category not in TOPIC_TAXONOMY:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_official_category",
+                "message": "official browse requires a canonical taxonomy topic",
+            },
+        )
 
 
 class PublicCardPreview(BaseModel):
@@ -122,7 +264,7 @@ async def browse_public_books(
     return result
 
 
-@router.get("/decks")
+@router.get("/decks", response_model=PublicDeckBrowsePage)
 async def browse_public_decks(
     category: Optional[str] = None,
     tags: Optional[str] = None,
@@ -130,19 +272,35 @@ async def browse_public_decks(
     difficulty: Optional[str] = None,
     search: Optional[str] = None,
     sort_by: str = "recent",
+    official: bool = Query(
+        False,
+        description="Restrict to editorially approved decks from the official Nowry account",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     request: Request = None,
     current_user: Optional[dict] = Depends(optional_auth),  # Add this dependency
     service: PublicContentService = Depends(get_public_service)
-):
+) -> PublicDeckBrowsePage:
     """
     Browse public decks.
     No authentication required, but logged-in users see more content based on their role.
+
+    Query Parameters (curated discovery, ADR-004):
+    - official: when true, return only approved decks owned by the configured
+      official Nowry account. `is_official` is always server-derived.
+    - sort_by: "recent", "popular", "top_rated", or "curated". "curated" is
+      valid only with official=true and orders by ascending editorial rank then
+      ascending deck id — popularity is never consulted.
+    - category: for official browse this is the canonical taxonomy topic.
+
+    A valid topic with no approved decks returns an empty page, not an error.
     """
     from app.config.database import users_collection
     from bson import ObjectId
-    
+
+    _validate_curated_browse(official, sort_by, category)
+
     # Try to get current user (optional)
     viewer_role = None
     viewer_is_beta = False
@@ -155,9 +313,9 @@ async def browse_public_decks(
                 viewer_is_beta = user.get("is_beta", False)
     except:
         pass  # Continue as anonymous user
-    
+
     tag_list = tags.split(",") if tags else None
-    
+
     result = await service.browse_public_content(
         content_type="deck",
         category=category,
@@ -169,10 +327,11 @@ async def browse_public_decks(
         page=page,
         page_size=page_size,
         viewer_role=viewer_role,
-        viewer_is_beta=viewer_is_beta
+        viewer_is_beta=viewer_is_beta,
+        official=official,
     )
-    
-    return result
+
+    return PublicDeckBrowsePage(**result)
 
 
 @router.get("/books/{book_id}")
@@ -393,6 +552,41 @@ async def unpublish_deck(
     }
 
 
+# ========== Editorial Curation (Admin Only) ==========
+
+@router.put(
+    "/decks/{deck_id}/curation",
+    response_model=DeckCurationResponse,
+    summary="Set editorial curation metadata for an official deck",
+)
+async def set_deck_curation(
+    deck_id: str,
+    data: DeckCurationRequest,
+    current_user: dict = Depends(require_admin),
+    service: PublicContentService = Depends(get_public_service),
+) -> DeckCurationResponse:
+    """
+    Trusted editorial operation — the ONLY writer of `public_metadata.curation`.
+
+    Admin-gated (`is_admin=true`) and restricted to decks owned by the
+    configured official publisher account. The reviewer identity and review time
+    are taken from the authenticated caller and the server clock; the request
+    body cannot carry them.
+
+    Errors: `400` topic/category mismatch, unpublished deck, or an empty deck on
+    approval; `403` non-admin caller or a deck outside the official account;
+    `404` unknown deck; `409` the approved rank is already taken for that topic;
+    `503` no official publisher configured.
+    """
+    result = await service.set_deck_curation(
+        deck_id=deck_id,
+        curation=data.model_dump(),
+        reviewer_id=current_user["user_id"],
+    )
+
+    return DeckCurationResponse(**result)
+
+
 # ========== Engagement (Auth Required) ==========
 
 @router.post("/books/{book_id}/like")
@@ -461,48 +655,87 @@ async def unlike_deck(
 
 # ========== Forking/Cloning (Auth Required) ==========
 
-@router.post("/books/{book_id}/fork")
+@router.post("/books/{book_id}/fork", response_model=ForkBookResponse)
 async def fork_book(
     book_id: str,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
-    service: PublicContentService = Depends(get_public_service)
-):
+    service: PublicContentService = Depends(get_public_service),
+) -> ForkBookResponse:
     """
     Fork/clone a public book to your library.
     Creates a private copy with attribution.
+
+    Forking is idempotent on the durable `(type, source, user)` key (ADR-005):
+    a book this user already forked replays as `200` with `created=false` and
+    the same private book, rather than the historical `409 already_forked`.
+    ONB-014 aligned books with decks so one client action has one outcome.
+
+    Errors: `400 cannot_fork_own_content` or `malformed_idempotency_key`; `401`;
+    `404`; `409 fork_in_progress`; `500 fork_failed`.
     """
-    result = await service.fork_content(
+    outcome = await service.fork_content(
         content_type="book",
         original_content_id=book_id,
-        forking_user_id=current_user["user_id"]
+        forking_user_id=current_user["user_id"],
+        idempotency_key=validated_idempotency_key(idempotency_key),
     )
-    
-    return {
-        "message": "Book forked successfully",
-        "forked_book": result
-    }
+
+    return ForkBookResponse(
+        message="Book forked successfully",
+        created=outcome.created,
+        forked_book=outcome.content,
+    )
 
 
-@router.post("/decks/{deck_id}/fork")
+@router.post(
+    "/decks/{deck_id}/fork",
+    response_model=ForkDeckResponse,
+    response_model_exclude_none=True,
+)
 async def fork_deck(
     deck_id: str,
+    body: Optional[ForkRequest] = None,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
-    service: PublicContentService = Depends(get_public_service)
-):
+    service: PublicContentService = Depends(get_public_service),
+) -> ForkDeckResponse:
     """
-    Fork/clone a public deck to your library.
-    Creates a private copy with attribution.
+    Fork/clone a public deck to your library. Idempotent (ADR-005).
+
+    Repeating the request for a deck this user already forked returns `200` with
+    `created=false` and the same private deck, so a retry after a lost response
+    cannot create a second copy and cannot be mistaken for a duplicate attempt.
+    The optional `Idempotency-Key` header only correlates retries — uniqueness
+    rests on `(deck, user)`, so a lost or regenerated key changes nothing.
+
+    Sending `{"context": "onboarding"}` additionally makes this call the sole
+    owner of onboarding activation (ADR-006): the source must be approved
+    official content, and the response is successful only once the deck, its
+    cards *and* the activation are persisted. The `onboarding` block is then
+    present on both the first completion and every replay, so a client that
+    lost the first response still learns it is activated. Omitting the body
+    leaves onboarding state completely untouched.
+
+    Errors: `400 cannot_fork_own_content` or `malformed_idempotency_key`; `401`;
+    `404`; `409 fork_in_progress` (recoverable — retry shortly) or
+    `409 source_not_official`; `500 fork_failed` / `activation_failed`
+    (recoverable — the identical retry reuses the deck and finishes activation).
     """
-    result = await service.fork_content(
+    outcome = await service.fork_content(
         content_type="deck",
         original_content_id=deck_id,
-        forking_user_id=current_user["user_id"]
+        forking_user_id=current_user["user_id"],
+        idempotency_key=validated_idempotency_key(idempotency_key),
+        onboarding_context=bool(body and body.context == "onboarding"),
     )
-    
-    return {
-        "message": "Deck forked successfully",
-        "forked_deck": result
-    }
+
+    return ForkDeckResponse(
+        message="Deck forked successfully",
+        created=outcome.created,
+        forked_deck=outcome.content,
+        onboarding=outcome.onboarding,
+    )
 
 
 # ========== User Library (Auth Required) ==========
