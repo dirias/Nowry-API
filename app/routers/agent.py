@@ -93,7 +93,7 @@ class ScreenContextPayload(BaseModel):
     front: Optional[str] = None
     back: Optional[str] = None           # None when is_flipped is False
     is_daily_review: Optional[bool] = None
-    mode: Optional[Literal['study', 'browse', 'cram']] = None
+    mode: Optional[Literal['study', 'browse']] = None
     # book fields
     book_id: Optional[str] = None
     book_title: Optional[str] = None
@@ -272,8 +272,8 @@ def _build_context_injection(
             "Answer questions about this card directly from this context — no tool calls needed for this card's content. "
         )
         if ctx.is_flipped and ctx.back:
-            if ctx.mode in ('browse', 'cram'):
-                # Read-only modes: no grading happens, so never imply the user
+            if ctx.mode == 'browse':
+                # Read-only mode: no grading happens, so never imply the user
                 # "answered" anything — mirrors mode_note's constraint below so
                 # the two blocks never give the LLM contradictory instructions.
                 tutor_hint += (
@@ -301,7 +301,7 @@ def _build_context_injection(
         mode_note = (
             "\nMODE NOTE: This is a read-only review — do not mention progress, "
             "when the card comes up again, or whether the answer was right or wrong."
-        ) if ctx.mode in ('browse', 'cram') else ""
+        ) if ctx.mode == 'browse' else ""
 
         return (
             f"\n\nCURRENT SCREEN CONTEXT:\n"

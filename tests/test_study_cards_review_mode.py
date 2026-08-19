@@ -1,9 +1,12 @@
 """
-Phase 32 Plan 02 — Browse/Cram SM-2 mode-guard integration tests (D-04/D-05/T-32-04).
+Phase 32 Plan 02 — Browse SM-2 mode-guard integration tests (D-04/D-05/T-32-04).
 
-Verifies POST /study-cards/{id}/review rejects non-study modes (browse, cram)
+Verifies POST /study-cards/{id}/review rejects the non-study mode (browse)
 with 403 before any SM-2 mutation, while mode=study (and mode omitted, for
-backward compatibility) still update the card's SM-2 fields.
+backward compatibility) still update the card's SM-2 fields. `cram` is no
+longer a supported mode (Nowry has zero production users pre-beta, so it was
+removed outright rather than kept as a backward-compat alias) and is now
+rejected as an invalid query value (422) by the `mode` pattern.
 
 Pytest-native (@pytest.mark.asyncio + app.dependency_overrides + httpx.ASGITransport),
 collected by the normal `pytest tests/` run.
@@ -26,7 +29,7 @@ local `from app.routers.agent import grant_xp` XP side-effect) is stubbed in
 sys.modules the same way test_tracing.py stubs heavy SDK-backed modules on
 this test runner. See 32-02-SUMMARY.md.
 
-Expected RED (browse/cram cases only) until Task 2 adds the `mode` query
+Expected RED (browse case only) until Task 2 adds the `mode` query
 param and the non-study 403 guard to review_card.
 """
 from __future__ import annotations
@@ -142,11 +145,12 @@ async def test_review_mode_browse_forbidden_no_mutation():
 
 
 @pytest.mark.asyncio
-async def test_review_mode_cram_forbidden_no_mutation():
-    """D-04/D-05: mode=cram is rejected with 403 before any SM-2 write."""
+async def test_review_mode_cram_rejected_as_invalid_query_value():
+    """`cram` was removed as a supported mode; the pattern now rejects it
+    as an invalid query value (422) rather than accepting it and 403'ing."""
     card_doc = _make_card_doc()
     response, collection = await _post_review("&mode=cram", card_doc)
-    assert response.status_code == 403
+    assert response.status_code == 422
     collection.update_one.assert_not_awaited()
 
 
