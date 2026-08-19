@@ -797,7 +797,7 @@ async def delete_study_card(
 async def review_card(
     id: str,
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
-    mode: str = Query("study", pattern="^(study|browse|cram)$"),
+    mode: str = Query("study", pattern="^(study|browse)$"),
     collection: Collection = Depends(get_cards_collection),
     card: dict = Depends(require_ownership(get_cards_collection, "id")),
     user: dict = Depends(get_firebase_user),
@@ -806,14 +806,14 @@ async def review_card(
     Review a card and update its SM-2 spaced repetition parameters.
 
     - **grade**: User's self-assessment (again, hard, good, easy)
-    - **mode**: Active session mode (study, browse, cram). Only `study`
-      (the default) may grade a card and mutate its SM-2 schedule;
-      `browse`/`cram` are rejected with 403 before any write (D-04/D-05).
+    - **mode**: Active session mode (study, browse). Only `study` may
+      grade a card and mutate its SM-2 schedule; `browse` is rejected
+      with 403 before any write.
     """
     if mode != "study":
         raise HTTPException(
             status_code=403,
-            detail="Reviews cannot be graded in Browse or Cram mode.",
+            detail="Reviews cannot be graded in Browse mode.",
         )
 
     try:

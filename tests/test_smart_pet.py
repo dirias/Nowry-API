@@ -177,9 +177,9 @@ def test_screen_context_payload_parses_mode():
 # trivially pass regardless of implementation (agent.py never mentions "SM2"/
 # "grading"/"scheduling" anywhere yet). The genuinely failing assertion is the
 # same-vs-different check: today mode has NO effect on the injected string, so
-# a browse/cram injection is byte-for-byte identical to the study-mode
-# injection (RED). Once 31-04 adds the mode-aware read-only note, the two
-# will diverge (GREEN) while still never containing the forbidden words.
+# a browse injection is byte-for-byte identical to the study-mode injection
+# (RED). Once 31-04 adds the mode-aware read-only note, the two will diverge
+# (GREEN) while still never containing the forbidden words.
 def test_context_injection_omits_grading_language_for_browse():
     ctx_browse = ScreenContextPayload(
         page="study_session", mode="browse", card_index=1, total_cards=5
@@ -197,25 +197,21 @@ def test_context_injection_omits_grading_language_for_browse():
     assert injection_browse != injection_study
 
 
-def test_context_injection_omits_grading_language_for_cram():
-    ctx_cram = ScreenContextPayload(
-        page="study_session", mode="cram", card_index=1, total_cards=5
-    )
-    ctx_study = ScreenContextPayload(
-        page="study_session", mode="study", card_index=1, total_cards=5
-    )
-    injection_cram = _build_context_injection(ctx_cram)
-    injection_study = _build_context_injection(ctx_study)
-    lowered = injection_cram.lower()
-    assert "sm2" not in lowered
-    assert "grading" not in lowered
-    assert "grade" not in lowered
-    assert "scheduling" not in lowered
-    assert injection_cram != injection_study
+def test_screen_context_payload_rejects_cram_mode():
+    """`cram` was removed as a supported mode (Nowry has zero production
+    users pre-beta, so it was dropped outright rather than kept as a
+    backward-compat alias) — the Literal now rejects it as an invalid
+    value instead of accepting it."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ScreenContextPayload(
+            page="study_session", mode="cram", card_index=1, total_cards=5
+        )
 
 
 def test_context_injection_unaffected_for_study_mode():
-    """mode='study' (and mode=None) must NOT carry a browse/cram note."""
+    """mode='study' (and mode=None) must NOT carry a browse note."""
     ctx_study = ScreenContextPayload(
         page="study_session", mode="study", card_index=1, total_cards=5
     )

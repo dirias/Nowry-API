@@ -1,9 +1,9 @@
 """
-Phase 31 — D-08 regression: Browse/Cram sessions must never move the streak.
+Phase 31 — D-08 regression: Browse sessions must never move the streak.
 
 Verification test only (no production code change). `review_card` in
-study_cards.py is the SOLE writer of `last_reviewed`, and Browse/Cram never
-call it (Phase 30's structural guarantee). This test locks in that a session
+study_cards.py is the SOLE writer of `last_reviewed`, and Browse never
+calls it (Phase 30's structural guarantee). This test locks in that a session
 with no `last_reviewed` writes in the reviewed-cards window computes a
 streak of 0 in app.routers.users.get_user_stats.
 """
@@ -31,7 +31,7 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_streak_unaffected_when_last_reviewed_untouched(mock_users_collection):
-    """D-08 regression: a Browse/Cram session that wrote no last_reviewed
+    """D-08 regression: a Browse session that wrote no last_reviewed
     timestamps must not extend/create a streak — get_user_stats returns
     study_streak == 0 when the reviewed-cards cursor yields nothing."""
     from app.routers.users import get_user_stats
@@ -59,7 +59,7 @@ async def test_streak_stays_zero_across_multiple_stat_queries(mock_users_collect
     though get_user_stats issues several independent count_documents calls
     (total/flashcards/reviewed/quiz/visual) alongside the streak cursor, a
     completely untouched review window still yields study_streak == 0 —
-    documenting that Browse/Cram's lack of last_reviewed writes is the sole
+    documenting that Browse's lack of last_reviewed writes is the sole
     input the streak calculation depends on."""
     from app.routers.users import get_user_stats
 
