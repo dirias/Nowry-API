@@ -69,8 +69,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # `pip-audit -r requirements.lock` makes pip-audit build its own
+          # ephemeral per-requirement resolution venv internally to work out
+          # transitive dependencies. That inner venv bootstrap (ensurepip) is
+          # a known flaky step in constrained/sandboxed runners and, when it
+          # dies, leaves no pip-audit-report.json behind — the `|| true`
+          # above only swallows pip-audit's own exit code, so the *next*
+          # line then crashes on a missing file with an unrelated-looking
+          # traceback, which is what actually failed this step.
+          #
+          # Installing requirements.lock into this job's own venv first and
+          # auditing the *installed environment* (no `-r`) audits the exact
+          # same pinned dependency set — requirements.lock, not whatever
+          # requirements.txt happens to resolve to today — without pip-audit
+          # ever creating a nested venv. This is pip-audit's own recommended
+          # mode for CI for exactly this reason.
+          pip install -r requirements.lock
           pip install pip-audit==2.9.0
-          pip-audit -r requirements.lock -f json -o pip-audit-report.json || true
+          pip-audit -f json -o pip-audit-report.json || true
           python scripts/check_pip_audit_severity.py pip-audit-report.json
 
       - name: Security regression guards (Phase 32 — SEC-01/SEC-02/SEC-03)
