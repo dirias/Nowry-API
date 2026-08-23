@@ -10,6 +10,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pymongo.errors import DuplicateKeyError
 from app.config.firebase_config import verify_firebase_token
 from app.config.subscription_plans import SubscriptionTier
+from app.models.User import USERNAME_MAX_LENGTH, sanitize_username
 from functools import lru_cache
 from typing import Optional
 from datetime import datetime, timezone
@@ -141,7 +142,6 @@ async def get_firebase_user(request: Request) -> dict:
             # would hit the unique index on firebase_uid/email and raise a
             # DuplicateKeyError (causing a 500).
             now = datetime.now(timezone.utc)
-            display_name: str = token_data.get("name") or ""
             await users_collection.update_one(
                 {"_id": user["_id"]},
                 {
@@ -151,7 +151,6 @@ async def get_firebase_user(request: Request) -> dict:
                         # account after hard-delete on the Firebase side).
                         "firebase_uid": token_data["firebase_uid"],
                         "photo_url": token_data.get("picture") or user.get("photo_url"),
-                        "full_name": display_name or user.get("full_name", ""),
                         "wizard_completed": False,
                         "updated_at": now,
                     },
@@ -165,7 +164,13 @@ async def get_firebase_user(request: Request) -> dict:
             # the frontend can drive onboarding (wizard) normally.
             display_name: str = token_data.get("name") or ""
             email: str = token_data.get("email") or ""
-            username: str = display_name or (email.split("@")[0] if email else "user")
+            raw_username: str = display_name or (email.split("@")[0] if email else "user")
+            # This path never goes through RegisterRequest/ProfilePatchRequest
+            # validation (there is no user-submitted form here), so the
+            # derived value is sanitized against the identical username
+            # format rule those models enforce — e.g. an email local-part
+            # like "rikydier+nu1" would otherwise write an invalid "+".
+            username: str = sanitize_username(raw_username, token_data["firebase_uid"][:6])
             now = datetime.now(timezone.utc)
 
             # Create Stripe customer — wrapped in try/except so a Stripe failure
@@ -185,7 +190,6 @@ async def get_firebase_user(request: Request) -> dict:
                 "firebase_uid": token_data["firebase_uid"],
                 "email": email,
                 "username": username,
-                "full_name": display_name or username,
                 "photo_url": token_data.get("picture"),
                 "role": "user",
                 "stripe_customer_id": stripe_customer_id,  # None if Stripe call failed
@@ -200,6 +204,20 @@ async def get_firebase_user(request: Request) -> dict:
                     "subscription_status_updated_at": now,
                 },
                 "wizard_completed": False,
+                "preferences": {
+                    "pet": {
+                        # Mirror register_user's new-account defaults (auth.py):
+                        # the pet starts inactive and un-revealed, auto-activating
+                        # on the user's first completed study session via
+                        # POST /agent/pet/reveal. Without this, an account
+                        # auto-provisioned here (first-time Google sign-in,
+                        # racing ahead of /auth/register) would fall through to
+                        # PetPreferencesResponse's True default and show the pet
+                        # as already active on a brand-new account.
+                        "pet_active": False,
+                        "pet_revealed": False,
+                    }
+                },
                 "created_at": now,
                 "updated_at": now,
             }
@@ -237,7 +255,12 @@ async def get_firebase_user(request: Request) -> dict:
                     # username collision between two different accounts that
                     # happen to share a display name. Disambiguate and retry
                     # once rather than 500ing on a brand-new sign-up.
-                    new_user_doc["username"] = f"{username}-{token_data['firebase_uid'][:6]}"
+                    # Truncated: `username` is already sanitized to at most
+                    # USERNAME_MAX_LENGTH chars, but appending "-{uid[:6]}"
+                    # could otherwise push the result past that limit.
+                    new_user_doc["username"] = (
+                        f"{username}-{token_data['firebase_uid'][:6]}"[:USERNAME_MAX_LENGTH]
+                    )
                     try:
                         result = await users_collection.insert_one(new_user_doc)
                         token_data["user_id"] = str(result.inserted_id)

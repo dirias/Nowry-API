@@ -146,6 +146,8 @@ class AgentStateResponse(BaseModel):
     animation_url: Optional[str] = None
     animation_stage: Optional[int] = None
     animation_regen_pending: bool = False
+    pet_active: bool = True
+    pet_revealed: bool = True
     agent_roaming_enabled: bool = True
     agent_intervention_frequency: str = 'balanced'
     agent_focus_mode: bool = False
@@ -751,7 +753,7 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     color_slug = pet.get("pet_color") or "violet"
     study_goal = general.get("study_goal") or "general"
     primary_topic = (general.get("primary_topic") or "").lower()
-    full_name = user_doc.get("full_name") or user_doc.get("username") or ""
+    full_name = user_doc.get("username") or ""
     avatar_seed = pet.get("avatar_seed") or str(_uuid.uuid4())
 
     # Build interest traits (max 4 total, 2 per interest)
@@ -940,7 +942,7 @@ def _build_system_prompt(
     wizard fields stored in preferences.general and preferences.agent.
     """
     prefs = user.get("preferences", {}).get("general", {})
-    preferred_name = user.get("full_name") or user.get("username", "there")
+    preferred_name = user.get("username", "there")
     primary_topic = prefs.get("primary_topic") or "general knowledge"
     interests = prefs.get("interests", [])
     study_goal = prefs.get("study_goal", "general")
@@ -2103,6 +2105,53 @@ async def post_intervention(
     raise HTTPException(status_code=422, detail="Unknown intervention type.")
 
 
+class PetRevealResponse(BaseModel):
+    pet_active: bool
+    pet_revealed: bool
+    already_revealed: bool = False
+
+
+@router.post('/pet/reveal', response_model=PetRevealResponse)
+async def reveal_pet(
+    current_user: dict = Depends(get_firebase_user),
+) -> PetRevealResponse:
+    """One-time contextual activation of the study companion.
+
+    Called by the frontend right after a user's first completed study
+    session. Idempotent — a second call (retry, duplicate tab, race) is a
+    no-op that returns the existing state rather than re-celebrating.
+    """
+    user_id: str = current_user.get("user_id")
+
+    user_doc = await users_collection.find_one(
+        {'_id': ObjectId(user_id)},
+        {'preferences.pet': 1},
+    )
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    pet: dict = user_doc.get('preferences', {}).get('pet', {})
+    if pet.get('pet_revealed', True):
+        return PetRevealResponse(
+            pet_active=pet.get('pet_active', True),
+            pet_revealed=True,
+            already_revealed=True,
+        )
+
+    await users_collection.update_one(
+        {'_id': ObjectId(user_id)},
+        {'$set': {
+            'preferences.pet.pet_active': True,
+            'preferences.pet.pet_revealed': True,
+        }},
+    )
+    return PetRevealResponse(
+        pet_active=True,
+        pet_revealed=True,
+        already_revealed=False,
+    )
+
+
 class SessionXpRequest(BaseModel):
     cards_reviewed: int
     deck_id: str
@@ -2196,7 +2245,7 @@ async def get_agent_state(
     agent_data = user.get("agent", {})
     cards_reviewed: int = user.get("stats", {}).get("total_cards_reviewed", 0)
     messages_used: int = agent_data.get("messages_used_this_month", 0)
-    preferred_name = user.get("full_name") or user.get("username", "Learner")
+    preferred_name = user.get("username", "Learner")
 
     knowledge_access, proactive_nudging, _, __ = _get_agent_prefs(user)
 
@@ -2218,6 +2267,8 @@ async def get_agent_state(
     animation_url = pet_prefs.get("animation_url")
     animation_stage = pet_prefs.get("animation_stage")
     animation_regen_pending = pet_prefs.get("animation_regen_pending", False)
+    pet_active = pet_prefs.get("pet_active", True)
+    pet_revealed = pet_prefs.get("pet_revealed", True)
 
     return AgentStateResponse(
         level=_calculate_level(xp),
@@ -2241,6 +2292,8 @@ async def get_agent_state(
         animation_url=animation_url,
         animation_stage=animation_stage,
         animation_regen_pending=animation_regen_pending,
+        pet_active=pet_active,
+        pet_revealed=pet_revealed,
         agent_roaming_enabled=agent_roaming_enabled,
         agent_intervention_frequency=intervention_frequency,
         agent_focus_mode=focus_mode,
@@ -2274,7 +2327,7 @@ async def get_proactive_nudge(
 
     try:
         summary = await get_study_summary(user_id)
-        preferred_name = user.get("full_name") or user.get("username", "there")
+        preferred_name = user.get("username", "there")
         due = summary.get("due_cards", 0)
         new = summary.get("new_cards", 0)
         pending_decks = summary.get("decks_with_pending_work", [])
