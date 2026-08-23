@@ -22,6 +22,9 @@ logger = get_logger(__name__)
 
 from app.models.User import (
     RECORDABLE_ONBOARDING_POINTS,
+    USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH,
+    USERNAME_PATTERN,
     OnboardingPoint,
     OnboardingState,
     OnboardingStatus,
@@ -71,7 +74,6 @@ class UserMeResponse(BaseModel):
     firebase_uid: str
     username: str
     email: str
-    full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     photo_url: Optional[str] = None
     role: str
@@ -104,7 +106,6 @@ async def get_current_user_profile(
         firebase_uid=user.get("firebase_uid"),
         username=user.get("username"),
         email=user.get("email"),
-        full_name=user.get("full_name"),
         avatar_url=user.get("avatar_url"),
         photo_url=user.get("photo_url"),
         role=user.get("role", "user"),
@@ -117,7 +118,6 @@ async def get_current_user_profile(
 
 # Pydantic Models
 class ProfileUpdate(BaseModel):
-    full_name: Optional[str] = None
     bio: Optional[str] = None
 
 
@@ -125,7 +125,6 @@ class ProfileResponse(BaseModel):
     id: str
     username: str
     email: str
-    full_name: Optional[str] = None
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
     photo_url: Optional[str] = None
@@ -138,16 +137,26 @@ class ProfileResponse(BaseModel):
 
 
 class ProfilePatchRequest(BaseModel):
-    full_name: Optional[str] = None
     bio: Optional[str] = None
+    # Shared with RegisterRequest.username (app/routers/auth.py) via the
+    # USERNAME_* constants in app/models/User.py, so signup and profile-edit
+    # enforce the identical format rule. The Firebase auto-provisioning
+    # fallback (app/auth/firebase_auth.py) sanitizes its derived username
+    # against the same rule using app.models.User.sanitize_username.
+    username: Optional[str] = Field(
+        default=None,
+        min_length=USERNAME_MIN_LENGTH,
+        max_length=USERNAME_MAX_LENGTH,
+        pattern=USERNAME_PATTERN,
+    )
 
     model_config = ConfigDict(extra="forbid")
 
 
 class ProfilePatchResponse(BaseModel):
     message: str
-    full_name: Optional[str] = None
     bio: Optional[str] = None
+    username: Optional[str] = None
     updated_at: datetime
 
 
@@ -482,7 +491,6 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
         id=str(user["_id"]),
         username=user.get("username", ""),
         email=user.get("email", ""),
-        full_name=user.get("full_name"),
         bio=user.get("bio"),
         avatar_url=user.get("avatar_url"),
         photo_url=user.get("photo_url"),
@@ -504,8 +512,6 @@ async def update_profile(
     user_id = current_user.get("user_id")
 
     update_data = {}
-    if profile_update.full_name is not None:
-        update_data["full_name"] = profile_update.full_name
     if profile_update.bio is not None:
         update_data["bio"] = profile_update.bio
 
@@ -525,20 +531,31 @@ async def patch_user_profile(
     body: ProfilePatchRequest,
     current_user: dict = Depends(get_firebase_user),
 ) -> ProfilePatchResponse:
-    """Partially update user profile (display name, bio)"""
-    if body.full_name is None and body.bio is None:
+    """Partially update user profile (bio, username)"""
+    if body.bio is None and body.username is None:
         raise HTTPException(
             status_code=400,
-            detail="At least one field (full_name, bio) must be provided.",
+            detail="At least one field (bio, username) must be provided.",
         )
 
     user_id = current_user.get("user_id")
 
     update_dict: dict = {}
-    if body.full_name is not None:
-        update_dict["full_name"] = body.full_name
     if body.bio is not None:
         update_dict["bio"] = body.bio
+
+    if body.username is not None:
+        # Uniqueness backed by the unique index on `username`
+        # (app/config/database.py create_indexes). Unlike the signup
+        # auto-provisioning paths, a value the user explicitly typed here is
+        # never silently suffixed on collision — surface a 409 instead so the
+        # frontend can show an inline field error.
+        existing = await users_collection.find_one(
+            {"username": body.username, "_id": {"$ne": ObjectId(user_id)}}
+        )
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="Username already taken")
+        update_dict["username"] = body.username
 
     updated_at = datetime.now(timezone.utc)
     update_dict["updated_at"] = updated_at
@@ -552,8 +569,8 @@ async def patch_user_profile(
 
     return ProfilePatchResponse(
         message="Profile updated successfully",
-        full_name=body.full_name,
         bio=body.bio,
+        username=body.username,
         updated_at=updated_at,
     )
 
@@ -1198,6 +1215,7 @@ class PetPreferencesUpdate(BaseModel):
     pet_name: str | None = None
     pet_species: str | None = None
     pet_color: str | None = None
+    pet_active: bool | None = None
 
     @field_validator("pet_name")
     @classmethod
@@ -1230,13 +1248,23 @@ class PetPreferencesResponse(BaseModel):
     pet_name: str | None = None
     pet_species: str | None = None
     pet_color: str | None = None
+    pet_active: bool = True
+    pet_revealed: bool = True
 
 
 @router.get("/preferences/pet", response_model=PetPreferencesResponse)
 async def get_pet_preferences(
     current_user: dict = Depends(get_firebase_user),
 ) -> PetPreferencesResponse:
-    """Fetch the current user's pet customization preferences."""
+    """Fetch the current user's pet customization preferences.
+
+    Legacy documents (created before the pet-activation gate existed) have
+    no ``pet_active``/``pet_revealed`` keys at all — those must resolve to
+    ``True`` so existing accounts keep seeing an already-active pet. New
+    accounts always have both keys explicitly set at creation time (see
+    ``app/routers/auth.py::register_user``), so this default only ever
+    fires for pre-existing data.
+    """
     user_id: str = current_user.get("user_id")
     user_doc = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
@@ -1249,6 +1277,8 @@ async def get_pet_preferences(
         pet_name=pet.get("pet_name"),
         pet_species=pet.get("pet_species"),
         pet_color=pet.get("pet_color"),
+        pet_active=pet.get("pet_active", True),
+        pet_revealed=pet.get("pet_revealed", True),
     )
 
 

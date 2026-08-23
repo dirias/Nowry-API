@@ -383,14 +383,14 @@ async def get_user_interests(user_id: str) -> dict:
 
     user = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
-        {"preferences": 1, "full_name": 1}
+        {"preferences": 1, "username": 1}
     )
     if not user:
         return {"error": "User not found"}
 
     prefs = user.get("preferences", {}).get("general", {})
     return {
-        "preferred_name": user.get("full_name", ""),
+        "preferred_name": user.get("username", ""),
         "interests": prefs.get("interests", []),
         "primary_topic": prefs.get("primary_topic", ""),
         "study_goal": prefs.get("study_goal", "general"),

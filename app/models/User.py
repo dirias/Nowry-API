@@ -9,6 +9,7 @@ time. Language, accent color, interests, primary topic, and study goal stay in
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
@@ -24,6 +25,47 @@ class User(BaseModel, SoftDeleteMixin):
     role: Optional[str] = "user"  # user, dev, admin
     is_beta: Optional[bool] = False  # Beta tester flag
     # password: str  # REMOVED - Firebase handles authentication
+
+
+# ---------------------------------------------------------------------------
+# Username format rule
+# ---------------------------------------------------------------------------
+# Single source of truth for the username format constraint, shared by
+# RegisterRequest (app/routers/auth.py), ProfilePatchRequest
+# (app/routers/users.py), and the Firebase auto-provisioning fallback
+# (app/auth/firebase_auth.py). All three paths must enforce the identical
+# rule so a username can never be created that later fails re-validation.
+
+USERNAME_MIN_LENGTH = 3
+USERNAME_MAX_LENGTH = 30
+USERNAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
+
+#: Matches any character outside the allowed username charset.
+_USERNAME_INVALID_CHARS_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def sanitize_username(raw: str, uid_suffix: str) -> str:
+    """Sanitize a derived username so it satisfies ``USERNAME_PATTERN``.
+
+    Used by the Firebase auto-provisioning fallback, which derives a
+    username from the ID token's display name or email local-part without
+    ever passing through ``RegisterRequest``/``ProfilePatchRequest``
+    validation (e.g. an email of ``rikydier+nu1@gmail.com`` naively derives
+    ``"rikydier+nu1"``, and ``+`` is not in the allowed charset).
+
+    Invalid characters are stripped (not replaced) to keep the result
+    deterministic and free of artifacts like doubled hyphens. If stripping
+    leaves fewer than ``USERNAME_MIN_LENGTH`` characters, the result falls
+    back to a generic stem padded with the same ``-{firebase_uid[:6]}``
+    suffix already used elsewhere in ``firebase_auth.py`` to disambiguate
+    username collisions — one mechanism covers both "too short" and
+    "not unique" instead of two separate code paths.
+    """
+    cleaned = _USERNAME_INVALID_CHARS_RE.sub("", raw)[:USERNAME_MAX_LENGTH]
+    if len(cleaned) >= USERNAME_MIN_LENGTH:
+        return cleaned
+    stem = cleaned or "user"
+    return f"{stem}-{uid_suffix}"[:USERNAME_MAX_LENGTH]
 
 
 # ---------------------------------------------------------------------------

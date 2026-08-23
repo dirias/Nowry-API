@@ -1187,13 +1187,7 @@ class PublicContentService:
             user_doc = None
         if not user_doc:
             return None
-        return (
-            user_doc.get("full_name")
-            or user_doc.get("display_name")
-            or user_doc.get("username")
-            or user_doc.get("displayName")
-            or "Anonymous User"
-        )
+        return user_doc.get("username") or "Anonymous User"
 
     async def _copy_fork_cards(
         self,
