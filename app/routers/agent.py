@@ -178,7 +178,11 @@ class ChatResponse(BaseModel):
 
 
 class GenerateAvatarRequest(BaseModel):
-    trigger: Literal["manual", "evolution"] = "manual"
+    # next_stage generates the form the user has NOT reached yet, so the
+    # locked rung on their journey shows the real shape they are working
+    # toward rather than a generic placeholder. Quota-free and idempotent:
+    # it no-ops once that stage's art exists.
+    trigger: Literal["manual", "evolution", "next_stage"] = "manual"
 
 
 class GenerateAvatarResponse(BaseModel):
@@ -968,6 +972,62 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     return prompt, seed_int
 
 
+def _strip_generated_backdrop(image_bytes: bytes) -> bytes:
+    """Make the generated backdrop transparent, leaving just the companion.
+
+    FLUX cannot emit an alpha channel, so every generated portrait arrives on
+    a solid white field. That field is visible as a white disc behind the pet
+    in the orb, and it makes a locked look-ahead form silhouette into a
+    featureless circle instead of the creature's actual shape.
+
+    Flood-filled from the corners rather than keyed on white globally: a pet's
+    own highlights, eyes and pale plumage are near-white too, and a global
+    threshold punches holes straight through the character.
+
+    Best-effort — returns the original bytes untouched on any failure, since a
+    portrait with a backdrop is far better than no portrait.
+    """
+    try:
+        import io
+
+        from PIL import Image, ImageDraw
+
+        SENTINEL = (254, 0, 254)
+        THRESHOLD = 26
+        # The portrait renders at 56-110px; 512 covers any retina display.
+        # Alpha PNGs are far heavier than the flat source, so without this the
+        # backdrop removal would roughly triple what every user downloads.
+        MAX_EDGE = 512
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        width, height = image.size
+        corners = ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1))
+        for corner in corners:
+            ImageDraw.floodfill(image, corner, SENTINEL, thresh=THRESHOLD)
+
+        rgba = image.convert("RGBA")
+        rgba.putdata([
+            (0, 0, 0, 0) if pixel[:3] == SENTINEL else pixel
+            for pixel in rgba.getdata()
+        ])
+
+        # Trim to the character before scaling, so the pet fills the frame
+        # rather than the empty margin the model left around it.
+        bbox = rgba.getbbox()
+        if bbox:
+            rgba = rgba.crop(bbox)
+        if max(rgba.size) > MAX_EDGE:
+            ratio = MAX_EDGE / max(rgba.size)
+            rgba = rgba.resize((max(1, int(rgba.width * ratio)), max(1, int(rgba.height * ratio))), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        rgba.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+    except Exception as exc:  # noqa: BLE001 - decoration must never break generation
+        logger.warning(f"Backdrop removal skipped: {exc}")
+        return image_bytes
+
+
 async def _call_fal_avatar(prompt: str, seed: int) -> str:
     """
     Call fal.ai FLUX Pro to generate an avatar, then upload it to Cloudinary.
@@ -1008,13 +1068,13 @@ async def _call_fal_avatar(prompt: str, seed: int) -> str:
         if img_resp.status_code != 200:
             raise RuntimeError(f"Failed to download image: {img_resp.status_code}")
 
-        image_bytes = img_resp.content
+        image_bytes = _strip_generated_backdrop(img_resp.content)
 
     # Upload to Cloudinary for a permanent HTTPS URL
     storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
     result = await storage.upload(
         file_content=image_bytes,
-        filename=f"pet_avatar_{seed}",
+        filename=f"pet_avatar_{seed}.png",
         folder="nowry/pet_avatars",
     )
     secure_url: str = result.get("secure_url") or result.get("url")
@@ -2586,7 +2646,11 @@ async def get_agent_state(
 
     xp: int = agent_data.get("xp", 0)
     pet_prefs: dict = user.get("preferences", {}).get("pet", {})
-    avatar_url = pet_prefs.get("avatar_url")
+    # A form generated ahead of time becomes the worn one the moment its stage
+    # is reached — the reveal needs no extra request and no extra generation.
+    stage_avatars: dict = pet_prefs.get("stage_avatars") or {}
+    current_stage_for_art: int = _level_to_stage(_calculate_level(xp))
+    avatar_url = stage_avatars.get(str(current_stage_for_art)) or pet_prefs.get("avatar_url")
     avatar_stage = pet_prefs.get("avatar_stage")
     avatar_regen_pending = pet_prefs.get("avatar_regen_pending", False)
     animation_url = pet_prefs.get("animation_url")
@@ -2641,6 +2705,10 @@ class JourneyStage(BaseModel):
     reached_at: Optional[datetime] = None
     # Null once reached; otherwise how much XP still separates the user from it.
     xp_remaining: Optional[int] = None
+    # Real art for THIS form, when it exists. A look-ahead form has art before
+    # it is reached, so its locked silhouette is the true shape rather than a
+    # placeholder — and unlocking it is a genuine reveal, not a swap.
+    art_url: Optional[str] = None
 
 
 class JourneyResponse(BaseModel):
@@ -2693,7 +2761,8 @@ async def get_journey(
     user = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
         {"agent.xp": 1, "preferences.pet.evolution_history": 1,
-         "preferences.pet.avatar_url": 1, "created_at": 1},
+         "preferences.pet.avatar_url": 1, "preferences.pet.stage_avatars": 1,
+         "created_at": 1},
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2711,6 +2780,8 @@ async def get_journey(
         if isinstance(entry, dict) and entry.get("stage") and entry.get("reached_at")
     }
 
+    stage_avatars: dict = user.get("preferences", {}).get("pet", {}).get("stage_avatars") or {}
+
     stages: list[JourneyStage] = []
     for stage in range(1, STAGE_COUNT + 1):
         level_required: int = 1 if stage == 1 else STAGE_LEVEL_THRESHOLDS[stage - 2]
@@ -2724,6 +2795,7 @@ async def get_journey(
                 reached=reached,
                 reached_at=history.get(stage),
                 xp_remaining=None if reached else max(0, xp_required - xp),
+                art_url=stage_avatars.get(str(stage)),
             )
         )
 
@@ -2877,9 +2949,21 @@ async def generate_avatar(
         )
         pet["avatar_seed"] = avatar_seed
 
-    # Compute stage
+    # Compute stage. next_stage deliberately targets the form AHEAD of the
+    # user so their journey's locked rung is the real thing, undetailed.
     xp: int = user_doc.get("agent", {}).get("xp", 0)
-    stage: int = _level_to_stage(_calculate_level(xp))
+    current_stage: int = _level_to_stage(_calculate_level(xp))
+    stage: int = current_stage
+
+    stage_avatars: dict = pet.get("stage_avatars") or {}
+    if body.trigger == "next_stage":
+        stage = current_stage + 1
+        if stage > STAGE_COUNT:
+            raise HTTPException(status_code=400, detail="avatar_arc_complete")
+        # Idempotent by construction — no counter needed, and no way to spend
+        # money twice on the same form.
+        if stage_avatars.get(str(stage)):
+            raise HTTPException(status_code=409, detail="avatar_stage_already_generated")
 
     # Build prompt
     try:
@@ -2905,12 +2989,17 @@ async def generate_avatar(
     # For manual trigger: count/month already written atomically in the reservation above.
     # For evolution trigger: count_increment = 0; normalise month field to current_month.
     now = datetime.now(timezone.utc)
+    # Every generated form is kept, keyed by stage: that is what lets the
+    # journey show real art for forms already earned instead of one image.
     persist_fields: dict = {
-        "preferences.pet.avatar_url": avatar_url,
-        "preferences.pet.avatar_stage": stage,
+        f"preferences.pet.stage_avatars.{stage}": avatar_url,
         "preferences.pet.avatar_generated_at": now,
-        "preferences.pet.avatar_regen_pending": False,
     }
+    if body.trigger != "next_stage":
+        # avatar_url is the CURRENTLY worn form; a look-ahead must not replace it.
+        persist_fields["preferences.pet.avatar_url"] = avatar_url
+        persist_fields["preferences.pet.avatar_stage"] = stage
+        persist_fields["preferences.pet.avatar_regen_pending"] = False
     if body.trigger == "evolution":
         persist_fields["preferences.pet.avatar_reset_month"] = current_month
     await users_collection.update_one(

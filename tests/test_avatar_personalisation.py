@@ -61,6 +61,7 @@ _quiz_mod.QuizOffer = _QuizOffer
 
 from app.routers.agent import (  # noqa: E402
     AVATAR_GOAL_MOODS,
+    _strip_generated_backdrop,
     AVATAR_TOPIC_SIGNATURES,
     DEFAULT_PET_NAME,
     MAX_AVATAR_TOPICS,
@@ -314,3 +315,68 @@ class TestDefaultCompanion:
 
     def test_the_default_is_named_after_the_brand(self) -> None:
         assert DEFAULT_PET_NAME == "Nowry"
+
+
+class TestGeneratedBackdrop:
+    """
+    FLUX cannot emit alpha, so every portrait arrives on a solid white field.
+    Left in place it shows as a white disc behind the pet in the orb, and it
+    turns a locked look-ahead form's silhouette into a featureless square
+    instead of the creature's shape.
+    """
+
+    @staticmethod
+    def _flat_character():
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (300, 300), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse((90, 90, 210, 210), fill=(40, 140, 70))
+        # A near-white highlight ON the character: a global white key would
+        # punch a hole here, which is why the fill is seeded from the corners.
+        draw.ellipse((120, 120, 145, 145), fill=(252, 252, 252))
+        import io
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _open(self, data):
+        import io
+
+        from PIL import Image
+
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+
+    def test_the_backdrop_becomes_transparent(self) -> None:
+        out = self._open(_strip_generated_backdrop(self._flat_character()))
+        w, h = out.size
+        corners = (out.getpixel((0, 0)), out.getpixel((w - 1, 0)),
+                   out.getpixel((0, h - 1)), out.getpixel((w - 1, h - 1)))
+        assert all(pixel[3] == 0 for pixel in corners)
+
+    def test_the_character_survives_intact(self) -> None:
+        out = self._open(_strip_generated_backdrop(self._flat_character()))
+        w, h = out.size
+        assert out.getpixel((w // 2, h // 2))[3] == 255
+
+    def test_a_near_white_highlight_on_the_character_is_not_eaten(self) -> None:
+        # The regression a global white threshold would cause.
+        out = self._open(_strip_generated_backdrop(self._flat_character()))
+        opaque = sum(1 for pixel in out.getdata() if pixel[3] > 0)
+        assert opaque > 0
+        highlight_kept = any(
+            pixel[3] == 255 and min(pixel[:3]) > 240 for pixel in out.getdata()
+        )
+        assert highlight_kept
+
+    def test_the_result_is_cropped_to_the_character(self) -> None:
+        out = self._open(_strip_generated_backdrop(self._flat_character()))
+        # Source was 300x300 with the subject inset; output should be tighter.
+        assert max(out.size) < 300
+
+    def test_unreadable_bytes_pass_through_untouched(self) -> None:
+        # A portrait with a backdrop beats no portrait, so failure returns the
+        # original rather than raising into the generation path.
+        junk = b"not an image"
+        assert _strip_generated_backdrop(junk) == junk
