@@ -1206,15 +1206,13 @@ VALID_SPECIES: frozenset[str] = frozenset({
     "star", "phoenix", "crystal", "leaf", "music",
 })
 
-VALID_COLORS: frozenset[str] = frozenset({
-    "ocean", "violet", "mint", "gold", "rose", "coral", "sky", "ember",
-})
-
-
 class PetPreferencesUpdate(BaseModel):
+    # pet_color removed: the companion's colour now follows the accent the user
+    # actually picks (preferences.general.theme_color). This field had no
+    # picker anywhere in the UI, so it was null for effectively every user and
+    # the avatar generator's fallback made every pet violet.
     pet_name: str | None = None
     pet_species: str | None = None
-    pet_color: str | None = None
     pet_active: bool | None = None
 
     @field_validator("pet_name")
@@ -1236,18 +1234,11 @@ class PetPreferencesUpdate(BaseModel):
             raise ValueError(f"pet_species must be one of {sorted(VALID_SPECIES)}")
         return v
 
-    @field_validator("pet_color")
-    @classmethod
-    def validate_pet_color(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_COLORS:
-            raise ValueError(f"pet_color must be one of {sorted(VALID_COLORS)}")
-        return v
 
 
 class PetPreferencesResponse(BaseModel):
     pet_name: str | None = None
     pet_species: str | None = None
-    pet_color: str | None = None
     pet_active: bool = True
     pet_revealed: bool = True
 
@@ -1276,7 +1267,6 @@ async def get_pet_preferences(
     return PetPreferencesResponse(
         pet_name=pet.get("pet_name"),
         pet_species=pet.get("pet_species"),
-        pet_color=pet.get("pet_color"),
         pet_active=pet.get("pet_active", True),
         pet_revealed=pet.get("pet_revealed", True),
     )

@@ -140,7 +140,6 @@ class AgentStateResponse(BaseModel):
     current_stage: int = 1
     pet_name: str | None = None
     pet_species: str | None = None
-    pet_color: str | None = None
     avatar_url: Optional[str] = None
     avatar_stage: Optional[int] = None
     avatar_regen_pending: bool = False
@@ -685,29 +684,103 @@ AVATAR_STAGE_DESCRIPTORS: dict[int, str] = {
     6: "an ancient legendary being, radiant aura markings, majestic and awe-inspiring",
 }
 
+# Keyed on EXACT taxonomy values from learningTaxonomy.js TOPICS. The lookup
+# used to be a substring test, which quietly mis-fired: "art" is a substring of
+# "artificial_intelligence", so every AI learner was handed a paintbrush and
+# watercolour splashes. Exact matching also means a topic either has a trait or
+# visibly does not, instead of silently borrowing another topic's.
 AVATAR_INTEREST_TRAITS: dict[str, list[str]] = {
-    "science":     ["wearing a tiny lab coat", "small round goggles pushed up on forehead"],
-    "music":       ["floating musical notes orbiting it", "small headphones around neck"],
-    "health":      ["small glowing medical cross badge on chest", "fresh green leaf accent"],
+    "artificial_intelligence": ["faint neural-network lines tracing its form", "a small glowing node orbiting it"],
     "technology":  ["faint circuit board patterns on body", "small holographic display nearby"],
-    "language":    ["small open book floating beside it", "faint foreign script glyphs in background"],
-    "art":         ["paintbrush tucked behind ear", "faint watercolor splashes in background"],
+    "science":     ["wearing a tiny lab coat", "small round goggles pushed up on forehead"],
+    "mathematics": ["glowing geometric shapes floating nearby", "small chalkboard with symbols"],
     "history":     ["small ancient scroll in one hand", "sepia-tinted background corner detail"],
-    "math":        ["glowing geometric shapes floating nearby", "small chalkboard with symbols"],
-    "nature":      ["small flower growing from its habitat", "soft leaf and vine environment"],
-    "cooking":     ["tiny chef hat", "small steaming bowl beside it"],
+    "languages":   ["small open book floating beside it", "faint foreign script glyphs in background"],
+    "literature":  ["a worn hardback book tucked under one arm", "faint handwritten script drifting behind it"],
+    "art":         ["paintbrush tucked behind ear", "faint watercolor splashes in background"],
+    "music":       ["floating musical notes orbiting it", "small headphones around neck"],
+    "business":    ["a small leather satchel at its side", "a tiny upward-trending chart floating nearby"],
+    "health":      ["small glowing medical cross badge on chest", "fresh green leaf accent"],
+    "philosophy":  ["a small hourglass resting beside it", "a faint spiral motif in the background"],
+    "design":      ["a small colour swatch fan in hand", "fine grid lines faint in the background"],
+    "psychology":  ["a soft glowing thought-bubble above its head", "faint interlocking-circles motif behind it"],
 }
 
-AVATAR_COLOR_NAMES: dict[str, str] = {
-    "ocean":  "deep ocean blue",
-    "violet": "rich violet purple",
-    "mint":   "soft mint green",
-    "gold":   "warm golden amber",
-    "rose":   "gentle rose pink",
-    "coral":  "vivid coral orange-pink",
-    "sky":    "clear sky blue",
-    "ember":  "warm ember orange",
+# The companion's colour follows the accent the user actually picked during
+# onboarding (`preferences.general.theme_color`).
+#
+# It previously read `preferences.pet.pet_color`, a slug from a second palette
+# that had no picker anywhere in the UI — so it was null for effectively every
+# user, the `or "violet"` fallback fired, and every generated pet came out
+# violet regardless of what the user had chosen. Two colour systems existed;
+# only one was ever set, and the generator read the other.
+#
+# Keys are the eight accent presets from the frontend's getColorPresets().
+AVATAR_THEME_COLOR_NAMES: dict[str, str] = {
+    "#2a6971": "deep ocean teal",
+    "#0b6bcb": "clear sky blue",
+    "#9c27b0": "rich royal purple",
+    "#e91e63": "vivid rose pink",
+    "#f44336": "warm crimson red",
+    "#ff9800": "bright sunset orange",
+    "#4caf50": "fresh forest green",
+    "#795548": "earthy warm brown",
 }
+
+DEFAULT_THEME_COLOR = "#2a6971"
+
+# Hue bands for a theme colour that is not one of the presets — the field
+# accepts any hex, so the prompt must still describe something truthful rather
+# than silently naming a colour the user never chose.
+_HUE_NAMES: tuple[tuple[float, str], ...] = (
+    (15, "warm red"),
+    (45, "warm orange"),
+    (70, "golden yellow"),
+    (160, "fresh green"),
+    (200, "deep teal"),
+    (250, "clear blue"),
+    (290, "rich purple"),
+    (345, "vivid magenta"),
+    (360.1, "warm red"),
+)
+
+
+def _describe_theme_color(theme_color: Optional[str]) -> str:
+    """Turn a theme-colour hex into wording an image model can use.
+
+    Presets get their own name; any other hex is described by hue so a custom
+    accent still yields an honest prompt instead of a wrong one.
+    """
+    if not theme_color:
+        return AVATAR_THEME_COLOR_NAMES[DEFAULT_THEME_COLOR]
+
+    normalized = theme_color.strip().lower()
+    if not normalized.startswith("#"):
+        normalized = f"#{normalized}"
+    if normalized in AVATAR_THEME_COLOR_NAMES:
+        return AVATAR_THEME_COLOR_NAMES[normalized]
+
+    try:
+        r, g, b = (int(normalized[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    except (ValueError, IndexError):
+        return AVATAR_THEME_COLOR_NAMES[DEFAULT_THEME_COLOR]
+
+    high, low = max(r, g, b), min(r, g, b)
+    delta = high - low
+    if delta == 0:
+        return "soft slate grey"
+
+    if high == r:
+        hue = (60 * ((g - b) / delta)) % 360
+    elif high == g:
+        hue = 60 * ((b - r) / delta) + 120
+    else:
+        hue = 60 * ((r - g) / delta) + 240
+
+    for ceiling, name in _HUE_NAMES:
+        if hue < ceiling:
+            return name
+    return _HUE_NAMES[-1][1]
 
 AVATAR_GOAL_MOODS: dict[str, str] = {
     "general":  "serene",
@@ -717,20 +790,45 @@ AVATAR_GOAL_MOODS: dict[str, str] = {
     "hobby":    "playful",
 }
 
+# Also exact-keyed on taxonomy values. Previously keyed on "programming"/
+# "coding" while the app stores "technology", so the single most common topic
+# never matched and most learners got no scene at all — 5 of 14 topics were
+# covered. All 14 now are.
 AVATAR_TOPIC_SCENES: dict[str, str] = {
-    "japanese":    ", with a delicate torii gate silhouette in the far background",
-    "chinese":     ", with a delicate torii gate silhouette in the far background",
-    "korean":      ", with a delicate torii gate silhouette in the far background",
-    "biology":     ", surrounded by soft floating cell and leaf illustrations",
-    "science":     ", surrounded by soft floating cell and leaf illustrations",
-    "chemistry":   ", surrounded by soft floating cell and leaf illustrations",
-    "history":     ", on ancient stone steps with faint map illustrations",
-    "music":       ", on a small stage with soft spotlight",
-    "math":        ", in a warm library with floating geometric shapes",
+    "artificial_intelligence": ", with faint constellation-like network lines in the background",
+    "technology":  ", with faint circuit traces and code glyphs in the background",
+    "science":     ", surrounded by soft floating cell and molecule illustrations",
     "mathematics": ", in a warm library with floating geometric shapes",
-    "art":         ", in a bright studio with soft color splashes",
-    "programming": ", with faint circuit and code glyphs in the background",
-    "coding":      ", with faint circuit and code glyphs in the background",
+    "history":     ", on ancient stone steps with faint map illustrations",
+    "languages":   ", with soft speech-bubble shapes carrying foreign glyphs",
+    "literature":  ", in a quiet reading nook lined with worn book spines",
+    "art":         ", in a bright studio with soft colour splashes",
+    "music":       ", on a small stage with a soft spotlight",
+    "business":    ", by a wide window with a faint city skyline beyond",
+    "health":      ", in a calm sunlit room with a potted plant nearby",
+    "philosophy":  ", among weathered stone columns under a soft sky",
+    "design":      ", against a clean grid backdrop with drifting colour swatches",
+    "psychology":  ", with soft overlapping translucent circles in the background",
+}
+
+# Legacy/free-form primary_topic values from before the taxonomy was enforced.
+AVATAR_TOPIC_ALIASES: dict[str, str] = {
+    "japanese": "languages", "chinese": "languages", "korean": "languages",
+    "language": "languages", "math": "mathematics", "biology": "science",
+    "chemistry": "science", "programming": "technology", "coding": "technology",
+}
+
+def _canonical_topic(value: Optional[str]) -> str:
+    """Normalise a stored topic to a taxonomy key, resolving legacy aliases."""
+    key = (value or "").strip().lower()
+    return AVATAR_TOPIC_ALIASES.get(key, key)
+
+
+# The names the UI shows for each evolution stage. Naming the form in the
+# prompt gives the image model a concept to anchor on, so the arc reads as a
+# journey between distinct beings rather than one creature resized six times.
+AVATAR_STAGE_NAMES: dict[int, str] = {
+    1: "Wisp", 2: "Sprite", 3: "Scout", 4: "Sage", 5: "Oracle", 6: "Luminary",
 }
 
 AVATAR_STYLE_SUFFIX = (
@@ -750,37 +848,31 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     general = prefs.get("general", {})
 
     species = pet.get("pet_species") or "owl"
-    interests = [i.lower() for i in (general.get("interests") or [])[:2]]
-    color_slug = pet.get("pet_color") or "violet"
+    interests = [_canonical_topic(i) for i in (general.get("interests") or [])[:2]]
     study_goal = general.get("study_goal") or "general"
-    primary_topic = (general.get("primary_topic") or "").lower()
+    primary_topic = _canonical_topic(general.get("primary_topic"))
     full_name = user_doc.get("username") or ""
     avatar_seed = pet.get("avatar_seed") or str(_uuid.uuid4())
 
-    # Build interest traits (max 4 total, 2 per interest)
+    # Interest traits — exact lookup, max 4 (2 per interest).
     trait_parts: list[str] = []
     for interest in interests:
-        for key, traits in AVATAR_INTEREST_TRAITS.items():
-            if key in interest:
-                trait_parts.extend(traits[:2])
-                break
+        trait_parts.extend(AVATAR_INTEREST_TRAITS.get(interest, [])[:2])
     trait_text = ", ".join(trait_parts[:4])
 
-    # Stage descriptor
+    # Stage: both the descriptor and the name the UI uses for this form, so the
+    # six stages read as distinct beings rather than one creature resized.
     stage_desc = AVATAR_STAGE_DESCRIPTORS.get(stage, AVATAR_STAGE_DESCRIPTORS[1])
+    stage_name = AVATAR_STAGE_NAMES.get(stage, AVATAR_STAGE_NAMES[1])
 
-    # Color name
-    color_name = AVATAR_COLOR_NAMES.get(color_slug, "violet purple")
+    # Colour comes from the accent the user chose, not from the unset pet slug.
+    color_name = _describe_theme_color(general.get("theme_color"))
 
     # Goal mood
     goal_mood = AVATAR_GOAL_MOODS.get(study_goal, "serene")
 
-    # Topic scene
-    scene = ""
-    for keyword, scene_text in AVATAR_TOPIC_SCENES.items():
-        if keyword in primary_topic:
-            scene = scene_text
-            break
+    # Topic scene — exact lookup on the canonical topic.
+    scene = AVATAR_TOPIC_SCENES.get(primary_topic, "")
 
     # Initials for uniqueness
     name_parts = full_name.strip().split()
@@ -788,7 +880,7 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
 
     # Build prompt
     parts_list = [
-        f"{stage_desc} {species} companion",
+        f"a {stage_name} — {stage_desc} {species} companion",
         trait_text,
         f"{color_name} color accents throughout",
         f"{goal_mood} atmosphere",
@@ -2452,7 +2544,6 @@ async def get_agent_state(
         current_stage=_level_to_stage(_calculate_level(xp)),
         pet_name=pet_prefs.get("pet_name"),
         pet_species=pet_prefs.get("pet_species"),
-        pet_color=pet_prefs.get("pet_color"),
         avatar_url=avatar_url,
         avatar_stage=avatar_stage,
         avatar_regen_pending=avatar_regen_pending,
