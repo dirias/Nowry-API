@@ -1095,6 +1095,10 @@ XP_LEVEL_DIVISOR = 25
 # Evolution stage thresholds, by level. Index 0 is stage 2's threshold.
 STAGE_LEVEL_THRESHOLDS = (3, 6, 10, 14, 18)
 
+# Stage 1 plus one stage per threshold. Derived, never hardcoded, so adding a
+# stage means touching only the tuple above.
+STAGE_COUNT = len(STAGE_LEVEL_THRESHOLDS) + 1
+
 # Rewards.
 XP_PER_CARD_REVIEW = 2      # the core loop — deliberately unchanged
 XP_PER_SESSION_COMPLETE = 15  # rewards finishing, not grinding
@@ -1169,6 +1173,29 @@ async def grant_xp(user_id: str, amount: int) -> dict:
         level_after: int = _calculate_level(xp_after)
         level_up: bool = level_after > level_before
         new_stage: int = _level_to_stage(level_after)
+        stage_before: int = _level_to_stage(level_before)
+
+        # Record the evolution the moment it happens. Nothing else in the
+        # system knows *when* a pet became a Scout, and it cannot be recovered
+        # afterwards — XP totals carry no history. $push (not $set) so the
+        # journey keeps every step; capped via $slice because six stages is the
+        # ceiling and a runaway array here would bloat the user document.
+        if new_stage > stage_before:
+            await users_collection.update_one(
+                {"_id": ObjectId(user_id)},
+                {
+                    "$push": {
+                        "preferences.pet.evolution_history": {
+                            "$each": [{
+                                "stage": new_stage,
+                                "reached_at": datetime.now(timezone.utc),
+                                "xp": xp_after,
+                            }],
+                            "$slice": -STAGE_COUNT,
+                        }
+                    }
+                },
+            )
 
         avatar_regen_pending_flag: bool = False
         if level_up and user_doc:
@@ -2437,6 +2464,80 @@ async def get_agent_state(
         agent_intervention_pre_session=intervention_pre_session,
         agent_intervention_re_engagement=intervention_re_engagement,
         agent_intervention_streak_milestone=intervention_streak_milestone,
+    )
+
+
+class JourneyStage(BaseModel):
+    stage: int
+    level_required: int
+    xp_required: int
+    reached: bool
+    # Null for a stage passed before evolution history was recorded, or one not
+    # yet reached. The client must render an undated stage, not assume a date.
+    reached_at: Optional[datetime] = None
+    # Null once reached; otherwise how much XP still separates the user from it.
+    xp_remaining: Optional[int] = None
+
+
+class JourneyResponse(BaseModel):
+    current_stage: int
+    current_level: int
+    current_xp: int
+    stages: list[JourneyStage]
+
+
+@router.get("/journey", response_model=JourneyResponse)
+async def get_journey(
+    current_user: dict = Depends(get_firebase_user),
+) -> JourneyResponse:
+    """The pet's full evolution arc — every form it has been and will become.
+
+    Deliberately a separate endpoint rather than more fields on /agent/me:
+    /agent/me is fetched on every mount, and this payload is only needed when
+    the user actually opens the companion page.
+    """
+    user_id: str = current_user.get("user_id")
+    user = await users_collection.find_one(
+        {"_id": ObjectId(user_id)},
+        {"agent.xp": 1, "preferences.pet.evolution_history": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    xp: int = user.get("agent", {}).get("xp", 0)
+    level: int = _calculate_level(xp)
+    current_stage: int = _level_to_stage(level)
+
+    # stage -> reached_at, for whatever history exists. Users who evolved
+    # before this was recorded simply have no dates; that is honest and the
+    # UI shows the stage as reached-but-undated rather than inventing one.
+    history: dict[int, datetime] = {
+        entry["stage"]: entry["reached_at"]
+        for entry in (user.get("preferences", {}).get("pet", {}).get("evolution_history") or [])
+        if isinstance(entry, dict) and entry.get("stage") and entry.get("reached_at")
+    }
+
+    stages: list[JourneyStage] = []
+    for stage in range(1, STAGE_COUNT + 1):
+        level_required: int = 1 if stage == 1 else STAGE_LEVEL_THRESHOLDS[stage - 2]
+        xp_required: int = _xp_for_level(level_required)
+        reached: bool = current_stage >= stage
+        stages.append(
+            JourneyStage(
+                stage=stage,
+                level_required=level_required,
+                xp_required=xp_required,
+                reached=reached,
+                reached_at=history.get(stage),
+                xp_remaining=None if reached else max(0, xp_required - xp),
+            )
+        )
+
+    return JourneyResponse(
+        current_stage=current_stage,
+        current_level=level,
+        current_xp=xp,
+        stages=stages,
     )
 
 

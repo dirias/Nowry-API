@@ -33,6 +33,7 @@ for _mod in (
 
 from app.routers.agent import (  # noqa: E402
     CHAT_XP_MESSAGES_PER_DAY,
+    STAGE_COUNT,
     STAGE_LEVEL_THRESHOLDS,
     XP_LEVEL_DIVISOR,
     XP_PER_CARD_REVIEW,
@@ -147,6 +148,56 @@ class TestLevelProgress:
     def test_handles_zero_and_negative_xp_without_throwing(self) -> None:
         assert _level_progress(0) == 0.0
         assert 0.0 <= _level_progress(-100) <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Journey ladder — what GET /agent/journey promises the client
+# ---------------------------------------------------------------------------
+
+
+class TestJourneyLadder:
+    """
+    The journey endpoint tells the user how far each future form is. If its
+    arithmetic disagrees with the curve the rest of the app runs on, it
+    promises a distance that never arrives — the single worst failure mode for
+    an anticipation surface.
+    """
+
+    def _ladder(self):
+        """Mirrors the endpoint's stage construction."""
+        return [
+            (stage, 1 if stage == 1 else STAGE_LEVEL_THRESHOLDS[stage - 2])
+            for stage in range(1, STAGE_COUNT + 1)
+        ]
+
+    def test_covers_every_stage_exactly_once(self) -> None:
+        stages = [stage for stage, _ in self._ladder()]
+        assert stages == list(range(1, STAGE_COUNT + 1))
+
+    def test_reaching_a_stage_s_xp_actually_grants_that_stage(self) -> None:
+        # The promise the UI makes: earn this much and you become this form.
+        for stage, level_required in self._ladder():
+            xp_required = _xp_for_level(level_required)
+            assert _level_to_stage(_calculate_level(xp_required)) == stage
+
+    def test_one_xp_short_leaves_you_on_the_previous_stage(self) -> None:
+        for stage, level_required in self._ladder():
+            if stage == 1:
+                continue
+            xp_required = _xp_for_level(level_required)
+            assert _level_to_stage(_calculate_level(xp_required - 1)) == stage - 1
+
+    def test_requirements_increase_down_the_ladder(self) -> None:
+        required = [_xp_for_level(level) for _, level in self._ladder()]
+        assert required == sorted(required)
+        assert len(set(required)) == len(required)
+
+    def test_the_first_stage_costs_nothing(self) -> None:
+        assert _xp_for_level(self._ladder()[0][1]) == 0
+
+    def test_stage_count_matches_the_threshold_tuple(self) -> None:
+        # STAGE_COUNT is derived; this guards against it being hardcoded back.
+        assert STAGE_COUNT == len(STAGE_LEVEL_THRESHOLDS) + 1
 
 
 # ---------------------------------------------------------------------------
