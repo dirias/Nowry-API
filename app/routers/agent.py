@@ -1074,31 +1074,56 @@ BEHAVIORAL RULES:
     )
 
 
+# ---------------------------------------------------------------------------
+# XP economy
+#
+# Every XP amount in the app is defined here. Keep it that way: the previous
+# spread of magic numbers across three routers is what let a task completion
+# drift to 25x the value of a card review without anyone noticing.
+#
+# The curve is tuned so a regular learner (~30 reviews/day, one finished
+# session, one streak bonus = ~90 XP/day) reaches the sixth and final
+# evolution stage in roughly three months. The previous constants put that
+# same learner at ~700 days, which parked five of the six evolutions well
+# outside any plausible retention window.
+# ---------------------------------------------------------------------------
+
+# Curve. level = floor(sqrt(xp / XP_LEVEL_DIVISOR)) + 1
+XP_LEVEL_DIVISOR = 25
+
+# Evolution stage thresholds, by level. Index 0 is stage 2's threshold.
+STAGE_LEVEL_THRESHOLDS = (3, 6, 10, 14, 18)
+
+# Rewards.
+XP_PER_CARD_REVIEW = 2      # the core loop — deliberately unchanged
+XP_PER_SESSION_COMPLETE = 15  # rewards finishing, not grinding
+XP_PER_DAILY_STREAK = 15      # rewards returning, the metric that matters
+XP_PER_TASK_COMPLETE = 10     # was 50, i.e. 25 card reviews for one checkbox
+XP_PER_CHAT_MESSAGE = 2       # was 5
+
+# Chatting must never outpace studying, so engagement XP is capped per day.
+CHAT_XP_MESSAGES_PER_DAY = 5
+
+
 def _calculate_level(xp: int) -> int:
     """Smooth square-root levelling curve.
-    Level 2 starts at 50 XP (one day of light study), Level 10 at ~4,050 XP.
+    Level 2 starts at 25 XP (a few minutes of study), Level 10 at 2,025 XP.
     """
-    return max(1, math.floor(math.sqrt(max(0, xp) / 50)) + 1)
+    return max(1, math.floor(math.sqrt(max(0, xp) / XP_LEVEL_DIVISOR)) + 1)
 
 
 def _level_to_stage(level: int) -> int:
     """Map a level number to an evolution stage (1–6)."""
-    if level >= 30:
-        return 6
-    if level >= 20:
-        return 5
-    if level >= 15:
-        return 4
-    if level >= 10:
-        return 3
-    if level >= 5:
-        return 2
-    return 1
+    stage = 1
+    for threshold in STAGE_LEVEL_THRESHOLDS:
+        if level >= threshold:
+            stage += 1
+    return stage
 
 
 def _xp_for_level(level: int) -> int:
     """Return the total XP required to *reach* a given level."""
-    return 50 * (level - 1) ** 2
+    return XP_LEVEL_DIVISOR * (level - 1) ** 2
 
 
 def _xp_for_next_level(xp: int) -> int:
@@ -1150,6 +1175,66 @@ async def grant_xp(user_id: str, amount: int) -> dict:
         }
     except Exception:
         return {"level_up": False, "new_level": 1, "new_stage": 1, "avatar_regen_pending": False}
+
+
+async def _grant_chat_xp(user_id: str) -> dict:
+    """Award engagement XP for a Buddy message, capped per calendar day.
+
+    Uncapped chat XP lets a user out-earn a full study session by typing, which
+    prices the companion above the thing it exists to support. The daily slot
+    is reserved atomically (same conditional-update shape as the avatar rate
+    limiter) so concurrent messages cannot overshoot the cap.
+
+    Returns grant_xp's result dict; a no-op result when the cap is spent.
+    """
+    today: str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    reserve_result = await users_collection.update_one(
+        {
+            "_id": ObjectId(user_id),
+            "$or": [
+                # Same-day path: only while the cap has room left.
+                {
+                    "agent.chat_xp_date": today,
+                    "agent.chat_xp_count": {"$lt": CHAT_XP_MESSAGES_PER_DAY},
+                },
+                # Day-rollover path: any prior (or missing) date qualifies.
+                {"agent.chat_xp_date": {"$ne": today}},
+            ],
+        },
+        [
+            {
+                "$set": {
+                    "agent.chat_xp_count": {
+                        "$cond": [
+                            {"$ne": [{"$ifNull": ["$agent.chat_xp_date", ""]}, today]},
+                            1,  # new day — start the count fresh
+                            # $ifNull guards the same-day path: a missing count
+                            # compares as null, which satisfies the {$lt: cap}
+                            # match above, and $add against null yields null.
+                            {"$add": [{"$ifNull": ["$agent.chat_xp_count", 0]}, 1]},
+                        ]
+                    },
+                    "agent.chat_xp_date": today,
+                }
+            }
+        ],
+    )
+
+    if reserve_result.matched_count == 0:
+        # Cap already spent today. Report current standing without granting.
+        user_doc = await users_collection.find_one(
+            {"_id": ObjectId(user_id)}, {"agent.xp": 1}
+        )
+        level: int = _calculate_level((user_doc or {}).get("agent", {}).get("xp", 0))
+        return {
+            "level_up": False,
+            "new_level": level,
+            "new_stage": _level_to_stage(level),
+            "avatar_regen_pending": False,
+        }
+
+    return await grant_xp(user_id, XP_PER_CHAT_MESSAGE)
 
 
 def _calculate_mood(user: dict, cards_reviewed: int) -> str:
@@ -2184,9 +2269,9 @@ async def award_session_xp(
     current_user: dict = Depends(get_firebase_user),
 ) -> XpGrantResponse:
     user_id: str = current_user.get("user_id")
-    xp_result: dict = await grant_xp(user_id, 20)
+    xp_result: dict = await grant_xp(user_id, XP_PER_SESSION_COMPLETE)
     return XpGrantResponse(
-        xp_awarded=20,
+        xp_awarded=XP_PER_SESSION_COMPLETE,
         level_up=xp_result["level_up"],
         new_level=xp_result["new_level"],
         new_stage=xp_result["new_stage"],
@@ -2215,13 +2300,13 @@ async def award_streak_xp(
         )
 
     # Award XP and record today's date atomically
-    xp_result: dict = await grant_xp(user_id, 10)
+    xp_result: dict = await grant_xp(user_id, XP_PER_DAILY_STREAK)
     await users_collection.update_one(
         {'_id': ObjectId(user_id)},
         {'$set': {'agent.streak_xp_awarded_date': today}},
     )
     return XpGrantResponse(
-        xp_awarded=10,
+        xp_awarded=XP_PER_DAILY_STREAK,
         level_up=xp_result["level_up"],
         new_level=xp_result["new_level"],
         new_stage=xp_result["new_stage"],
@@ -2852,7 +2937,7 @@ async def chat(
         {"_id": ObjectId(user_id)},
         {"$set": {"agent.last_interaction": datetime.now(timezone.utc)}},
     )
-    xp_result: dict = await grant_xp(user_id, 5)  # 5 XP per Buddy interaction
+    xp_result: dict = await _grant_chat_xp(user_id)
 
     # Fetch updated messages_used for response
     updated_agent = await users_collection.find_one(

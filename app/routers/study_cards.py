@@ -818,7 +818,7 @@ async def review_card(
 
     try:
         from app.utils.sm2 import calculate_next_review
-        from app.routers.agent import grant_xp
+        from app.routers.agent import grant_xp, XP_PER_CARD_REVIEW
 
         # Get current SM-2 parameters
         ease_factor = card.get("ease_factor", 2.5)
@@ -860,7 +860,7 @@ async def review_card(
         # the same grade a second time — see 32-REVIEW.md CR-01).
         user_id = user.get("user_id")
         try:
-            await grant_xp(user_id, 2)
+            await grant_xp(user_id, XP_PER_CARD_REVIEW)
         except Exception as xp_err:
             logger.warning(
                 f"grant_xp failed for user {user_id} after review of card {id}: {xp_err}"
