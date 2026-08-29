@@ -139,6 +139,7 @@ class AgentStateResponse(BaseModel):
     level_progress: float = 0.0
     current_stage: int = 1
     pet_name: str | None = None
+    is_default_companion: bool = True
     pet_species: str | None = None
     avatar_url: Optional[str] = None
     avatar_stage: Optional[int] = None
@@ -729,6 +730,32 @@ AVATAR_THEME_COLOR_NAMES: dict[str, str] = {
 
 DEFAULT_THEME_COLOR = "#2a6971"
 
+# ---------------------------------------------------------------------------
+# The default companion.
+#
+# Free users, and anyone who has not personalised a pet, get Nowry — the
+# brand's own owl — rather than a procedural orb wearing a randomly guessed
+# species. Nowry ships as six hand-directed illustrations, so the default
+# experience costs nothing to serve, never waits on an image model and cannot
+# fail. Personalisation then means "make it yours", not "get a picture at all".
+#
+# A user is on the default companion until they have a generated portrait:
+# free users can never generate one, so they stay with Nowry by design.
+# ---------------------------------------------------------------------------
+# The picker allows five ranked topics; the prompt used to read only two.
+MAX_AVATAR_TOPICS = 5
+
+DEFAULT_PET_NAME = "Nowry"
+DEFAULT_PET_SPECIES = "owl"
+DEFAULT_PET_THEME_COLOR = "#4caf50"   # Forest Green
+DEFAULT_PET_INTERESTS = ["artificial_intelligence", "technology", "science", "music", "health"]
+DEFAULT_PET_STUDY_GOAL = "hobby"      # labelled "Personal Interest" in the UI
+
+
+def _is_default_companion(pet_prefs: dict) -> bool:
+    """True while the user has not personalised their companion."""
+    return not pet_prefs.get("avatar_url")
+
 # Hue bands for a theme colour that is not one of the presets — the field
 # accepts any hex, so the prompt must still describe something truthful rather
 # than silently naming a colour the user never chose.
@@ -811,6 +838,31 @@ AVATAR_TOPIC_SCENES: dict[str, str] = {
     "psychology":  ", with soft overlapping translucent circles in the background",
 }
 
+# The primary topic's signature — woven into the creature itself rather than
+# hung on it as a prop.
+#
+# Accessories alone do not make a companion feel personal: two users with
+# different topics ended up as the same owl wearing different objects. A
+# signature changes the plumage, so the pet reads as *shaped by* what its owner
+# studies. Only rank 1 gets one; ranks 2-5 add accents, so the composition is
+# genuinely combinatorial across 14 topics.
+AVATAR_TOPIC_SIGNATURES: dict[str, str] = {
+    "artificial_intelligence": "its plumage patterned with faint glowing neural-network nodes and connecting lines",
+    "technology":  "fine circuit-board tracery etched across its feathers",
+    "science":     "softly luminous molecular patterns throughout its plumage",
+    "mathematics": "feathers arranged in precise geometric tessellation",
+    "history":     "plumage marked like aged parchment with faint script",
+    "languages":   "delicate script glyphs woven through its feathers",
+    "literature":  "feather edges curled like the pages of an open book",
+    "art":         "plumage washed in soft painterly colour blooms",
+    "music":       "feather tips curling into flowing musical notation",
+    "business":    "crisp tailored feather markings like fine pinstripes",
+    "health":      "plumage veined with fresh leaf patterns, vivid and healthy",
+    "philosophy":  "a slow spiral motif turning through its plumage",
+    "design":      "plumage divided into clean geometric colour blocks",
+    "psychology":  "soft interlocking circular patterns rippling across its feathers",
+}
+
 # Legacy/free-form primary_topic values from before the taxonomy was enforced.
 AVATAR_TOPIC_ALIASES: dict[str, str] = {
     "japanese": "languages", "chinese": "languages", "korean": "languages",
@@ -848,17 +900,31 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     general = prefs.get("general", {})
 
     species = pet.get("pet_species") or "owl"
-    interests = [_canonical_topic(i) for i in (general.get("interests") or [])[:2]]
+    # Every topic the user ranked, not just the first two. Rank carries meaning:
+    # #1 shapes the creature, the rest add accents.
+    interests = [_canonical_topic(i) for i in (general.get("interests") or [])[:MAX_AVATAR_TOPICS]]
     study_goal = general.get("study_goal") or "general"
     primary_topic = _canonical_topic(general.get("primary_topic"))
     full_name = user_doc.get("username") or ""
     avatar_seed = pet.get("avatar_seed") or str(_uuid.uuid4())
 
-    # Interest traits — exact lookup, max 4 (2 per interest).
-    trait_parts: list[str] = []
+    # Rank 1 shapes the creature; ranks 2-5 each add a single accent, so a
+    # five-topic learner reads differently from a one-topic learner and two
+    # users rarely land on the same combination.
+    primary = primary_topic or (interests[0] if interests else "")
+    signature = AVATAR_TOPIC_SIGNATURES.get(primary, "")
+
+    accent_parts: list[str] = []
     for interest in interests:
-        trait_parts.extend(AVATAR_INTEREST_TRAITS.get(interest, [])[:2])
-    trait_text = ", ".join(trait_parts[:4])
+        if interest == primary:
+            continue
+        traits = AVATAR_INTEREST_TRAITS.get(interest)
+        if traits:
+            accent_parts.append(traits[0])
+    # Falls back to the primary's own accessory when it is the only topic.
+    if not accent_parts and primary:
+        accent_parts = AVATAR_INTEREST_TRAITS.get(primary, [])[:1]
+    trait_text = ", ".join(accent_parts)
 
     # Stage: both the descriptor and the name the UI uses for this form, so the
     # six stages read as distinct beings rather than one creature resized.
@@ -881,6 +947,7 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     # Build prompt
     parts_list = [
         f"a {stage_name} — {stage_desc} {species} companion",
+        signature,
         trait_text,
         f"{color_name} color accents throughout",
         f"{goal_mood} atmosphere",
@@ -2542,7 +2609,8 @@ async def get_agent_state(
         xp_for_next_level=_xp_for_next_level(xp),
         level_progress=_level_progress(xp),
         current_stage=_level_to_stage(_calculate_level(xp)),
-        pet_name=pet_prefs.get("pet_name"),
+        pet_name=pet_prefs.get("pet_name") or DEFAULT_PET_NAME,
+        is_default_companion=_is_default_companion(pet_prefs),
         pet_species=pet_prefs.get("pet_species"),
         avatar_url=avatar_url,
         avatar_stage=avatar_stage,
@@ -2584,6 +2652,9 @@ class JourneyResponse(BaseModel):
     # that it can point at something you did together.
     days_studied: int = 0
     companion_since: Optional[datetime] = None
+    # Which art the client should render for each rung: Nowry's six shipped
+    # illustrations, or the procedural silhouette for a personalised pet.
+    is_default_companion: bool = True
 
 
 async def _days_studied_together(user_id: str) -> int:
@@ -2621,7 +2692,8 @@ async def get_journey(
     user_id: str = current_user.get("user_id")
     user = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
-        {"agent.xp": 1, "preferences.pet.evolution_history": 1, "created_at": 1},
+        {"agent.xp": 1, "preferences.pet.evolution_history": 1,
+         "preferences.pet.avatar_url": 1, "created_at": 1},
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2668,6 +2740,7 @@ async def get_journey(
         stages=stages,
         days_studied=await _days_studied_together(user_id),
         companion_since=companion_since,
+        is_default_companion=_is_default_companion(user.get("preferences", {}).get("pet", {})),
     )
 
 
@@ -3062,7 +3135,7 @@ async def chat(
     xp: int = agent_data.get("xp", 0)
     current_stage: int = _level_to_stage(_calculate_level(xp))
     pet_prefs: dict = user.get("preferences", {}).get("pet", {})
-    pet_name_custom: Optional[str] = pet_prefs.get("pet_name")
+    pet_name_custom: Optional[str] = pet_prefs.get("pet_name") or DEFAULT_PET_NAME
     pet_species_custom: Optional[str] = pet_prefs.get("pet_species")
 
     # RAG: retrieve relevant book chunks if the user is reading a book and has knowledge access

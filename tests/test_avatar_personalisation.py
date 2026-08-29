@@ -61,6 +61,10 @@ _quiz_mod.QuizOffer = _QuizOffer
 
 from app.routers.agent import (  # noqa: E402
     AVATAR_GOAL_MOODS,
+    AVATAR_TOPIC_SIGNATURES,
+    DEFAULT_PET_NAME,
+    MAX_AVATAR_TOPICS,
+    _is_default_companion,
     AVATAR_INTEREST_TRAITS,
     AVATAR_STAGE_NAMES,
     AVATAR_THEME_COLOR_NAMES,
@@ -242,3 +246,71 @@ class TestPromptComposition:
         _, first = _build_avatar_prompt(build_user(), 1)
         _, second = _build_avatar_prompt(build_user(), 4)
         assert first == second
+
+
+class TestRankedTopics:
+    """
+    The picker takes five ranked topics; the prompt used to read only two, and
+    hung both on the creature as props. Rank now carries meaning: #1 shapes the
+    plumage, the rest add accents.
+    """
+
+    @pytest.mark.parametrize("topic", TOPICS)
+    def test_every_topic_can_be_a_primary_signature(self, topic: str) -> None:
+        assert AVATAR_TOPIC_SIGNATURES.get(topic)
+
+    def test_signatures_are_distinct_and_inside_the_taxonomy(self) -> None:
+        assert set(AVATAR_TOPIC_SIGNATURES) <= set(TOPICS)
+        sigs = list(AVATAR_TOPIC_SIGNATURES.values())
+        assert len(set(sigs)) == len(sigs)
+
+    def test_all_five_ranked_topics_reach_the_prompt(self) -> None:
+        five = ["artificial_intelligence", "science", "music", "technology", "health"]
+        prompt, _ = _build_avatar_prompt(
+            build_user(interests=five, primary_topic="artificial_intelligence"), 4)
+        assert "neural-network nodes" in prompt   # #1, as a plumage signature
+        assert "lab coat" in prompt               # #2 science
+        assert "musical notes" in prompt          # #3 music
+        assert "circuit board" in prompt          # #4 technology
+        assert "medical cross" in prompt          # #5 health
+
+    def test_the_primary_shapes_the_creature_not_just_its_props(self) -> None:
+        five = ["artificial_intelligence", "science", "music", "technology", "health"]
+        ai_first, _ = _build_avatar_prompt(build_user(interests=five, primary_topic="artificial_intelligence"), 4)
+        music_first, _ = _build_avatar_prompt(
+            build_user(interests=["music"] + [t for t in five if t != "music"], primary_topic="music"), 4)
+        # Same five topics, different rank 1 => a different creature.
+        assert ai_first != music_first
+        assert AVATAR_TOPIC_SIGNATURES["artificial_intelligence"] in ai_first
+        assert AVATAR_TOPIC_SIGNATURES["music"] in music_first
+
+    def test_the_primary_is_not_also_repeated_as_an_accent(self) -> None:
+        prompt, _ = _build_avatar_prompt(
+            build_user(interests=["music", "science"], primary_topic="music"), 4)
+        assert prompt.count(AVATAR_INTEREST_TRAITS["music"][0]) == 0
+
+    def test_a_single_topic_user_still_gets_an_accessory(self) -> None:
+        prompt, _ = _build_avatar_prompt(build_user(interests=["music"], primary_topic="music"), 4)
+        assert AVATAR_TOPIC_SIGNATURES["music"] in prompt
+        assert AVATAR_INTEREST_TRAITS["music"][0] in prompt
+
+    def test_topics_beyond_the_cap_are_ignored_rather_than_bloating_the_prompt(self) -> None:
+        assert MAX_AVATAR_TOPICS == 5
+        many = TOPICS[:8]
+        prompt, _ = _build_avatar_prompt(build_user(interests=many, primary_topic=many[0]), 4)
+        used = sum(1 for t in many if AVATAR_INTEREST_TRAITS[t][0] in prompt)
+        assert used <= MAX_AVATAR_TOPICS
+
+
+class TestDefaultCompanion:
+    """Nowry stands in until the user has a portrait of their own."""
+
+    def test_a_user_with_no_portrait_is_on_the_default_companion(self) -> None:
+        assert _is_default_companion({}) is True
+        assert _is_default_companion({"pet_species": "owl"}) is True
+
+    def test_generating_a_portrait_ends_the_default_state(self) -> None:
+        assert _is_default_companion({"avatar_url": "https://example.com/a.png"}) is False
+
+    def test_the_default_is_named_after_the_brand(self) -> None:
+        assert DEFAULT_PET_NAME == "Nowry"
