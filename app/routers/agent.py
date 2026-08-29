@@ -23,7 +23,7 @@ import math
 import os
 import re
 import uuid as _uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import httpx
@@ -33,7 +33,7 @@ from app.core.limiter import limiter
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.auth.firebase_auth import get_firebase_user
-from app.config.database import cards_collection, decks_collection, users_collection
+from app.config.database import cards_collection, decks_collection, study_sessions_collection, users_collection
 from app.config.subscription_plans import (
     AGENT_MODELS,
     SUBSCRIPTION_PLANS,
@@ -1108,6 +1108,11 @@ XP_PER_CHAT_MESSAGE = 2       # was 5
 
 # Chatting must never outpace studying, so engagement XP is capped per day.
 CHAT_XP_MESSAGES_PER_DAY = 5
+
+# How far back the companion's shared-history count reaches. Bounded because
+# CLAUDE.md forbids unbounded reads, and two years is well past the point where
+# a bigger number would mean anything more to the user.
+DAYS_TOGETHER_WINDOW = 730
 
 
 def _calculate_level(xp: int) -> int:
@@ -2484,6 +2489,32 @@ class JourneyResponse(BaseModel):
     current_level: int
     current_xp: int
     stages: list[JourneyStage]
+    # Shared history. What turns a progress bar with a face into a companion is
+    # that it can point at something you did together.
+    days_studied: int = 0
+    companion_since: Optional[datetime] = None
+
+
+async def _days_studied_together(user_id: str) -> int:
+    """Distinct calendar days on which the user completed a study session.
+
+    Sourced from study_sessions rather than cards: a card only stores its most
+    recent review, so counting distinct `last_reviewed` days would badly
+    undercount history. Bounded by DAYS_TOGETHER_WINDOW and served by the
+    existing (user_id, completed_at) compound index.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=DAYS_TOGETHER_WINDOW)
+    pipeline = [
+        {"$match": {"user_id": user_id, "completed_at": {"$gte": since}}},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$completed_at"}}}},
+        {"$count": "days"},
+    ]
+    try:
+        result = await study_sessions_collection.aggregate(pipeline).to_list(length=1)
+        return result[0]["days"] if result else 0
+    except Exception:
+        # Relationship stats are decoration; never fail the page over them.
+        return 0
 
 
 @router.get("/journey", response_model=JourneyResponse)
@@ -2499,7 +2530,7 @@ async def get_journey(
     user_id: str = current_user.get("user_id")
     user = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
-        {"agent.xp": 1, "preferences.pet.evolution_history": 1},
+        {"agent.xp": 1, "preferences.pet.evolution_history": 1, "created_at": 1},
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2533,11 +2564,19 @@ async def get_journey(
             )
         )
 
+    # The day the companion actually entered the picture: its first recorded
+    # evolution, else the account's own start. Never "today" — a companion that
+    # claims to be new every time you look has no history at all.
+    evolution_dates = [e for e in history.values() if e]
+    companion_since = min(evolution_dates) if evolution_dates else user.get("created_at")
+
     return JourneyResponse(
         current_stage=current_stage,
         current_level=level,
         current_xp=xp,
         stages=stages,
+        days_studied=await _days_studied_together(user_id),
+        companion_since=companion_since,
     )
 
 
