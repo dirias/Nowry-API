@@ -41,6 +41,7 @@ from app.routers.agent import (  # noqa: E402
     XP_PER_SESSION_COMPLETE,
     XP_PER_TASK_COMPLETE,
     _calculate_level,
+    _level_progress,
     _level_to_stage,
     _xp_for_level,
     _xp_for_next_level,
@@ -102,6 +103,50 @@ class TestCurveMechanics:
             assert _calculate_level(xp) == max(
                 1, math.floor(math.sqrt(max(0, xp) / XP_LEVEL_DIVISOR)) + 1
             )
+
+
+# ---------------------------------------------------------------------------
+# Level progress — the number behind the orb's ring
+# ---------------------------------------------------------------------------
+
+
+class TestLevelProgress:
+    """
+    This is computed server-side rather than on the client on purpose:
+    reconstructing it in JS needs XP_LEVEL_DIVISOR, and a duplicated curve
+    constant is exactly the drift PET-003 set out to remove.
+    """
+
+    def test_sits_at_zero_the_instant_a_level_is_reached(self) -> None:
+        for level in range(1, 20):
+            assert _level_progress(_xp_for_level(level)) == 0.0
+
+    def test_approaches_one_just_below_the_next_level(self) -> None:
+        for level in range(1, 20):
+            just_short = _xp_for_level(level + 1) - 1
+            progress = _level_progress(just_short)
+            assert 0.0 < progress < 1.0
+
+    def test_stays_within_zero_and_one_across_the_whole_curve(self) -> None:
+        for xp in range(0, 30_000, 11):
+            assert 0.0 <= _level_progress(xp) <= 1.0
+
+    def test_increases_monotonically_within_a_level(self) -> None:
+        start = _xp_for_level(5)
+        end = _xp_for_level(6)
+        previous = -1.0
+        for xp in range(start, end):
+            current = _level_progress(xp)
+            assert current >= previous
+            previous = current
+
+    def test_resets_when_a_level_is_crossed(self) -> None:
+        boundary = _xp_for_level(6)
+        assert _level_progress(boundary - 1) > _level_progress(boundary)
+
+    def test_handles_zero_and_negative_xp_without_throwing(self) -> None:
+        assert _level_progress(0) == 0.0
+        assert 0.0 <= _level_progress(-100) <= 1.0
 
 
 # ---------------------------------------------------------------------------

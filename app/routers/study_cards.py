@@ -858,9 +858,16 @@ async def review_card(
         # turn an already-persisted review into a client-facing 500 (which
         # would cause the frontend's retry queue to resubmit and re-apply
         # the same grade a second time — see 32-REVIEW.md CR-01).
+        #
+        # The result IS returned now (PET-004). It was previously computed and
+        # discarded, which meant the most common way to level up — reviewing a
+        # card — was also the only way the user was never told about it. On
+        # failure the xp block stays None and the client keeps its last known
+        # progress rather than snapping a progress bar to zero.
         user_id = user.get("user_id")
+        xp_result: Optional[dict] = None
         try:
-            await grant_xp(user_id, XP_PER_CARD_REVIEW)
+            xp_result = await grant_xp(user_id, XP_PER_CARD_REVIEW)
         except Exception as xp_err:
             logger.warning(
                 f"grant_xp failed for user {user_id} after review of card {id}: {xp_err}"
@@ -868,7 +875,22 @@ async def review_card(
 
         logger.info(f"Successfully updated card {id}")
 
-        return {"message": "Card reviewed successfully", "sm2_data": sm2_result}
+        return {
+            "message": "Card reviewed successfully",
+            "sm2_data": sm2_result,
+            "xp": {
+                "xp_awarded": XP_PER_CARD_REVIEW,
+                "level_up": xp_result["level_up"],
+                "new_level": xp_result["new_level"],
+                "new_stage": xp_result["new_stage"],
+                "avatar_regen_pending": xp_result.get("avatar_regen_pending", False),
+                "current_xp": xp_result.get("current_xp"),
+                "xp_for_next_level": xp_result.get("xp_for_next_level"),
+                "level_progress": xp_result.get("level_progress"),
+            }
+            if xp_result
+            else None,
+        }
     except HTTPException:
         raise
     except Exception as e:

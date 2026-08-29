@@ -136,6 +136,7 @@ class AgentStateResponse(BaseModel):
     proactive_nudging_enabled: bool
     current_xp: int = 0
     xp_for_next_level: int = 50
+    level_progress: float = 0.0
     current_stage: int = 1
     pet_name: str | None = None
     pet_species: str | None = None
@@ -1133,6 +1134,22 @@ def _xp_for_next_level(xp: int) -> int:
     return max(0, next_level_xp - xp)
 
 
+def _level_progress(xp: int) -> float:
+    """Fraction of the way from the current level to the next, in [0, 1].
+
+    Computed server-side on purpose: reconstructing this on the client needs
+    XP_LEVEL_DIVISOR, and duplicating the curve constant in JS is exactly the
+    drift that let the economy get out of hand in the first place. The client
+    receives one number and needs no knowledge of the curve.
+    """
+    level = _calculate_level(xp)
+    start = _xp_for_level(level)
+    span = _xp_for_level(level + 1) - start
+    if span <= 0:
+        return 0.0
+    return min(1.0, max(0.0, (xp - start) / span))
+
+
 async def grant_xp(user_id: str, amount: int) -> dict:
     """Atomically increment the user's XP in MongoDB and return level-up data."""
     try:
@@ -1172,9 +1189,22 @@ async def grant_xp(user_id: str, amount: int) -> dict:
             "new_level": level_after,
             "new_stage": new_stage,
             "avatar_regen_pending": avatar_regen_pending_flag,
+            # Running totals so callers can render a progress bar without a
+            # second round-trip to GET /agent/me after every single grant.
+            "current_xp": xp_after,
+            "xp_for_next_level": _xp_for_next_level(xp_after),
+            "level_progress": _level_progress(xp_after),
         }
     except Exception:
-        return {"level_up": False, "new_level": 1, "new_stage": 1, "avatar_regen_pending": False}
+        return {
+            "level_up": False,
+            "new_level": 1,
+            "new_stage": 1,
+            "avatar_regen_pending": False,
+            "current_xp": None,
+            "xp_for_next_level": None,
+            "level_progress": None,
+        }
 
 
 async def _grant_chat_xp(user_id: str) -> dict:
@@ -1226,12 +1256,16 @@ async def _grant_chat_xp(user_id: str) -> dict:
         user_doc = await users_collection.find_one(
             {"_id": ObjectId(user_id)}, {"agent.xp": 1}
         )
-        level: int = _calculate_level((user_doc or {}).get("agent", {}).get("xp", 0))
+        current_xp: int = (user_doc or {}).get("agent", {}).get("xp", 0)
+        level: int = _calculate_level(current_xp)
         return {
             "level_up": False,
             "new_level": level,
             "new_stage": _level_to_stage(level),
             "avatar_regen_pending": False,
+            "current_xp": current_xp,
+            "xp_for_next_level": _xp_for_next_level(current_xp),
+            "level_progress": _level_progress(current_xp),
         }
 
     return await grant_xp(user_id, XP_PER_CHAT_MESSAGE)
@@ -2261,6 +2295,11 @@ class XpGrantResponse(BaseModel):
     level_up: bool
     new_level: int
     new_stage: int
+    # Null only when the underlying grant failed; callers keep their last
+    # known progress rather than rendering a bar that snaps to zero.
+    current_xp: Optional[int] = None
+    xp_for_next_level: Optional[int] = None
+    level_progress: Optional[float] = None
 
 
 @router.post('/xp/session', response_model=XpGrantResponse)
@@ -2275,6 +2314,9 @@ async def award_session_xp(
         level_up=xp_result["level_up"],
         new_level=xp_result["new_level"],
         new_stage=xp_result["new_stage"],
+        current_xp=xp_result.get("current_xp"),
+        xp_for_next_level=xp_result.get("xp_for_next_level"),
+        level_progress=xp_result.get("level_progress"),
     )
 
 
@@ -2291,12 +2333,16 @@ async def award_streak_xp(
         {'agent.streak_xp_awarded_date': 1, 'agent.xp': 1},
     )
     if user_doc and user_doc.get('agent', {}).get('streak_xp_awarded_date') == today:
-        level: int = _calculate_level(user_doc.get('agent', {}).get('xp', 0))
+        current_streak_xp: int = user_doc.get('agent', {}).get('xp', 0)
+        level: int = _calculate_level(current_streak_xp)
         return XpGrantResponse(
             xp_awarded=0,
             level_up=False,
             new_level=level,
             new_stage=_level_to_stage(level),
+            current_xp=current_streak_xp,
+            xp_for_next_level=_xp_for_next_level(current_streak_xp),
+            level_progress=_level_progress(current_streak_xp),
         )
 
     # Award XP and record today's date atomically
@@ -2310,6 +2356,9 @@ async def award_streak_xp(
         level_up=xp_result["level_up"],
         new_level=xp_result["new_level"],
         new_stage=xp_result["new_stage"],
+        current_xp=xp_result.get("current_xp"),
+        xp_for_next_level=xp_result.get("xp_for_next_level"),
+        level_progress=xp_result.get("level_progress"),
     )
 
 
@@ -2367,6 +2416,7 @@ async def get_agent_state(
         proactive_nudging_enabled=proactive_nudging,
         current_xp=xp,
         xp_for_next_level=_xp_for_next_level(xp),
+        level_progress=_level_progress(xp),
         current_stage=_level_to_stage(_calculate_level(xp)),
         pet_name=pet_prefs.get("pet_name"),
         pet_species=pet_prefs.get("pet_species"),
