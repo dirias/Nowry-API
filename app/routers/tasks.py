@@ -115,9 +115,9 @@ async def update_task(
 
     # Award XP when a task is marked complete for the first time
     if just_completed:
-        from app.routers.agent import grant_xp
+        from app.routers.agent import grant_xp, XP_PER_TASK_COMPLETE
         user_id = user.get("user_id")
-        await grant_xp(user_id, 50)
+        await grant_xp(user_id, XP_PER_TASK_COMPLETE)
 
     # Return updated task
     updated_task = await collection.find_one({"_id": ObjectId(id)})

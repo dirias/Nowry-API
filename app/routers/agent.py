@@ -23,7 +23,7 @@ import math
 import os
 import re
 import uuid as _uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import httpx
@@ -33,7 +33,7 @@ from app.core.limiter import limiter
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.auth.firebase_auth import get_firebase_user
-from app.config.database import cards_collection, decks_collection, users_collection
+from app.config.database import cards_collection, decks_collection, study_sessions_collection, users_collection
 from app.config.subscription_plans import (
     AGENT_MODELS,
     SUBSCRIPTION_PLANS,
@@ -136,10 +136,11 @@ class AgentStateResponse(BaseModel):
     proactive_nudging_enabled: bool
     current_xp: int = 0
     xp_for_next_level: int = 50
+    level_progress: float = 0.0
     current_stage: int = 1
     pet_name: str | None = None
+    is_default_companion: bool = True
     pet_species: str | None = None
-    pet_color: str | None = None
     avatar_url: Optional[str] = None
     avatar_stage: Optional[int] = None
     avatar_regen_pending: bool = False
@@ -177,7 +178,11 @@ class ChatResponse(BaseModel):
 
 
 class GenerateAvatarRequest(BaseModel):
-    trigger: Literal["manual", "evolution"] = "manual"
+    # next_stage generates the form the user has NOT reached yet, so the
+    # locked rung on their journey shows the real shape they are working
+    # toward rather than a generic placeholder. Quota-free and idempotent:
+    # it no-ops once that stage's art exists.
+    trigger: Literal["manual", "evolution", "next_stage"] = "manual"
 
 
 class GenerateAvatarResponse(BaseModel):
@@ -684,29 +689,129 @@ AVATAR_STAGE_DESCRIPTORS: dict[int, str] = {
     6: "an ancient legendary being, radiant aura markings, majestic and awe-inspiring",
 }
 
+# Keyed on EXACT taxonomy values from learningTaxonomy.js TOPICS. The lookup
+# used to be a substring test, which quietly mis-fired: "art" is a substring of
+# "artificial_intelligence", so every AI learner was handed a paintbrush and
+# watercolour splashes. Exact matching also means a topic either has a trait or
+# visibly does not, instead of silently borrowing another topic's.
 AVATAR_INTEREST_TRAITS: dict[str, list[str]] = {
-    "science":     ["wearing a tiny lab coat", "small round goggles pushed up on forehead"],
-    "music":       ["floating musical notes orbiting it", "small headphones around neck"],
-    "health":      ["small glowing medical cross badge on chest", "fresh green leaf accent"],
+    "artificial_intelligence": ["faint neural-network lines tracing its form", "a small glowing node orbiting it"],
     "technology":  ["faint circuit board patterns on body", "small holographic display nearby"],
-    "language":    ["small open book floating beside it", "faint foreign script glyphs in background"],
-    "art":         ["paintbrush tucked behind ear", "faint watercolor splashes in background"],
+    "science":     ["wearing a tiny lab coat", "small round goggles pushed up on forehead"],
+    "mathematics": ["glowing geometric shapes floating nearby", "small chalkboard with symbols"],
     "history":     ["small ancient scroll in one hand", "sepia-tinted background corner detail"],
-    "math":        ["glowing geometric shapes floating nearby", "small chalkboard with symbols"],
-    "nature":      ["small flower growing from its habitat", "soft leaf and vine environment"],
-    "cooking":     ["tiny chef hat", "small steaming bowl beside it"],
+    "languages":   ["small open book floating beside it", "faint foreign script glyphs in background"],
+    "literature":  ["a worn hardback book tucked under one arm", "faint handwritten script drifting behind it"],
+    "art":         ["paintbrush tucked behind ear", "faint watercolor splashes in background"],
+    "music":       ["floating musical notes orbiting it", "small headphones around neck"],
+    "business":    ["a small leather satchel at its side", "a tiny upward-trending chart floating nearby"],
+    "health":      ["small glowing medical cross badge on chest", "fresh green leaf accent"],
+    "philosophy":  ["a small hourglass resting beside it", "a faint spiral motif in the background"],
+    "design":      ["a small colour swatch fan in hand", "fine grid lines faint in the background"],
+    "psychology":  ["a soft glowing thought-bubble above its head", "faint interlocking-circles motif behind it"],
 }
 
-AVATAR_COLOR_NAMES: dict[str, str] = {
-    "ocean":  "deep ocean blue",
-    "violet": "rich violet purple",
-    "mint":   "soft mint green",
-    "gold":   "warm golden amber",
-    "rose":   "gentle rose pink",
-    "coral":  "vivid coral orange-pink",
-    "sky":    "clear sky blue",
-    "ember":  "warm ember orange",
+# The companion's colour follows the accent the user actually picked during
+# onboarding (`preferences.general.theme_color`).
+#
+# It previously read `preferences.pet.pet_color`, a slug from a second palette
+# that had no picker anywhere in the UI — so it was null for effectively every
+# user, the `or "violet"` fallback fired, and every generated pet came out
+# violet regardless of what the user had chosen. Two colour systems existed;
+# only one was ever set, and the generator read the other.
+#
+# Keys are the eight accent presets from the frontend's getColorPresets().
+AVATAR_THEME_COLOR_NAMES: dict[str, str] = {
+    "#2a6971": "deep ocean teal",
+    "#0b6bcb": "clear sky blue",
+    "#9c27b0": "rich royal purple",
+    "#e91e63": "vivid rose pink",
+    "#f44336": "warm crimson red",
+    "#ff9800": "bright sunset orange",
+    "#4caf50": "fresh forest green",
+    "#795548": "earthy warm brown",
 }
+
+DEFAULT_THEME_COLOR = "#2a6971"
+
+# ---------------------------------------------------------------------------
+# The default companion.
+#
+# Free users, and anyone who has not personalised a pet, get Nowry — the
+# brand's own owl — rather than a procedural orb wearing a randomly guessed
+# species. Nowry ships as six hand-directed illustrations, so the default
+# experience costs nothing to serve, never waits on an image model and cannot
+# fail. Personalisation then means "make it yours", not "get a picture at all".
+#
+# A user is on the default companion until they have a generated portrait:
+# free users can never generate one, so they stay with Nowry by design.
+# ---------------------------------------------------------------------------
+# The picker allows five ranked topics; the prompt used to read only two.
+MAX_AVATAR_TOPICS = 5
+
+DEFAULT_PET_NAME = "Nowry"
+DEFAULT_PET_SPECIES = "owl"
+DEFAULT_PET_THEME_COLOR = "#4caf50"   # Forest Green
+DEFAULT_PET_INTERESTS = ["artificial_intelligence", "technology", "science", "music", "health"]
+DEFAULT_PET_STUDY_GOAL = "hobby"      # labelled "Personal Interest" in the UI
+
+
+def _is_default_companion(pet_prefs: dict) -> bool:
+    """True while the user has not personalised their companion."""
+    return not pet_prefs.get("avatar_url")
+
+# Hue bands for a theme colour that is not one of the presets — the field
+# accepts any hex, so the prompt must still describe something truthful rather
+# than silently naming a colour the user never chose.
+_HUE_NAMES: tuple[tuple[float, str], ...] = (
+    (15, "warm red"),
+    (45, "warm orange"),
+    (70, "golden yellow"),
+    (160, "fresh green"),
+    (200, "deep teal"),
+    (250, "clear blue"),
+    (290, "rich purple"),
+    (345, "vivid magenta"),
+    (360.1, "warm red"),
+)
+
+
+def _describe_theme_color(theme_color: Optional[str]) -> str:
+    """Turn a theme-colour hex into wording an image model can use.
+
+    Presets get their own name; any other hex is described by hue so a custom
+    accent still yields an honest prompt instead of a wrong one.
+    """
+    if not theme_color:
+        return AVATAR_THEME_COLOR_NAMES[DEFAULT_THEME_COLOR]
+
+    normalized = theme_color.strip().lower()
+    if not normalized.startswith("#"):
+        normalized = f"#{normalized}"
+    if normalized in AVATAR_THEME_COLOR_NAMES:
+        return AVATAR_THEME_COLOR_NAMES[normalized]
+
+    try:
+        r, g, b = (int(normalized[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    except (ValueError, IndexError):
+        return AVATAR_THEME_COLOR_NAMES[DEFAULT_THEME_COLOR]
+
+    high, low = max(r, g, b), min(r, g, b)
+    delta = high - low
+    if delta == 0:
+        return "soft slate grey"
+
+    if high == r:
+        hue = (60 * ((g - b) / delta)) % 360
+    elif high == g:
+        hue = 60 * ((b - r) / delta) + 120
+    else:
+        hue = 60 * ((r - g) / delta) + 240
+
+    for ceiling, name in _HUE_NAMES:
+        if hue < ceiling:
+            return name
+    return _HUE_NAMES[-1][1]
 
 AVATAR_GOAL_MOODS: dict[str, str] = {
     "general":  "serene",
@@ -716,20 +821,70 @@ AVATAR_GOAL_MOODS: dict[str, str] = {
     "hobby":    "playful",
 }
 
+# Also exact-keyed on taxonomy values. Previously keyed on "programming"/
+# "coding" while the app stores "technology", so the single most common topic
+# never matched and most learners got no scene at all — 5 of 14 topics were
+# covered. All 14 now are.
 AVATAR_TOPIC_SCENES: dict[str, str] = {
-    "japanese":    ", with a delicate torii gate silhouette in the far background",
-    "chinese":     ", with a delicate torii gate silhouette in the far background",
-    "korean":      ", with a delicate torii gate silhouette in the far background",
-    "biology":     ", surrounded by soft floating cell and leaf illustrations",
-    "science":     ", surrounded by soft floating cell and leaf illustrations",
-    "chemistry":   ", surrounded by soft floating cell and leaf illustrations",
-    "history":     ", on ancient stone steps with faint map illustrations",
-    "music":       ", on a small stage with soft spotlight",
-    "math":        ", in a warm library with floating geometric shapes",
+    "artificial_intelligence": ", with faint constellation-like network lines in the background",
+    "technology":  ", with faint circuit traces and code glyphs in the background",
+    "science":     ", surrounded by soft floating cell and molecule illustrations",
     "mathematics": ", in a warm library with floating geometric shapes",
-    "art":         ", in a bright studio with soft color splashes",
-    "programming": ", with faint circuit and code glyphs in the background",
-    "coding":      ", with faint circuit and code glyphs in the background",
+    "history":     ", on ancient stone steps with faint map illustrations",
+    "languages":   ", with soft speech-bubble shapes carrying foreign glyphs",
+    "literature":  ", in a quiet reading nook lined with worn book spines",
+    "art":         ", in a bright studio with soft colour splashes",
+    "music":       ", on a small stage with a soft spotlight",
+    "business":    ", by a wide window with a faint city skyline beyond",
+    "health":      ", in a calm sunlit room with a potted plant nearby",
+    "philosophy":  ", among weathered stone columns under a soft sky",
+    "design":      ", against a clean grid backdrop with drifting colour swatches",
+    "psychology":  ", with soft overlapping translucent circles in the background",
+}
+
+# The primary topic's signature — woven into the creature itself rather than
+# hung on it as a prop.
+#
+# Accessories alone do not make a companion feel personal: two users with
+# different topics ended up as the same owl wearing different objects. A
+# signature changes the plumage, so the pet reads as *shaped by* what its owner
+# studies. Only rank 1 gets one; ranks 2-5 add accents, so the composition is
+# genuinely combinatorial across 14 topics.
+AVATAR_TOPIC_SIGNATURES: dict[str, str] = {
+    "artificial_intelligence": "its plumage patterned with faint glowing neural-network nodes and connecting lines",
+    "technology":  "fine circuit-board tracery etched across its feathers",
+    "science":     "softly luminous molecular patterns throughout its plumage",
+    "mathematics": "feathers arranged in precise geometric tessellation",
+    "history":     "plumage marked like aged parchment with faint script",
+    "languages":   "delicate script glyphs woven through its feathers",
+    "literature":  "feather edges curled like the pages of an open book",
+    "art":         "plumage washed in soft painterly colour blooms",
+    "music":       "feather tips curling into flowing musical notation",
+    "business":    "crisp tailored feather markings like fine pinstripes",
+    "health":      "plumage veined with fresh leaf patterns, vivid and healthy",
+    "philosophy":  "a slow spiral motif turning through its plumage",
+    "design":      "plumage divided into clean geometric colour blocks",
+    "psychology":  "soft interlocking circular patterns rippling across its feathers",
+}
+
+# Legacy/free-form primary_topic values from before the taxonomy was enforced.
+AVATAR_TOPIC_ALIASES: dict[str, str] = {
+    "japanese": "languages", "chinese": "languages", "korean": "languages",
+    "language": "languages", "math": "mathematics", "biology": "science",
+    "chemistry": "science", "programming": "technology", "coding": "technology",
+}
+
+def _canonical_topic(value: Optional[str]) -> str:
+    """Normalise a stored topic to a taxonomy key, resolving legacy aliases."""
+    key = (value or "").strip().lower()
+    return AVATAR_TOPIC_ALIASES.get(key, key)
+
+
+# The names the UI shows for each evolution stage. Naming the form in the
+# prompt gives the image model a concept to anchor on, so the arc reads as a
+# journey between distinct beings rather than one creature resized six times.
+AVATAR_STAGE_NAMES: dict[int, str] = {
+    1: "Wisp", 2: "Sprite", 3: "Scout", 4: "Sage", 5: "Oracle", 6: "Luminary",
 }
 
 AVATAR_STYLE_SUFFIX = (
@@ -749,37 +904,45 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     general = prefs.get("general", {})
 
     species = pet.get("pet_species") or "owl"
-    interests = [i.lower() for i in (general.get("interests") or [])[:2]]
-    color_slug = pet.get("pet_color") or "violet"
+    # Every topic the user ranked, not just the first two. Rank carries meaning:
+    # #1 shapes the creature, the rest add accents.
+    interests = [_canonical_topic(i) for i in (general.get("interests") or [])[:MAX_AVATAR_TOPICS]]
     study_goal = general.get("study_goal") or "general"
-    primary_topic = (general.get("primary_topic") or "").lower()
+    primary_topic = _canonical_topic(general.get("primary_topic"))
     full_name = user_doc.get("username") or ""
     avatar_seed = pet.get("avatar_seed") or str(_uuid.uuid4())
 
-    # Build interest traits (max 4 total, 2 per interest)
-    trait_parts: list[str] = []
+    # Rank 1 shapes the creature; ranks 2-5 each add a single accent, so a
+    # five-topic learner reads differently from a one-topic learner and two
+    # users rarely land on the same combination.
+    primary = primary_topic or (interests[0] if interests else "")
+    signature = AVATAR_TOPIC_SIGNATURES.get(primary, "")
+
+    accent_parts: list[str] = []
     for interest in interests:
-        for key, traits in AVATAR_INTEREST_TRAITS.items():
-            if key in interest:
-                trait_parts.extend(traits[:2])
-                break
-    trait_text = ", ".join(trait_parts[:4])
+        if interest == primary:
+            continue
+        traits = AVATAR_INTEREST_TRAITS.get(interest)
+        if traits:
+            accent_parts.append(traits[0])
+    # Falls back to the primary's own accessory when it is the only topic.
+    if not accent_parts and primary:
+        accent_parts = AVATAR_INTEREST_TRAITS.get(primary, [])[:1]
+    trait_text = ", ".join(accent_parts)
 
-    # Stage descriptor
+    # Stage: both the descriptor and the name the UI uses for this form, so the
+    # six stages read as distinct beings rather than one creature resized.
     stage_desc = AVATAR_STAGE_DESCRIPTORS.get(stage, AVATAR_STAGE_DESCRIPTORS[1])
+    stage_name = AVATAR_STAGE_NAMES.get(stage, AVATAR_STAGE_NAMES[1])
 
-    # Color name
-    color_name = AVATAR_COLOR_NAMES.get(color_slug, "violet purple")
+    # Colour comes from the accent the user chose, not from the unset pet slug.
+    color_name = _describe_theme_color(general.get("theme_color"))
 
     # Goal mood
     goal_mood = AVATAR_GOAL_MOODS.get(study_goal, "serene")
 
-    # Topic scene
-    scene = ""
-    for keyword, scene_text in AVATAR_TOPIC_SCENES.items():
-        if keyword in primary_topic:
-            scene = scene_text
-            break
+    # Topic scene — exact lookup on the canonical topic.
+    scene = AVATAR_TOPIC_SCENES.get(primary_topic, "")
 
     # Initials for uniqueness
     name_parts = full_name.strip().split()
@@ -787,7 +950,8 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
 
     # Build prompt
     parts_list = [
-        f"{stage_desc} {species} companion",
+        f"a {stage_name} — {stage_desc} {species} companion",
+        signature,
         trait_text,
         f"{color_name} color accents throughout",
         f"{goal_mood} atmosphere",
@@ -806,6 +970,62 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
         seed_int = 42
 
     return prompt, seed_int
+
+
+def _strip_generated_backdrop(image_bytes: bytes) -> bytes:
+    """Make the generated backdrop transparent, leaving just the companion.
+
+    FLUX cannot emit an alpha channel, so every generated portrait arrives on
+    a solid white field. That field is visible as a white disc behind the pet
+    in the orb, and it makes a locked look-ahead form silhouette into a
+    featureless circle instead of the creature's actual shape.
+
+    Flood-filled from the corners rather than keyed on white globally: a pet's
+    own highlights, eyes and pale plumage are near-white too, and a global
+    threshold punches holes straight through the character.
+
+    Best-effort — returns the original bytes untouched on any failure, since a
+    portrait with a backdrop is far better than no portrait.
+    """
+    try:
+        import io
+
+        from PIL import Image, ImageDraw
+
+        SENTINEL = (254, 0, 254)
+        THRESHOLD = 26
+        # The portrait renders at 56-110px; 512 covers any retina display.
+        # Alpha PNGs are far heavier than the flat source, so without this the
+        # backdrop removal would roughly triple what every user downloads.
+        MAX_EDGE = 512
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        width, height = image.size
+        corners = ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1))
+        for corner in corners:
+            ImageDraw.floodfill(image, corner, SENTINEL, thresh=THRESHOLD)
+
+        rgba = image.convert("RGBA")
+        rgba.putdata([
+            (0, 0, 0, 0) if pixel[:3] == SENTINEL else pixel
+            for pixel in rgba.getdata()
+        ])
+
+        # Trim to the character before scaling, so the pet fills the frame
+        # rather than the empty margin the model left around it.
+        bbox = rgba.getbbox()
+        if bbox:
+            rgba = rgba.crop(bbox)
+        if max(rgba.size) > MAX_EDGE:
+            ratio = MAX_EDGE / max(rgba.size)
+            rgba = rgba.resize((max(1, int(rgba.width * ratio)), max(1, int(rgba.height * ratio))), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        rgba.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+    except Exception as exc:  # noqa: BLE001 - decoration must never break generation
+        logger.warning(f"Backdrop removal skipped: {exc}")
+        return image_bytes
 
 
 async def _call_fal_avatar(prompt: str, seed: int) -> str:
@@ -848,13 +1068,13 @@ async def _call_fal_avatar(prompt: str, seed: int) -> str:
         if img_resp.status_code != 200:
             raise RuntimeError(f"Failed to download image: {img_resp.status_code}")
 
-        image_bytes = img_resp.content
+        image_bytes = _strip_generated_backdrop(img_resp.content)
 
     # Upload to Cloudinary for a permanent HTTPS URL
     storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
     result = await storage.upload(
         file_content=image_bytes,
-        filename=f"pet_avatar_{seed}",
+        filename=f"pet_avatar_{seed}.png",
         folder="nowry/pet_avatars",
     )
     secure_url: str = result.get("secure_url") or result.get("url")
@@ -1074,31 +1294,65 @@ BEHAVIORAL RULES:
     )
 
 
+# ---------------------------------------------------------------------------
+# XP economy
+#
+# Every XP amount in the app is defined here. Keep it that way: the previous
+# spread of magic numbers across three routers is what let a task completion
+# drift to 25x the value of a card review without anyone noticing.
+#
+# The curve is tuned so a regular learner (~30 reviews/day, one finished
+# session, one streak bonus = ~90 XP/day) reaches the sixth and final
+# evolution stage in roughly three months. The previous constants put that
+# same learner at ~700 days, which parked five of the six evolutions well
+# outside any plausible retention window.
+# ---------------------------------------------------------------------------
+
+# Curve. level = floor(sqrt(xp / XP_LEVEL_DIVISOR)) + 1
+XP_LEVEL_DIVISOR = 25
+
+# Evolution stage thresholds, by level. Index 0 is stage 2's threshold.
+STAGE_LEVEL_THRESHOLDS = (3, 6, 10, 14, 18)
+
+# Stage 1 plus one stage per threshold. Derived, never hardcoded, so adding a
+# stage means touching only the tuple above.
+STAGE_COUNT = len(STAGE_LEVEL_THRESHOLDS) + 1
+
+# Rewards.
+XP_PER_CARD_REVIEW = 2      # the core loop — deliberately unchanged
+XP_PER_SESSION_COMPLETE = 15  # rewards finishing, not grinding
+XP_PER_DAILY_STREAK = 15      # rewards returning, the metric that matters
+XP_PER_TASK_COMPLETE = 10     # was 50, i.e. 25 card reviews for one checkbox
+XP_PER_CHAT_MESSAGE = 2       # was 5
+
+# Chatting must never outpace studying, so engagement XP is capped per day.
+CHAT_XP_MESSAGES_PER_DAY = 5
+
+# How far back the companion's shared-history count reaches. Bounded because
+# CLAUDE.md forbids unbounded reads, and two years is well past the point where
+# a bigger number would mean anything more to the user.
+DAYS_TOGETHER_WINDOW = 730
+
+
 def _calculate_level(xp: int) -> int:
     """Smooth square-root levelling curve.
-    Level 2 starts at 50 XP (one day of light study), Level 10 at ~4,050 XP.
+    Level 2 starts at 25 XP (a few minutes of study), Level 10 at 2,025 XP.
     """
-    return max(1, math.floor(math.sqrt(max(0, xp) / 50)) + 1)
+    return max(1, math.floor(math.sqrt(max(0, xp) / XP_LEVEL_DIVISOR)) + 1)
 
 
 def _level_to_stage(level: int) -> int:
     """Map a level number to an evolution stage (1–6)."""
-    if level >= 30:
-        return 6
-    if level >= 20:
-        return 5
-    if level >= 15:
-        return 4
-    if level >= 10:
-        return 3
-    if level >= 5:
-        return 2
-    return 1
+    stage = 1
+    for threshold in STAGE_LEVEL_THRESHOLDS:
+        if level >= threshold:
+            stage += 1
+    return stage
 
 
 def _xp_for_level(level: int) -> int:
     """Return the total XP required to *reach* a given level."""
-    return 50 * (level - 1) ** 2
+    return XP_LEVEL_DIVISOR * (level - 1) ** 2
 
 
 def _xp_for_next_level(xp: int) -> int:
@@ -1108,12 +1362,29 @@ def _xp_for_next_level(xp: int) -> int:
     return max(0, next_level_xp - xp)
 
 
+def _level_progress(xp: int) -> float:
+    """Fraction of the way from the current level to the next, in [0, 1].
+
+    Computed server-side on purpose: reconstructing this on the client needs
+    XP_LEVEL_DIVISOR, and duplicating the curve constant in JS is exactly the
+    drift that let the economy get out of hand in the first place. The client
+    receives one number and needs no knowledge of the curve.
+    """
+    level = _calculate_level(xp)
+    start = _xp_for_level(level)
+    span = _xp_for_level(level + 1) - start
+    if span <= 0:
+        return 0.0
+    return min(1.0, max(0.0, (xp - start) / span))
+
+
 async def grant_xp(user_id: str, amount: int) -> dict:
     """Atomically increment the user's XP in MongoDB and return level-up data."""
     try:
         user_doc = await users_collection.find_one(
             {"_id": ObjectId(user_id)},
-            {"agent.xp": 1, "preferences.pet.avatar_stage": 1, "preferences.pet.avatar_url": 1},
+            {"agent.xp": 1, "preferences.pet.avatar_url": 1,
+             "preferences.pet.stage_avatars": 1},
         )
         xp_before: int = (user_doc or {}).get("agent", {}).get("xp", 0) if user_doc else 0
         level_before: int = _calculate_level(xp_before)
@@ -1127,12 +1398,42 @@ async def grant_xp(user_id: str, amount: int) -> dict:
         level_after: int = _calculate_level(xp_after)
         level_up: bool = level_after > level_before
         new_stage: int = _level_to_stage(level_after)
+        stage_before: int = _level_to_stage(level_before)
+
+        # Record the evolution the moment it happens. Nothing else in the
+        # system knows *when* a pet became a Scout, and it cannot be recovered
+        # afterwards — XP totals carry no history. $push (not $set) so the
+        # journey keeps every step; capped via $slice because six stages is the
+        # ceiling and a runaway array here would bloat the user document.
+        if new_stage > stage_before:
+            await users_collection.update_one(
+                {"_id": ObjectId(user_id)},
+                {
+                    "$push": {
+                        "preferences.pet.evolution_history": {
+                            "$each": [{
+                                "stage": new_stage,
+                                "reached_at": datetime.now(timezone.utc),
+                                "xp": xp_after,
+                            }],
+                            "$slice": -STAGE_COUNT,
+                        }
+                    }
+                },
+            )
 
         avatar_regen_pending_flag: bool = False
         if level_up and user_doc:
-            stored_avatar_stage = user_doc.get("preferences", {}).get("pet", {}).get("avatar_stage")
-            stored_avatar_url = user_doc.get("preferences", {}).get("pet", {}).get("avatar_url")
-            if stored_avatar_url and stored_avatar_stage and new_stage > stored_avatar_stage:
+            pet_prefs: dict = user_doc.get("preferences", {}).get("pet", {})
+            stored_avatar_url = pet_prefs.get("avatar_url")
+            stage_avatars: dict = pet_prefs.get("stage_avatars") or {}
+            # Keyed off stage_avatars, not avatar_stage. avatar_stage is only
+            # written by manual/evolution generation, so once look-ahead art
+            # exists it goes stale — and a stale value made this flag fire for
+            # a form that had ALREADY been generated, billing a second image
+            # for art the user already owned. stage_avatars is authoritative.
+            already_generated = bool(stage_avatars.get(str(new_stage)))
+            if stored_avatar_url and not already_generated:
                 await users_collection.update_one(
                     {"_id": ObjectId(user_id)},
                     {"$set": {
@@ -1147,9 +1448,86 @@ async def grant_xp(user_id: str, amount: int) -> dict:
             "new_level": level_after,
             "new_stage": new_stage,
             "avatar_regen_pending": avatar_regen_pending_flag,
+            # Running totals so callers can render a progress bar without a
+            # second round-trip to GET /agent/me after every single grant.
+            "current_xp": xp_after,
+            "xp_for_next_level": _xp_for_next_level(xp_after),
+            "level_progress": _level_progress(xp_after),
         }
     except Exception:
-        return {"level_up": False, "new_level": 1, "new_stage": 1, "avatar_regen_pending": False}
+        return {
+            "level_up": False,
+            "new_level": 1,
+            "new_stage": 1,
+            "avatar_regen_pending": False,
+            "current_xp": None,
+            "xp_for_next_level": None,
+            "level_progress": None,
+        }
+
+
+async def _grant_chat_xp(user_id: str) -> dict:
+    """Award engagement XP for a Buddy message, capped per calendar day.
+
+    Uncapped chat XP lets a user out-earn a full study session by typing, which
+    prices the companion above the thing it exists to support. The daily slot
+    is reserved atomically (same conditional-update shape as the avatar rate
+    limiter) so concurrent messages cannot overshoot the cap.
+
+    Returns grant_xp's result dict; a no-op result when the cap is spent.
+    """
+    today: str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    reserve_result = await users_collection.update_one(
+        {
+            "_id": ObjectId(user_id),
+            "$or": [
+                # Same-day path: only while the cap has room left.
+                {
+                    "agent.chat_xp_date": today,
+                    "agent.chat_xp_count": {"$lt": CHAT_XP_MESSAGES_PER_DAY},
+                },
+                # Day-rollover path: any prior (or missing) date qualifies.
+                {"agent.chat_xp_date": {"$ne": today}},
+            ],
+        },
+        [
+            {
+                "$set": {
+                    "agent.chat_xp_count": {
+                        "$cond": [
+                            {"$ne": [{"$ifNull": ["$agent.chat_xp_date", ""]}, today]},
+                            1,  # new day — start the count fresh
+                            # $ifNull guards the same-day path: a missing count
+                            # compares as null, which satisfies the {$lt: cap}
+                            # match above, and $add against null yields null.
+                            {"$add": [{"$ifNull": ["$agent.chat_xp_count", 0]}, 1]},
+                        ]
+                    },
+                    "agent.chat_xp_date": today,
+                }
+            }
+        ],
+    )
+
+    if reserve_result.matched_count == 0:
+        # Cap already spent today. Report current standing without granting.
+        user_doc = await users_collection.find_one(
+            {"_id": ObjectId(user_id)}, {"agent.xp": 1}
+        )
+        current_xp: int = (user_doc or {}).get("agent", {}).get("xp", 0)
+        level: int = _calculate_level(current_xp)
+        return {
+            "level_up": False,
+            "new_level": level,
+            "new_stage": _level_to_stage(level),
+            "avatar_regen_pending": False,
+            "current_xp": current_xp,
+            "xp_for_next_level": _xp_for_next_level(current_xp),
+            "level_progress": _level_progress(current_xp),
+        }
+
+    return await grant_xp(user_id, XP_PER_CHAT_MESSAGE)
 
 
 def _calculate_mood(user: dict, cards_reviewed: int) -> str:
@@ -2176,6 +2554,11 @@ class XpGrantResponse(BaseModel):
     level_up: bool
     new_level: int
     new_stage: int
+    # Null only when the underlying grant failed; callers keep their last
+    # known progress rather than rendering a bar that snaps to zero.
+    current_xp: Optional[int] = None
+    xp_for_next_level: Optional[int] = None
+    level_progress: Optional[float] = None
 
 
 @router.post('/xp/session', response_model=XpGrantResponse)
@@ -2184,12 +2567,15 @@ async def award_session_xp(
     current_user: dict = Depends(get_firebase_user),
 ) -> XpGrantResponse:
     user_id: str = current_user.get("user_id")
-    xp_result: dict = await grant_xp(user_id, 20)
+    xp_result: dict = await grant_xp(user_id, XP_PER_SESSION_COMPLETE)
     return XpGrantResponse(
-        xp_awarded=20,
+        xp_awarded=XP_PER_SESSION_COMPLETE,
         level_up=xp_result["level_up"],
         new_level=xp_result["new_level"],
         new_stage=xp_result["new_stage"],
+        current_xp=xp_result.get("current_xp"),
+        xp_for_next_level=xp_result.get("xp_for_next_level"),
+        level_progress=xp_result.get("level_progress"),
     )
 
 
@@ -2206,25 +2592,32 @@ async def award_streak_xp(
         {'agent.streak_xp_awarded_date': 1, 'agent.xp': 1},
     )
     if user_doc and user_doc.get('agent', {}).get('streak_xp_awarded_date') == today:
-        level: int = _calculate_level(user_doc.get('agent', {}).get('xp', 0))
+        current_streak_xp: int = user_doc.get('agent', {}).get('xp', 0)
+        level: int = _calculate_level(current_streak_xp)
         return XpGrantResponse(
             xp_awarded=0,
             level_up=False,
             new_level=level,
             new_stage=_level_to_stage(level),
+            current_xp=current_streak_xp,
+            xp_for_next_level=_xp_for_next_level(current_streak_xp),
+            level_progress=_level_progress(current_streak_xp),
         )
 
     # Award XP and record today's date atomically
-    xp_result: dict = await grant_xp(user_id, 10)
+    xp_result: dict = await grant_xp(user_id, XP_PER_DAILY_STREAK)
     await users_collection.update_one(
         {'_id': ObjectId(user_id)},
         {'$set': {'agent.streak_xp_awarded_date': today}},
     )
     return XpGrantResponse(
-        xp_awarded=10,
+        xp_awarded=XP_PER_DAILY_STREAK,
         level_up=xp_result["level_up"],
         new_level=xp_result["new_level"],
         new_stage=xp_result["new_stage"],
+        current_xp=xp_result.get("current_xp"),
+        xp_for_next_level=xp_result.get("xp_for_next_level"),
+        level_progress=xp_result.get("level_progress"),
     )
 
 
@@ -2261,7 +2654,11 @@ async def get_agent_state(
 
     xp: int = agent_data.get("xp", 0)
     pet_prefs: dict = user.get("preferences", {}).get("pet", {})
-    avatar_url = pet_prefs.get("avatar_url")
+    # A form generated ahead of time becomes the worn one the moment its stage
+    # is reached — the reveal needs no extra request and no extra generation.
+    stage_avatars: dict = pet_prefs.get("stage_avatars") or {}
+    current_stage_for_art: int = _level_to_stage(_calculate_level(xp))
+    avatar_url = stage_avatars.get(str(current_stage_for_art)) or pet_prefs.get("avatar_url")
     avatar_stage = pet_prefs.get("avatar_stage")
     avatar_regen_pending = pet_prefs.get("avatar_regen_pending", False)
     animation_url = pet_prefs.get("animation_url")
@@ -2282,10 +2679,11 @@ async def get_agent_state(
         proactive_nudging_enabled=proactive_nudging,
         current_xp=xp,
         xp_for_next_level=_xp_for_next_level(xp),
+        level_progress=_level_progress(xp),
         current_stage=_level_to_stage(_calculate_level(xp)),
-        pet_name=pet_prefs.get("pet_name"),
+        pet_name=pet_prefs.get("pet_name") or DEFAULT_PET_NAME,
+        is_default_companion=_is_default_companion(pet_prefs),
         pet_species=pet_prefs.get("pet_species"),
-        pet_color=pet_prefs.get("pet_color"),
         avatar_url=avatar_url,
         avatar_stage=avatar_stage,
         avatar_regen_pending=avatar_regen_pending,
@@ -2302,6 +2700,127 @@ async def get_agent_state(
         agent_intervention_pre_session=intervention_pre_session,
         agent_intervention_re_engagement=intervention_re_engagement,
         agent_intervention_streak_milestone=intervention_streak_milestone,
+    )
+
+
+class JourneyStage(BaseModel):
+    stage: int
+    level_required: int
+    xp_required: int
+    reached: bool
+    # Null for a stage passed before evolution history was recorded, or one not
+    # yet reached. The client must render an undated stage, not assume a date.
+    reached_at: Optional[datetime] = None
+    # Null once reached; otherwise how much XP still separates the user from it.
+    xp_remaining: Optional[int] = None
+    # Real art for THIS form, when it exists. A look-ahead form has art before
+    # it is reached, so its locked silhouette is the true shape rather than a
+    # placeholder — and unlocking it is a genuine reveal, not a swap.
+    art_url: Optional[str] = None
+
+
+class JourneyResponse(BaseModel):
+    current_stage: int
+    current_level: int
+    current_xp: int
+    stages: list[JourneyStage]
+    # Shared history. What turns a progress bar with a face into a companion is
+    # that it can point at something you did together.
+    days_studied: int = 0
+    companion_since: Optional[datetime] = None
+    # Which art the client should render for each rung: Nowry's six shipped
+    # illustrations, or the procedural silhouette for a personalised pet.
+    is_default_companion: bool = True
+
+
+async def _days_studied_together(user_id: str) -> int:
+    """Distinct calendar days on which the user completed a study session.
+
+    Sourced from study_sessions rather than cards: a card only stores its most
+    recent review, so counting distinct `last_reviewed` days would badly
+    undercount history. Bounded by DAYS_TOGETHER_WINDOW and served by the
+    existing (user_id, completed_at) compound index.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=DAYS_TOGETHER_WINDOW)
+    pipeline = [
+        {"$match": {"user_id": user_id, "completed_at": {"$gte": since}}},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$completed_at"}}}},
+        {"$count": "days"},
+    ]
+    try:
+        result = await study_sessions_collection.aggregate(pipeline).to_list(length=1)
+        return result[0]["days"] if result else 0
+    except Exception:
+        # Relationship stats are decoration; never fail the page over them.
+        return 0
+
+
+@router.get("/journey", response_model=JourneyResponse)
+async def get_journey(
+    current_user: dict = Depends(get_firebase_user),
+) -> JourneyResponse:
+    """The pet's full evolution arc — every form it has been and will become.
+
+    Deliberately a separate endpoint rather than more fields on /agent/me:
+    /agent/me is fetched on every mount, and this payload is only needed when
+    the user actually opens the companion page.
+    """
+    user_id: str = current_user.get("user_id")
+    user = await users_collection.find_one(
+        {"_id": ObjectId(user_id)},
+        {"agent.xp": 1, "preferences.pet.evolution_history": 1,
+         "preferences.pet.avatar_url": 1, "preferences.pet.stage_avatars": 1,
+         "created_at": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    xp: int = user.get("agent", {}).get("xp", 0)
+    level: int = _calculate_level(xp)
+    current_stage: int = _level_to_stage(level)
+
+    # stage -> reached_at, for whatever history exists. Users who evolved
+    # before this was recorded simply have no dates; that is honest and the
+    # UI shows the stage as reached-but-undated rather than inventing one.
+    history: dict[int, datetime] = {
+        entry["stage"]: entry["reached_at"]
+        for entry in (user.get("preferences", {}).get("pet", {}).get("evolution_history") or [])
+        if isinstance(entry, dict) and entry.get("stage") and entry.get("reached_at")
+    }
+
+    stage_avatars: dict = user.get("preferences", {}).get("pet", {}).get("stage_avatars") or {}
+
+    stages: list[JourneyStage] = []
+    for stage in range(1, STAGE_COUNT + 1):
+        level_required: int = 1 if stage == 1 else STAGE_LEVEL_THRESHOLDS[stage - 2]
+        xp_required: int = _xp_for_level(level_required)
+        reached: bool = current_stage >= stage
+        stages.append(
+            JourneyStage(
+                stage=stage,
+                level_required=level_required,
+                xp_required=xp_required,
+                reached=reached,
+                reached_at=history.get(stage),
+                xp_remaining=None if reached else max(0, xp_required - xp),
+                art_url=stage_avatars.get(str(stage)),
+            )
+        )
+
+    # The day the companion actually entered the picture: its first recorded
+    # evolution, else the account's own start. Never "today" — a companion that
+    # claims to be new every time you look has no history at all.
+    evolution_dates = [e for e in history.values() if e]
+    companion_since = min(evolution_dates) if evolution_dates else user.get("created_at")
+
+    return JourneyResponse(
+        current_stage=current_stage,
+        current_level=level,
+        current_xp=xp,
+        stages=stages,
+        days_studied=await _days_studied_together(user_id),
+        companion_since=companion_since,
+        is_default_companion=_is_default_companion(user.get("preferences", {}).get("pet", {})),
     )
 
 
@@ -2438,9 +2957,21 @@ async def generate_avatar(
         )
         pet["avatar_seed"] = avatar_seed
 
-    # Compute stage
+    # Compute stage. next_stage deliberately targets the form AHEAD of the
+    # user so their journey's locked rung is the real thing, undetailed.
     xp: int = user_doc.get("agent", {}).get("xp", 0)
-    stage: int = _level_to_stage(_calculate_level(xp))
+    current_stage: int = _level_to_stage(_calculate_level(xp))
+    stage: int = current_stage
+
+    stage_avatars: dict = pet.get("stage_avatars") or {}
+    if body.trigger == "next_stage":
+        stage = current_stage + 1
+        if stage > STAGE_COUNT:
+            raise HTTPException(status_code=400, detail="avatar_arc_complete")
+        # Idempotent by construction — no counter needed, and no way to spend
+        # money twice on the same form.
+        if stage_avatars.get(str(stage)):
+            raise HTTPException(status_code=409, detail="avatar_stage_already_generated")
 
     # Build prompt
     try:
@@ -2466,12 +2997,17 @@ async def generate_avatar(
     # For manual trigger: count/month already written atomically in the reservation above.
     # For evolution trigger: count_increment = 0; normalise month field to current_month.
     now = datetime.now(timezone.utc)
+    # Every generated form is kept, keyed by stage: that is what lets the
+    # journey show real art for forms already earned instead of one image.
     persist_fields: dict = {
-        "preferences.pet.avatar_url": avatar_url,
-        "preferences.pet.avatar_stage": stage,
+        f"preferences.pet.stage_avatars.{stage}": avatar_url,
         "preferences.pet.avatar_generated_at": now,
-        "preferences.pet.avatar_regen_pending": False,
     }
+    if body.trigger != "next_stage":
+        # avatar_url is the CURRENTLY worn form; a look-ahead must not replace it.
+        persist_fields["preferences.pet.avatar_url"] = avatar_url
+        persist_fields["preferences.pet.avatar_stage"] = stage
+        persist_fields["preferences.pet.avatar_regen_pending"] = False
     if body.trigger == "evolution":
         persist_fields["preferences.pet.avatar_reset_month"] = current_month
     await users_collection.update_one(
@@ -2696,7 +3232,7 @@ async def chat(
     xp: int = agent_data.get("xp", 0)
     current_stage: int = _level_to_stage(_calculate_level(xp))
     pet_prefs: dict = user.get("preferences", {}).get("pet", {})
-    pet_name_custom: Optional[str] = pet_prefs.get("pet_name")
+    pet_name_custom: Optional[str] = pet_prefs.get("pet_name") or DEFAULT_PET_NAME
     pet_species_custom: Optional[str] = pet_prefs.get("pet_species")
 
     # RAG: retrieve relevant book chunks if the user is reading a book and has knowledge access
@@ -2852,7 +3388,7 @@ async def chat(
         {"_id": ObjectId(user_id)},
         {"$set": {"agent.last_interaction": datetime.now(timezone.utc)}},
     )
-    xp_result: dict = await grant_xp(user_id, 5)  # 5 XP per Buddy interaction
+    xp_result: dict = await _grant_chat_xp(user_id)
 
     # Fetch updated messages_used for response
     updated_agent = await users_collection.find_one(

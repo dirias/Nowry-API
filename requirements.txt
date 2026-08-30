@@ -56,3 +56,5 @@ slowapi
 cloudinary>=1.40.0,<2.0
 firebase-admin
 email-validator
+# Strips the solid backdrop from generated pet portraits (agent.py).
+Pillow>=10.0.0
