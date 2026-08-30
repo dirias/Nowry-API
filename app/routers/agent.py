@@ -1072,10 +1072,19 @@ async def _call_fal_avatar(prompt: str, seed: int) -> str:
 
     # Upload to Cloudinary for a permanent HTTPS URL
     storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
+    # format="png" is required, not cosmetic: _strip_generated_backdrop returns
+    # an alpha PNG, and Cloudinary's auto-detection is free to store it as JPEG,
+    # which cannot carry transparency at all. Existing avatars are .jpg for
+    # exactly that reason, which is why their locked silhouettes render as a
+    # featureless disc instead of the creature's outline.
+    #
+    # (`filename` is accepted by the storage backend but never forwarded to
+    # Cloudinary, so it cannot carry the format either.)
     result = await storage.upload(
         file_content=image_bytes,
-        filename=f"pet_avatar_{seed}.png",
+        filename=f"pet_avatar_{seed}",
         folder="nowry/pet_avatars",
+        format="png",
     )
     secure_url: str = result.get("secure_url") or result.get("url")
     if not secure_url:
