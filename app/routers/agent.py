@@ -1383,7 +1383,8 @@ async def grant_xp(user_id: str, amount: int) -> dict:
     try:
         user_doc = await users_collection.find_one(
             {"_id": ObjectId(user_id)},
-            {"agent.xp": 1, "preferences.pet.avatar_stage": 1, "preferences.pet.avatar_url": 1},
+            {"agent.xp": 1, "preferences.pet.avatar_url": 1,
+             "preferences.pet.stage_avatars": 1},
         )
         xp_before: int = (user_doc or {}).get("agent", {}).get("xp", 0) if user_doc else 0
         level_before: int = _calculate_level(xp_before)
@@ -1423,9 +1424,16 @@ async def grant_xp(user_id: str, amount: int) -> dict:
 
         avatar_regen_pending_flag: bool = False
         if level_up and user_doc:
-            stored_avatar_stage = user_doc.get("preferences", {}).get("pet", {}).get("avatar_stage")
-            stored_avatar_url = user_doc.get("preferences", {}).get("pet", {}).get("avatar_url")
-            if stored_avatar_url and stored_avatar_stage and new_stage > stored_avatar_stage:
+            pet_prefs: dict = user_doc.get("preferences", {}).get("pet", {})
+            stored_avatar_url = pet_prefs.get("avatar_url")
+            stage_avatars: dict = pet_prefs.get("stage_avatars") or {}
+            # Keyed off stage_avatars, not avatar_stage. avatar_stage is only
+            # written by manual/evolution generation, so once look-ahead art
+            # exists it goes stale — and a stale value made this flag fire for
+            # a form that had ALREADY been generated, billing a second image
+            # for art the user already owned. stage_avatars is authoritative.
+            already_generated = bool(stage_avatars.get(str(new_stage)))
+            if stored_avatar_url and not already_generated:
                 await users_collection.update_one(
                     {"_id": ObjectId(user_id)},
                     {"$set": {

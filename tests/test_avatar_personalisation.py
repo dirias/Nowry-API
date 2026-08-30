@@ -380,3 +380,52 @@ class TestGeneratedBackdrop:
         # original rather than raising into the generation path.
         junk = b"not an image"
         assert _strip_generated_backdrop(junk) == junk
+
+
+class TestRegenerationGate:
+    """
+    Whether a level-up should commission a NEW portrait.
+
+    The decision must be keyed off stage_avatars, not avatar_stage.
+    avatar_stage is written only by manual/evolution generation, so once
+    look-ahead art exists it is stale — and a stale value made the gate fire
+    for a form that had already been generated, billing a second image for art
+    the user already owned.
+    """
+
+    @staticmethod
+    def _should_regenerate(pet_prefs: dict, new_stage: int) -> bool:
+        """Mirrors grant_xp's gate."""
+        stage_avatars = pet_prefs.get("stage_avatars") or {}
+        return bool(pet_prefs.get("avatar_url")) and not bool(stage_avatars.get(str(new_stage)))
+
+    def test_a_user_with_no_portrait_is_never_asked_to_regenerate(self) -> None:
+        # They are on Nowry by design; generating unprompted would both
+        # surprise them and spend money they did not ask to spend.
+        assert self._should_regenerate({}, 3) is False
+        assert self._should_regenerate({"stage_avatars": {}}, 3) is False
+
+    def test_a_stage_whose_art_already_exists_is_not_regenerated(self) -> None:
+        # The look-ahead already paid for this form.
+        prefs = {"avatar_url": "https://x/2.png", "stage_avatars": {"2": "https://x/2.png", "3": "https://x/3.png"}}
+        assert self._should_regenerate(prefs, 3) is False
+
+    def test_a_stage_with_no_art_yet_is_regenerated(self) -> None:
+        prefs = {"avatar_url": "https://x/2.png", "stage_avatars": {"2": "https://x/2.png"}}
+        assert self._should_regenerate(prefs, 3) is True
+
+    def test_a_legacy_account_without_stage_avatars_still_regenerates(self) -> None:
+        # Accounts that predate per-stage storage must not be stranded.
+        assert self._should_regenerate({"avatar_url": "https://x/old.png"}, 4) is True
+
+    def test_a_stale_avatar_stage_cannot_force_a_duplicate(self) -> None:
+        # The exact regression: avatar_stage says 2, the user reaches 3, and
+        # the look-ahead already generated 3. The old gate compared stages and
+        # said yes; keying off the art itself says no.
+        prefs = {
+            "avatar_url": "https://x/2.png",
+            "avatar_stage": 2,
+            "stage_avatars": {"2": "https://x/2.png", "3": "https://x/3.png"},
+        }
+        assert prefs["avatar_stage"] < 3          # the stale comparison was true
+        assert self._should_regenerate(prefs, 3) is False
