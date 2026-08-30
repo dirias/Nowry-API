@@ -179,6 +179,9 @@ async def create_indexes():
     await cards_collection.create_index("deck_id")
     await cards_collection.create_index("user_id")
     await cards_collection.create_index("next_review_date")
+    # Marked cards — ADR-010. Backs `marked_only` on the card list (and the
+    # deferred cross-deck marked session) without touching any SM-2 index.
+    await cards_collection.create_index([("user_id", 1), ("marked_at", -1)])
     await tasks_collection.create_index("user_id")
     await tasks_collection.create_index("status")
 

@@ -21,6 +21,30 @@ router = APIRouter(
 logger = get_logger(__name__)
 
 
+#: Fields the generic PATCH must never write, each owned by a narrower route.
+#: The first six are scheduler state: `POST /{id}/review` is the only thing
+#: entitled to move them, and leaving them writable here let any authenticated
+#: owner reschedule a card by hand without ever grading it. `marked_at` is
+#: refused for the mirror-image reason — the user mark is a separate axis and
+#: must not travel on the one path that can touch SM-2 (ADR-010).
+#:
+#: `last_reviewed` and `introduced_at` are in the set because blocking only the
+#: obvious four would leave the same hole open through a side door: setting
+#: `last_reviewed` here used to rewrite `next_review`, and `introduced_at`
+#: drives which new cards `_select_session_cards` locks in for the day.
+PROTECTED_UPDATE_FIELDS: frozenset = frozenset(
+    {
+        "ease_factor",
+        "interval",
+        "repetitions",
+        "next_review",
+        "last_reviewed",
+        "introduced_at",
+        "marked_at",
+    }
+)
+
+
 def get_cards_collection() -> Collection:
     return cards_collection
 
@@ -578,6 +602,7 @@ async def list_study_cards(
     search: Optional[str] = Query(None),
     deck_id: Optional[str] = Query(None),
     due_only: bool = Query(False),
+    marked_only: bool = Query(False),
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ) -> dict:
@@ -619,6 +644,13 @@ async def list_study_cards(
 
     if tags:
         query["tags"] = {"$in": tags}
+
+    if marked_only:
+        # A plain top-level key by design: the deck, search and due clauses all
+        # rewrite `$or`/`$and` below, and this must survive every one of them
+        # rather than competing for the same key. `$ne: None` also excludes the
+        # documents that predate the field, which Mongo treats as null.
+        query["marked_at"] = {"$ne": None}
 
     due_clause: Optional[dict] = None
     if due_only:
@@ -741,9 +773,21 @@ async def update_study_card(
     for field in ["_id", "id", "user_id", "created_at"]:
         updates.pop(field, None)
 
-    if "last_reviewed" in updates:
-        updates["next_review"] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
-            days=existing_card.get("interval", 1)
+    # Scheduler state and the user mark are refused outright rather than
+    # silently applied — see PROTECTED_UPDATE_FIELDS. This route previously
+    # $set whatever it was handed, so `{"ease_factor": 2.5}` or
+    # `{"last_reviewed": ...}` rescheduled a card without a review ever
+    # happening. Rejecting is deliberate over dropping: a client asking for
+    # something this route will not do should be told, not ignored.
+    protected = PROTECTED_UPDATE_FIELDS.intersection(updates)
+    if protected:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Fields cannot be set directly: {', '.join(sorted(protected))}. "
+                "Scheduling is owned by POST /study-cards/{id}/review and the "
+                "user mark by PUT/DELETE /study-cards/{id}/mark."
+            ),
         )
 
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
@@ -791,6 +835,74 @@ async def delete_study_card(
         soft_delete_update,
     )
     return None
+
+
+async def _write_mark(
+    id: str, collection: Collection, marked_at: Optional[datetime]
+) -> dict:
+    """Set or clear `marked_at` on one card, and touch nothing else.
+
+    The narrowness is the guarantee, not an implementation detail: this writes
+    exactly two keys, so no future edit can make the user's mark move the
+    scheduler without visibly widening this function (ADR-010). Ownership is
+    already enforced by the `require_ownership` dependency on both callers.
+    """
+    await collection.update_one(
+        {"_id": ObjectId(id)},
+        {
+            "$set": {
+                "marked_at": marked_at,
+                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            }
+        },
+    )
+
+    card = await collection.find_one({"_id": ObjectId(id)})
+    card["_id"] = str(card["_id"])
+    if card.get("deck_id"):
+        card["deck_id"] = str(card["deck_id"])
+    if card.get("user_id"):
+        card["user_id"] = str(card["user_id"])
+    return card
+
+
+@router.put("/{id}/mark", summary="Mark a card for later review", response_model=StudyCard)
+async def mark_study_card(
+    id: str,
+    collection: Collection = Depends(get_cards_collection),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
+    """Flag a card as one the user wants to come back to.
+
+    This is the user's own axis and is deliberately invisible to SM-2: it does
+    not grade the card, does not move `next_review`, and is never read when a
+    study session is assembled. Its destination is the marked filter in free
+    study (Browse mode), where reviews are refused anyway — so drilling a marked
+    card can never inflate its ease. See ADR-010.
+
+    Idempotent: marking an already-marked card refreshes the timestamp rather
+    than erroring, so a double-tap is harmless.
+    """
+    logger.info(f"Marking card {id}")
+    return await _write_mark(
+        id, collection, datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+
+@router.delete("/{id}/mark", summary="Clear a card's mark", response_model=StudyCard)
+async def unmark_study_card(
+    id: str,
+    collection: Collection = Depends(get_cards_collection),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
+    """Clear the user's mark.
+
+    Only the user clears a mark — nothing in the app does it for them (A5). That
+    is why this has to be reachable in one action from inside the session, and
+    why it is idempotent: unmarking an unmarked card succeeds.
+    """
+    logger.info(f"Unmarking card {id}")
+    return await _write_mark(id, collection, None)
 
 
 @router.post("/{id}/review", summary="Review a card with SM-2 grading")

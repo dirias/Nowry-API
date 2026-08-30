@@ -52,6 +52,14 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     interval: int = Field(default=1)  # days until the next review
     repetitions: int = Field(default=0)  # number of times the card has been reviewed
 
+    # User-placed mark — an axis independent of SM-2 (ADR-010). It records that
+    # the user flagged this card to come back to, which is the one thing the
+    # scheduler cannot infer; it is NOT a difficulty rating, and the scheduler
+    # never reads it. Written only by PUT/DELETE /study-cards/{id}/mark, never
+    # by the generic PATCH. `None` means unmarked; the timestamp is what orders
+    # a future cross-deck marked session (MARK-007).
+    marked_at: Optional[datetime] = None
+
     # Quiz Specific Fields
     card_type: str = Field(default="flashcard")  # "flashcard", "quiz", "visual"
     options: Optional[List[str]] = None
@@ -77,5 +85,6 @@ class StudyCard(BaseModel, SoftDeleteMixin):
                 "ease_factor": 2.5,
                 "interval": 7,
                 "repetitions": 3,
+                "marked_at": None,
             }
         }
