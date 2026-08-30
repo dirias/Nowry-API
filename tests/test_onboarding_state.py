@@ -12,14 +12,15 @@ case goes through TestClient because the token check lives in the router-level
 dependency, above the handler.
 """
 import sys
+
+from tests._stubs import stub_if_missing
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Stub imports that may be missing from the local dev env, before any app
 # import. Mirrors the module-level stub block in test_users.py.
-for mod in ["app.models.agent_models", "langfuse", "langfuse.langchain"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("langfuse", "langfuse.langchain")
+sys.modules.setdefault("app.models.agent_models", MagicMock())
 
 import pytest
 from bson import ObjectId

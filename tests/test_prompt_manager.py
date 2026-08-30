@@ -12,10 +12,12 @@ Test isolation strategy mirrors test_langfuse_client.py:
 """
 
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import MagicMock
 
 # Prevent langfuse from failing on Python 3.9 type syntax during collection
-sys.modules.setdefault("langfuse", MagicMock())
+stub_if_missing("langfuse")
 
 import builtins
 import importlib

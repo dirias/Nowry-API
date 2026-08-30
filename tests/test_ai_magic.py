@@ -9,6 +9,7 @@ import and exercise the endpoint function — same pattern as test_stripe_webhoo
 from __future__ import annotations
 
 import sys
+from tests._stubs import stub_if_missing
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -25,12 +26,8 @@ def _ensure_books_importable():
     environment (groq, google.generativeai, firebase_auth Python-3.10-only syntax).
     Safe to call multiple times — setdefault is a no-op if already set.
     """
-    if "groq" not in sys.modules:
-        sys.modules["groq"] = MagicMock()
-    if "google" not in sys.modules:
-        sys.modules["google"] = MagicMock()
-    if "google.generativeai" not in sys.modules:
-        sys.modules["google.generativeai"] = MagicMock()
+    # Only what is genuinely absent — see tests/_stubs.py.
+    stub_if_missing("groq", "google", "google.generativeai")
 
     mock_firebase = MagicMock()
     mock_firebase.get_firebase_user = MagicMock()
@@ -241,10 +238,8 @@ def _ensure_cards_importable():
         mock_plans = MagicMock()
         sys.modules["app.config.subscription_plans"] = mock_plans
     # Stub slowapi + app.core.limiter to unblock quiz_ai.py import on CI (no slowapi installed)
-    if "slowapi" not in sys.modules:
-        sys.modules["slowapi"] = MagicMock()
-    if "slowapi.util" not in sys.modules:
-        sys.modules["slowapi.util"] = MagicMock()
+    stub_if_missing("slowapi")
+    stub_if_missing("slowapi.util")
     if "app.core.limiter" not in sys.modules:
         mock_limiter_mod = MagicMock()
         sys.modules["app.core.limiter"] = mock_limiter_mod

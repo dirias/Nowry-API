@@ -1,3 +1,20 @@
+"""Manual deck-security check — a script, not a pytest suite.
+
+Renamed out of the `test_*.py` pattern deliberately (DEBT-003). This file has no
+test functions: it is an `asyncio.run()` script guarded by `__main__`, and it
+needs a live MongoDB (`MONGO_URI`) plus a running app. pytest collected it only
+because of the name, imported `app.main` at module scope, and — whenever another
+test module had already stubbed an `app.*` module in `sys.modules` — died with a
+FastAPIError during COLLECTION. A collection error aborts the entire run, so
+this one unrunnable file was hiding the result of every other suite.
+
+Run it directly when you want it:
+
+    ./.venv/bin/python tests/manual_deck_security_check.py
+
+Converting it into real pytest tests would be worthwhile, but it needs a live
+database, so it is a separate piece of work rather than a rename.
+"""
 import sys
 import os
 import asyncio

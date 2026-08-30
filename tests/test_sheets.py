@@ -5,6 +5,8 @@ All tests are skipped until routers/sheets.py exists.
 from __future__ import annotations
 
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -15,12 +17,9 @@ import pytest
 # (mirrors the approach used in test_ai_magic.py and test_stripe_webhooks.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-if "groq" not in sys.modules:
-    sys.modules["groq"] = MagicMock()
-if "google" not in sys.modules:
-    sys.modules["google"] = MagicMock()
-if "google.generativeai" not in sys.modules:
-    sys.modules["google.generativeai"] = MagicMock()
+stub_if_missing("groq")
+stub_if_missing("google")
+stub_if_missing("google.generativeai")
 
 mock_firebase = MagicMock()
 mock_firebase.get_firebase_user = AsyncMock(return_value={"user_id": "507f1f77bcf86cd799439011"})
