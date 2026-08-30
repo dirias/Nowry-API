@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 
-from tests._stubs import stub_if_missing
+from tests._stubs import stub_if_missing, use_stub_if_missing
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -23,12 +23,12 @@ stub_if_missing("google.generativeai")
 
 mock_firebase = MagicMock()
 mock_firebase.get_firebase_user = AsyncMock(return_value={"user_id": "507f1f77bcf86cd799439011"})
-sys.modules.setdefault("app.auth.firebase_auth", mock_firebase)
+use_stub_if_missing("app.auth.firebase_auth", mock_firebase)
 
 mock_deps = MagicMock()
 mock_deps.get_subscription_tier = AsyncMock(return_value="free")
 mock_deps.track_ai_usage = AsyncMock(return_value={"user_id": "507f1f77bcf86cd799439011"})
-sys.modules.setdefault("app.auth.dependencies", mock_deps)
+use_stub_if_missing("app.auth.dependencies", mock_deps)
 
 _mock_db = MagicMock()
 _mock_sheets_col = MagicMock()
@@ -39,7 +39,7 @@ _mock_db.sheets_collection = _mock_sheets_col
 sys.modules.setdefault("app.config.database", _mock_db)
 
 if "app.ai_orchestrator.llm_clients.gemini_client" not in sys.modules:
-    sys.modules["app.ai_orchestrator.llm_clients.gemini_client"] = MagicMock()
+    stub_if_missing("app.ai_orchestrator.llm_clients.gemini_client")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

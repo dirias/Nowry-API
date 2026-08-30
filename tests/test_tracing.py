@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sys
 
-from tests._stubs import stub_if_missing
+from tests._stubs import stub_if_missing, use_stub_if_missing
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -50,13 +50,13 @@ def _ensure_books_importable() -> None:
 
     mock_firebase = MagicMock()
     mock_firebase.get_firebase_user = MagicMock()
-    sys.modules.setdefault("app.auth.firebase_auth", mock_firebase)
+    use_stub_if_missing("app.auth.firebase_auth", mock_firebase)
 
     mock_deps = MagicMock()
     mock_deps.require_ownership = MagicMock()
     mock_deps.track_ai_usage = MagicMock()
     mock_deps.get_subscription_tier = MagicMock()
-    sys.modules.setdefault("app.auth.dependencies", mock_deps)
+    use_stub_if_missing("app.auth.dependencies", mock_deps)
 
 
 def _ensure_cards_importable() -> None:
@@ -180,7 +180,7 @@ def _ensure_tts_importable() -> None:
         sys.modules["google.auth.exceptions"] = auth_exceptions_stub
 
     if "app.ai_orchestrator.llm_clients.tts_client" not in sys.modules:
-        sys.modules["app.ai_orchestrator.llm_clients.tts_client"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.llm_clients.tts_client")
 
 
 _ensure_cards_importable()

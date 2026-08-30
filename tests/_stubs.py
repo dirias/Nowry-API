@@ -36,3 +36,26 @@ def stub_if_missing(*module_names: str) -> None:
             importlib.import_module(module_name)
         except Exception:
             sys.modules.setdefault(module_name, MagicMock())
+
+
+def use_stub_if_missing(module_name: str, stub) -> None:
+    """Install a purpose-built `stub` for `module_name`, but only if it is real-less.
+
+    The companion to `stub_if_missing` for the cases where a plain `MagicMock`
+    is not enough and the caller has configured a stand-in of its own.
+
+    The `app.auth.*` stubs are the reason this exists. They were installed
+    unconditionally because `app/routers/auth.py` uses PEP 604 unions that
+    Python 3.9 cannot parse — but the project targets 3.11 and the venv is 3.10,
+    where the real modules import perfectly well. Because `sys.modules` is
+    global and these run at collection time, one file's stub replaced
+    `get_subscription_tier` with a `(*args, **kwargs)` MagicMock for every test
+    collected afterwards, which is what made `test_model_routing` pass alone and
+    fail in the suite.
+    """
+    if module_name in sys.modules:
+        return
+    try:
+        importlib.import_module(module_name)
+    except Exception:
+        sys.modules.setdefault(module_name, stub)

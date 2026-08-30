@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import sys
-from tests._stubs import stub_if_missing
+from tests._stubs import stub_if_missing, use_stub_if_missing
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,19 +56,19 @@ def _ensure_advanced_ai_importable() -> None:
         sys.modules["google.auth.exceptions"] = auth_exceptions_stub
     mock_firebase = MagicMock()
     mock_firebase.get_firebase_user = MagicMock()
-    sys.modules.setdefault("app.auth.firebase_auth", mock_firebase)
+    use_stub_if_missing("app.auth.firebase_auth", mock_firebase)
     mock_deps = MagicMock()
     mock_deps.track_ai_usage = MagicMock()
     mock_deps.get_subscription_tier = MagicMock()
-    sys.modules.setdefault("app.auth.dependencies", mock_deps)
+    use_stub_if_missing("app.auth.dependencies", mock_deps)
     # Stub orchestrator to prevent langgraph / LangChain import errors on test runner
     # (same pattern as _ensure_cards_importable in test_ai_magic.py)
     if "app.ai_orchestrator.orchestrator" not in sys.modules:
-        sys.modules["app.ai_orchestrator.orchestrator"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.orchestrator")
     if "app.ai_orchestrator.llm_clients.gemini_client" not in sys.modules:
-        sys.modules["app.ai_orchestrator.llm_clients.gemini_client"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.llm_clients.gemini_client")
     if "app.ai_orchestrator.llm_clients.tts_client" not in sys.modules:
-        sys.modules["app.ai_orchestrator.llm_clients.tts_client"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.llm_clients.tts_client")
 
 
 _ensure_advanced_ai_importable()
