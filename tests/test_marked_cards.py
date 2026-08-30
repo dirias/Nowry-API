@@ -20,6 +20,7 @@ Python 3.9 reasons documented at length in that file.
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -219,13 +220,17 @@ async def test_patch_refuses_protected_fields(field, value):
     blocking the front door while leaving that open would have changed nothing.
     `introduced_at` drives which new cards a day's session locks in, and
     `marked_at` belongs to the mark route alone.
+
+    DEBT-002 turned the denylist into `StudyCardUpdate`, an allowlist with
+    `extra="forbid"` — so these are now refused by request validation (422)
+    before the handler runs, rather than by a check inside it (400).
     """
     response, collection = await _request(
         "PATCH", f"/study-cards/{CARD_ID}", _make_card_doc(), json={field: value}
     )
 
-    assert response.status_code == 400
-    assert field in response.json()["detail"]
+    assert response.status_code == 422
+    assert field in json.dumps(response.json())
     collection.update_one.assert_not_awaited()
 
 
@@ -238,8 +243,8 @@ async def test_patch_names_every_offending_field_at_once():
         json={"ease_factor": 2.5, "repetitions": 0, "title": "Still rejected"},
     )
 
-    assert response.status_code == 400
-    detail = response.json()["detail"]
+    assert response.status_code == 422
+    detail = json.dumps(response.json())
     assert "ease_factor" in detail and "repetitions" in detail
 
 
@@ -256,6 +261,31 @@ async def test_patch_still_edits_ordinary_card_content():
 
     assert response.status_code == 200
     assert _written_fields(collection) == {"title", "content", "tags"}
+
+
+@pytest.mark.asyncio
+async def test_patch_leaves_omitted_fields_alone():
+    """`exclude_unset` is what keeps this a PATCH rather than a PUT.
+
+    Without it every optional field would arrive as `None` and blank the card —
+    a one-field edit would wipe the other nine.
+    """
+    response, collection = await _request(
+        "PATCH", f"/study-cards/{CARD_ID}", _make_card_doc(), json={"title": "Only the title"}
+    )
+
+    assert response.status_code == 200
+    assert _written_fields(collection) == {"title"}
+
+
+@pytest.mark.asyncio
+async def test_patch_with_nothing_to_change_is_a_no_op():
+    response, collection = await _request(
+        "PATCH", f"/study-cards/{CARD_ID}", _make_card_doc(), json={}
+    )
+
+    assert response.status_code == 200
+    collection.update_one.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -564,18 +594,45 @@ def test_the_decks_router_never_names_the_mark():
     assert "marked" not in (ROUTERS / "decks.py").read_text()
 
 
-def test_protected_update_fields_covers_every_scheduler_field():
-    """A denylist is only as good as its contents — pin them (see DEBT-002)."""
-    from app.routers.study_cards import PROTECTED_UPDATE_FIELDS
+def test_the_patch_model_is_an_allowlist_of_content_fields_only():
+    """Pin the allowlist by exact equality (DEBT-002).
 
-    assert PROTECTED_UPDATE_FIELDS == frozenset(
-        {
-            "ease_factor",
-            "interval",
-            "repetitions",
-            "next_review",
-            "last_reviewed",
-            "introduced_at",
-            "marked_at",
-        }
-    )
+    Exact rather than "does not contain `ease_factor`": the value of an
+    allowlist is that adding a field is a deliberate act. A membership check
+    would let a new scheduler-adjacent field slip in unnoticed, which is the
+    failure the denylist had and this replaced.
+    """
+    from app.models.StudyCard import StudyCardUpdate
+
+    assert set(StudyCardUpdate.model_fields) == {
+        "title",
+        "content",
+        "tags",
+        "deck_id",
+        "card_type",
+        "options",
+        "correct_answer",
+        "explanation",
+        "diagram_code",
+        "diagram_type",
+    }
+
+
+def test_the_patch_model_forbids_everything_it_does_not_name():
+    """`extra="forbid"` is what makes the allowlist an allowlist."""
+    import pydantic
+
+    from app.models.StudyCard import StudyCardUpdate
+
+    assert StudyCardUpdate.model_config.get("extra") == "forbid"
+
+    with pytest.raises(pydantic.ValidationError):
+        StudyCardUpdate(ease_factor=2.5)
+
+
+def test_no_scheduler_field_can_reach_the_patch_model():
+    """The guarantee, stated as the thing it protects rather than as a list."""
+    from app.models.StudyCard import StudyCardUpdate
+
+    scheduler_owned = {*SM2_FIELDS, "marked_at"}
+    assert scheduler_owned.isdisjoint(set(StudyCardUpdate.model_fields))

@@ -3,7 +3,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
-from app.models.StudyCard import StudyCard
+from app.models.StudyCard import StudyCard, StudyCardUpdate
 from app.models.deck_config import resolve_deck_budget
 from app.config.database import cards_collection, decks_collection, books_collection
 from app.utils.logger import get_logger
@@ -19,30 +19,6 @@ router = APIRouter(
 )
 
 logger = get_logger(__name__)
-
-
-#: Fields the generic PATCH must never write, each owned by a narrower route.
-#: The first six are scheduler state: `POST /{id}/review` is the only thing
-#: entitled to move them, and leaving them writable here let any authenticated
-#: owner reschedule a card by hand without ever grading it. `marked_at` is
-#: refused for the mirror-image reason — the user mark is a separate axis and
-#: must not travel on the one path that can touch SM-2 (ADR-010).
-#:
-#: `last_reviewed` and `introduced_at` are in the set because blocking only the
-#: obvious four would leave the same hole open through a side door: setting
-#: `last_reviewed` here used to rewrite `next_review`, and `introduced_at`
-#: drives which new cards `_select_session_cards` locks in for the day.
-PROTECTED_UPDATE_FIELDS: frozenset = frozenset(
-    {
-        "ease_factor",
-        "interval",
-        "repetitions",
-        "next_review",
-        "last_reviewed",
-        "introduced_at",
-        "marked_at",
-    }
-)
 
 
 def get_cards_collection() -> Collection:
@@ -740,11 +716,23 @@ async def list_study_cards(
 @router.patch("/{id}", summary="Update a study card", response_model=StudyCard)
 async def update_study_card(
     id: str,
-    updates: dict,
+    payload: StudyCardUpdate,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
     existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
+    """Edit a card's content. Scheduling and the user mark are not editable here.
+
+    `StudyCardUpdate` is an allowlist with `extra="forbid"`, so a field this
+    route does not own is refused by validation before any of this runs — see
+    that model for why it is an allowlist and not a denylist (DEBT-002).
+
+    `exclude_unset=True` is what keeps this a genuine PATCH: an omitted field is
+    untouched, while an explicitly-sent `null` still clears the value. That
+    distinction is load-bearing for `deck_id`, where `null` means "remove this
+    card from its deck".
+    """
+    updates = payload.model_dump(exclude_unset=True)
 
     # Handle deck_id change
     new_deck_id = updates.get("deck_id")
@@ -769,26 +757,10 @@ async def update_study_card(
         else:
             updates["deck_id"] = None
 
-    # Prevent internal field modification
-    for field in ["_id", "id", "user_id", "created_at"]:
-        updates.pop(field, None)
-
-    # Scheduler state and the user mark are refused outright rather than
-    # silently applied — see PROTECTED_UPDATE_FIELDS. This route previously
-    # $set whatever it was handed, so `{"ease_factor": 2.5}` or
-    # `{"last_reviewed": ...}` rescheduled a card without a review ever
-    # happening. Rejecting is deliberate over dropping: a client asking for
-    # something this route will not do should be told, not ignored.
-    protected = PROTECTED_UPDATE_FIELDS.intersection(updates)
-    if protected:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Fields cannot be set directly: {', '.join(sorted(protected))}. "
-                "Scheduling is owned by POST /study-cards/{id}/review and the "
-                "user mark by PUT/DELETE /study-cards/{id}/mark."
-            ),
-        )
+    # Nothing to do — a PATCH with no recognised field is a no-op, not an error.
+    if not updates:
+        existing_card["_id"] = str(existing_card["_id"])
+        return existing_card
 
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
 
