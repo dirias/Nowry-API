@@ -19,12 +19,16 @@ Python 3.9 reasons documented at length in that file.
 """
 from __future__ import annotations
 
+import ast
 import sys
-import pytest
-import httpx
-from fastapi import FastAPI
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import httpx
+import pytest
 from bson import ObjectId
+from fastapi import FastAPI
 
 # Same lazy-import stub as test_study_cards_review_mode.py: review_card pulls
 # app.routers.agent for its XP side-effect, which drags in SDKs absent from this
@@ -142,8 +146,6 @@ async def test_marking_writes_marked_at_and_nothing_from_sm2():
 async def test_marking_sets_a_timestamp_not_a_boolean():
     """`marked_at` orders the deferred cross-deck session (MARK-007), so the
     stored value has to be a real datetime rather than a truthy flag."""
-    from datetime import datetime
-
     _response, collection = await _request(
         "PUT", f"/study-cards/{CARD_ID}/mark", _make_card_doc()
     )
@@ -294,6 +296,18 @@ def _matches_operator(value, operator: str, expected) -> bool:
         return any(item in expected for item in candidates)
     if operator == "$exists":
         return (value is not _MISSING) is bool(expected)
+    # Comparison operators: the scheduler's own queries use them on datetimes.
+    # A missing or null field never satisfies one, matching Mongo.
+    if operator in ("$gte", "$gt", "$lte", "$lt"):
+        if value is _MISSING or value is None:
+            return False
+        if operator == "$gte":
+            return value >= expected
+        if operator == "$gt":
+            return value > expected
+        if operator == "$lte":
+            return value <= expected
+        return value < expected
     raise AssertionError(f"unsupported operator in card list query: {operator}")
 
 
@@ -376,3 +390,192 @@ async def test_marked_filter_survives_the_deck_clause():
 
     assert collection.last_filter["marked_at"] == {"$ne": None}
     assert "$or" in collection.last_filter
+
+
+# ---------------------------------------------------------------------------
+# MARK-006 — the scheduler must be unable to see the mark
+#
+# The tests above prove marking does not WRITE scheduler state. These prove the
+# other direction, which is the half that rots quietly: that nothing on the
+# scheduling side ever READS `marked_at`. Two kinds of guard, deliberately:
+# a behavioural one (the same deck selects the same cards whether or not they
+# are marked) and a structural one (the scheduler's own source never names the
+# field), because the behavioural test can only cover the paths it exercises
+# while the structural one covers every future edit to those functions.
+# ---------------------------------------------------------------------------
+class RecordingCardsCollection:
+    """Evaluates the queries `_select_session_cards` builds, and keeps them all."""
+
+    def __init__(self, docs: list) -> None:
+        self.docs = docs
+        self.queries: list = []
+        self.updates: list = []
+
+    def _selected(self, query: dict) -> list:
+        return [doc for doc in self.docs if _matches(doc, query)]
+
+    async def count_documents(self, query: dict) -> int:
+        self.queries.append(query)
+        return len(self._selected(query))
+
+    def find(self, query: dict):
+        self.queries.append(query)
+        selected = self._selected(query)
+
+        cursor = MagicMock()
+        cursor.sort = MagicMock(return_value=cursor)
+        cursor.limit = MagicMock(return_value=cursor)
+        cursor.to_list = AsyncMock(side_effect=lambda length: list(selected[:length]))
+        return cursor
+
+    async def update_many(self, query: dict, update: dict):
+        self.queries.append(query)
+        self.updates.append(update)
+        return None
+
+
+def _session_doc(oid: str, marked: bool) -> dict:
+    """A never-studied card, eligible for introduction today."""
+    return {
+        "_id": ObjectId(oid),
+        "user_id": OWNER_USER_ID,
+        "deck_id": ObjectId(DECK_ID),
+        "deleted_at": None,
+        "title": "Card",
+        "content": "Body",
+        "created_at": datetime(2026, 8, 1),
+        "last_reviewed": None,
+        "introduced_at": None,
+        "repetitions": 0,
+        "marked_at": "2026-08-30T10:00:00" if marked else None,
+    }
+
+
+async def _run_session_selection(marked: bool):
+    from app.routers.study_cards import _select_session_cards
+
+    now = datetime(2026, 8, 30, 12, 0, 0)
+    docs = [
+        _session_doc("507f1f77bcf86cd7994390a1", marked),
+        _session_doc("507f1f77bcf86cd7994390a2", marked),
+        _session_doc("507f1f77bcf86cd7994390a3", marked),
+    ]
+    collection = RecordingCardsCollection(docs)
+
+    new_cards, review_cards = await _select_session_cards(
+        collection=collection,
+        user_id=OWNER_USER_ID,
+        deck_or=[{"deck_id": ObjectId(DECK_ID)}],
+        new_cap=20,
+        review_cap=100,
+        now_dt=now,
+        today_start=now.replace(hour=0, minute=0, second=0, microsecond=0),
+    )
+    return collection, [str(c["_id"]) for c in new_cards + review_cards]
+
+
+def _mentions_mark(node) -> bool:
+    """True if any string anywhere in a query mentions the mark."""
+    if isinstance(node, dict):
+        return any("marked" in str(key) or _mentions_mark(value) for key, value in node.items())
+    if isinstance(node, list):
+        return any(_mentions_mark(item) for item in node)
+    return "marked" in str(node) if isinstance(node, str) else False
+
+
+@pytest.mark.asyncio
+async def test_session_selection_never_queries_the_mark():
+    collection, _ids = await _run_session_selection(marked=True)
+
+    assert collection.queries, "expected the selection to issue queries at all"
+    for query in collection.queries:
+        assert not _mentions_mark(query), f"scheduler query reads the mark: {query}"
+
+
+@pytest.mark.asyncio
+async def test_session_selection_never_writes_the_mark():
+    collection, _ids = await _run_session_selection(marked=False)
+
+    # It does write `introduced_at` — that is its job. It must write nothing else.
+    for update in collection.updates:
+        assert set(update["$set"].keys()) == {"introduced_at"}
+
+
+@pytest.mark.asyncio
+async def test_session_selection_picks_the_same_cards_whether_or_not_they_are_marked():
+    """The user's mark must not tilt what the scheduler decides to serve."""
+    _unmarked_collection, unmarked_ids = await _run_session_selection(marked=False)
+    _marked_collection, marked_ids = await _run_session_selection(marked=True)
+
+    assert marked_ids == unmarked_ids
+    assert len(marked_ids) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_marked_card_cannot_be_graded_in_browse_mode():
+    """Marked free study runs in Browse, where grading is already refused.
+
+    This is what stops drilling a marked card from inflating its ease and
+    pushing `next_review` out — the exact inverse of the user's intent,
+    produced by using the feature correctly.
+    """
+    card = _make_card_doc(marked_at="2026-08-30T10:00:00")
+    response, collection = await _request(
+        "POST", f"/study-cards/{CARD_ID}/review?grade=good&mode=browse", card
+    )
+
+    assert response.status_code == 403
+    collection.update_one.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Structural guards — read the source, not the behaviour
+# ---------------------------------------------------------------------------
+
+ROUTERS = Path(__file__).resolve().parent.parent / "app" / "routers"
+
+#: Functions that decide what the user is asked to review, and when. None of
+#: them may so much as name the mark.
+SCHEDULER_FUNCTIONS = ("_select_session_cards", "review_card", "get_daily_review_cards")
+
+
+def _function_source(path: Path, name: str) -> str:
+    source = path.read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return ast.get_source_segment(source, node) or ""
+    raise AssertionError(f"{name} not found in {path.name} — was it renamed?")
+
+
+@pytest.mark.parametrize("function_name", SCHEDULER_FUNCTIONS)
+def test_scheduler_functions_never_name_the_mark(function_name):
+    body = _function_source(ROUTERS / "study_cards.py", function_name)
+
+    assert "marked" not in body, (
+        f"{function_name} references the mark. The mark is an axis the scheduler "
+        f"must not read (ADR-010) — if this is deliberate, that decision needs "
+        f"revisiting first."
+    )
+
+
+def test_the_decks_router_never_names_the_mark():
+    """`decks.py` computes `due_cards`/`new_cards`. A marked card is not due."""
+    assert "marked" not in (ROUTERS / "decks.py").read_text()
+
+
+def test_protected_update_fields_covers_every_scheduler_field():
+    """A denylist is only as good as its contents — pin them (see DEBT-002)."""
+    from app.routers.study_cards import PROTECTED_UPDATE_FIELDS
+
+    assert PROTECTED_UPDATE_FIELDS == frozenset(
+        {
+            "ease_factor",
+            "interval",
+            "repetitions",
+            "next_review",
+            "last_reviewed",
+            "introduced_at",
+            "marked_at",
+        }
+    )
