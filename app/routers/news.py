@@ -5,17 +5,51 @@ import httpx
 from datetime import datetime, timedelta
 import re
 import os
+import html
+from urllib.parse import quote
 from app.auth.firebase_auth import get_firebase_user
 
 router = APIRouter()
 
 # In-memory cache (in production, use Redis)
 news_cache = {}
-CACHE_DURATION = timedelta(
-    minutes=int(os.getenv("NEWS_CACHE", 5))
-)  # Reduced to 5 minutes for testing
+# Feed contents change on the order of tens of minutes, and the frontend holds
+# its own 15-minute React Query staleTime (see `nowry/src/hooks/useNews.js`).
+# Keep the two in step so a Home revisit inside the window costs nothing.
+CACHE_DURATION = timedelta(minutes=int(os.getenv("NEWS_CACHE", 15)))
 
-# RSS feeds by language and category
+
+def google_news_search(query: str, hl: str, gl: str) -> str:
+    """
+    Build a Google News RSS search URL for a topic in a given locale.
+
+    Used for every category that has no dedicated publisher feed. `hl` is the
+    interface language ("en-US", "es"), `gl` the country code ("US", "ES"); the
+    `ceid` Google expects is "<country>:<language>" with the language stripped
+    of any regional suffix.
+    """
+    language = hl.split("-")[0]
+    return (
+        f"https://news.google.com/rss/search?q={quote(query)}"
+        f"&hl={hl}&gl={gl}&ceid={gl}:{language}"
+    )
+
+
+def google_news_home(hl: str, gl: str) -> str:
+    """Build the Google News RSS top-stories URL for a locale."""
+    language = hl.split("-")[0]
+    return f"https://news.google.com/rss?hl={hl}&gl={gl}&ceid={gl}:{language}"
+
+
+# RSS feeds by language and category.
+#
+# Every one of the 14 taxonomy topics in `nowry/src/constants/learningTaxonomy.js`
+# maps to a category that resolves here, in every supported language. Six topics
+# (mathematics, history, languages, philosophy, design, psychology) used to fall
+# back to "general", which meant a user who picked only those saw exactly the
+# same feed as a user with no interests at all; they now have real feeds. `en`
+# keeps its BBC section feeds where BBC publishes one and uses Google News search
+# for the rest.
 NEWS_FEEDS = {
     "en": {
         "general": "https://feeds.bbci.co.uk/news/rss.xml",
@@ -25,30 +59,57 @@ NEWS_FEEDS = {
         "health": "https://feeds.bbci.co.uk/news/health/rss.xml",
         "entertainment": "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
         "politics": "https://feeds.bbci.co.uk/news/politics/rss.xml",
+        "mathematics": google_news_search("mathematics", "en-US", "US"),
+        "history": google_news_search("archaeology OR historians", "en-US", "US"),
+        "languages": google_news_search("language learning", "en-US", "US"),
+        "philosophy": google_news_search("philosophy ethics", "en-US", "US"),
+        "design": google_news_search("design", "en-US", "US"),
+        "psychology": google_news_search("psychology", "en-US", "US"),
     },
     "es": {
-        "general": "https://news.google.com/rss?hl=es&gl=ES&ceid=ES:es",
-        "technology": "https://news.google.com/rss/search?q=tecnolog%C3%ADa&hl=es&gl=ES&ceid=ES:es",
-        "science": "https://news.google.com/rss/search?q=ciencia&hl=es&gl=ES&ceid=ES:es",
-        "business": "https://news.google.com/rss/search?q=econom%C3%ADa&hl=es&gl=ES&ceid=ES:es",
-        "entertainment": "https://news.google.com/rss/search?q=cultura&hl=es&gl=ES&ceid=ES:es",
-        "politics": "https://news.google.com/rss/search?q=pol%C3%ADtica&hl=es&gl=ES&ceid=ES:es",
+        "general": google_news_home("es", "ES"),
+        "technology": google_news_search("tecnología", "es", "ES"),
+        "science": google_news_search("ciencia", "es", "ES"),
+        "business": google_news_search("economía", "es", "ES"),
+        "health": google_news_search("salud", "es", "ES"),
+        "entertainment": google_news_search("cultura", "es", "ES"),
+        "politics": google_news_search("política", "es", "ES"),
+        "mathematics": google_news_search("matemáticas", "es", "ES"),
+        "history": google_news_search("arqueología OR historiador", "es", "ES"),
+        "languages": google_news_search("aprendizaje de idiomas", "es", "ES"),
+        "philosophy": google_news_search("filosofía", "es", "ES"),
+        "design": google_news_search("diseño", "es", "ES"),
+        "psychology": google_news_search("psicología", "es", "ES"),
     },
     "fr": {
-        "general": "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr",
-        "technology": "https://news.google.com/rss/search?q=technologie&hl=fr&gl=FR&ceid=FR:fr",
-        "science": "https://news.google.com/rss/search?q=science&hl=fr&gl=FR&ceid=FR:fr",
-        "business": "https://news.google.com/rss/search?q=%C3%A9conomie&hl=fr&gl=FR&ceid=FR:fr",
-        "entertainment": "https://news.google.com/rss/search?q=culture&hl=fr&gl=FR&ceid=FR:fr",
-        "politics": "https://news.google.com/rss/search?q=politique&hl=fr&gl=FR&ceid=FR:fr",
+        "general": google_news_home("fr", "FR"),
+        "technology": google_news_search("technologie", "fr", "FR"),
+        "science": google_news_search("science", "fr", "FR"),
+        "business": google_news_search("économie", "fr", "FR"),
+        "health": google_news_search("santé", "fr", "FR"),
+        "entertainment": google_news_search("culture", "fr", "FR"),
+        "politics": google_news_search("politique", "fr", "FR"),
+        "mathematics": google_news_search("mathématiques", "fr", "FR"),
+        "history": google_news_search("archéologie OR historien", "fr", "FR"),
+        "languages": google_news_search("apprentissage des langues", "fr", "FR"),
+        "philosophy": google_news_search("philosophie", "fr", "FR"),
+        "design": google_news_search("design", "fr", "FR"),
+        "psychology": google_news_search("psychologie", "fr", "FR"),
     },
     "de": {
-        "general": "https://news.google.com/rss?hl=de&gl=DE&ceid=DE:de",
-        "technology": "https://news.google.com/rss/search?q=technologie&hl=de&gl=DE&ceid=DE:de",
-        "science": "https://news.google.com/rss/search?q=wissenschaft&hl=de&gl=DE&ceid=DE:de",
-        "business": "https://news.google.com/rss/search?q=wirtschaft&hl=de&gl=DE&ceid=DE:de",
-        "entertainment": "https://news.google.com/rss/search?q=kultur&hl=de&gl=DE&ceid=DE:de",
-        "politics": "https://news.google.com/rss/search?q=politik&hl=de&gl=DE&ceid=DE:de",
+        "general": google_news_home("de", "DE"),
+        "technology": google_news_search("technologie", "de", "DE"),
+        "science": google_news_search("wissenschaft", "de", "DE"),
+        "business": google_news_search("wirtschaft", "de", "DE"),
+        "health": google_news_search("gesundheit", "de", "DE"),
+        "entertainment": google_news_search("kultur", "de", "DE"),
+        "politics": google_news_search("politik", "de", "DE"),
+        "mathematics": google_news_search("mathematik", "de", "DE"),
+        "history": google_news_search("archäologie OR historiker", "de", "DE"),
+        "languages": google_news_search("sprachen lernen", "de", "DE"),
+        "philosophy": google_news_search("philosophie", "de", "DE"),
+        "design": google_news_search("design", "de", "DE"),
+        "psychology": google_news_search("psychologie", "de", "DE"),
     },
 }
 
@@ -66,30 +127,39 @@ def extract_image_from_html(html: str) -> Optional[str]:
     return None
 
 
-def strip_html(html: str) -> str:
-    """Remove HTML tags from text"""
-    if not html:
+def strip_html(markup: str) -> str:
+    """
+    Remove HTML tags from text and decode character entities.
+
+    Entity decoding matters for the Google News feeds: their summaries are HTML
+    fragments whose text is littered with `&nbsp;` and `&#39;`, which used to be
+    rendered literally on the news card once the tags alone were stripped.
+    """
+    if not markup:
         return ""
-    return re.sub("<[^<]+?>", "", html)
+    return html.unescape(re.sub("<[^<]+?>", "", markup))
 
 
-# Category colors for placeholders
-CATEGORY_COLORS = {
-    "general": "607d8b",  # Grey Blue
-    "technology": "2196f3",  # Blue
-    "science": "9c27b0",  # Purple
-    "business": "4caf50",  # Green
-    "health": "f44336",  # Red
-    "entertainment": "e91e63",  # Pink
-    "politics": "795548",  # Brown
-}
+def _letters_only(text: str) -> str:
+    """Lowercase alphanumerics only — separators and spacing carry no meaning here."""
+    return re.sub(r"[^0-9a-z]", "", text.lower())
+
+
+def is_echo_of_title(description: str, title: str) -> bool:
+    """Is this summary just the headline restated?"""
+    normalized_title = _letters_only(title)
+    if not normalized_title:
+        return False
+    return _letters_only(description).startswith(normalized_title[:50])
 
 
 @router.get("/news/{language}/{category}")
 async def get_news(language: str = "en", category: str = "general", user: dict = Depends(get_firebase_user)):
     """
-    Fetch news from RSS feeds based on language and category
-    Returns cached results if available (5 min cache)
+    Fetch news from RSS feeds based on language and category.
+
+    Returns cached results when the entry is younger than CACHE_DURATION
+    (NEWS_CACHE minutes, default 15).
     """
     try:
         # Get feed URL first
@@ -170,6 +240,12 @@ async def get_news(language: str = "en", category: str = "general", user: dict =
                     "health": 500,
                     "entertainment": 600,
                     "politics": 700,
+                    "mathematics": 800,
+                    "history": 900,
+                    "languages": 1000,
+                    "philosophy": 1100,
+                    "design": 1200,
+                    "psychology": 1300,
                 }
                 seed = seed_map.get(category, 100)
                 # Add entry index for variety within same category
@@ -191,10 +267,22 @@ async def get_news(language: str = "en", category: str = "general", user: dict =
                 # Try to clean up Google News specific text "View full coverage"
                 description = description.replace("View full coverage", "").strip()
 
+                # Google News summaries are frequently just the headline again,
+                # sometimes with the publisher appended and different separators
+                # ("Title - Publisher" vs "Title&nbsp;&nbsp;Publisher"), so the
+                # comparison ignores everything but the letters and digits.
+                # Repeating the title in the card's excerpt is worse than no
+                # excerpt, and the frontend renders its own localized fallback.
+                if is_echo_of_title(description, strip_html(entry.title)):
+                    description = ""
+
                 articles.append(
                     {
                         "title": entry.title,
-                        "description": description or "Click to read more...",
+                        # Deliberately empty rather than an English "Click to
+                        # read more..." — the card is rendered in five locales,
+                        # so the placeholder belongs in the frontend bundle.
+                        "description": description,
                         "urlToImage": image_url,
                         "url": entry.link,
                         "publishedAt": getattr(entry, "published", None),

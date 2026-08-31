@@ -9,17 +9,14 @@ secondary LLM call and vetoes the tool via ToolCallRejectedError, which the
 provider loop turns into a re-run of the turn without the tool.
 """
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import AsyncMock, MagicMock
 
 # Python 3.9 compatibility stubs (mirrors test_smart_pet.py)
-for mod in ["google.generativeai", "google.generativeai.types",
-            "google.generativeai.protos", "google.api_core.exceptions"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("google.generativeai", "google.generativeai.types", "google.generativeai.protos", "google.api_core.exceptions")
 
-for mod in ["slowapi", "slowapi.util", "langfuse"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("slowapi", "slowapi.util", "langfuse")
 
 if "app.core.limiter" not in sys.modules:
     _mock_limiter_mod = MagicMock()

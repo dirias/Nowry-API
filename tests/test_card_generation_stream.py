@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+
+from tests._stubs import stub_if_missing
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -35,7 +37,7 @@ from fastapi import FastAPI
 # app.ai_orchestrator.orchestrator does `from langfuse.langchain import
 # CallbackHandler`; conftest stubs "langfuse" but not the submodule, and the
 # real package is not installed in this Python 3.9 dev venv.
-sys.modules.setdefault("langfuse.langchain", MagicMock())
+stub_if_missing("langfuse.langchain")
 
 # Defensive vs. collection order: earlier-collected test modules
 # (test_advanced_ai.py, test_ai_magic.py) stub these modules wholesale as

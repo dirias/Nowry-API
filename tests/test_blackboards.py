@@ -10,6 +10,8 @@ This mirrors the pattern established in `test_annual_planning_be.py`.
 attribute `app.routers.blackboards.db` — NOT an individually-imported collection.
 """
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import MagicMock, AsyncMock, patch
 
 # Stub out imports that may not be present yet.
@@ -17,9 +19,8 @@ from unittest.mock import MagicMock, AsyncMock, patch
 # AI orchestrator, whose module-level `from langfuse.langchain import
 # CallbackHandler` fails against conftest's bare `langfuse` MagicMock
 # ("'langfuse' is not a package"). Same stub as tests/test_tracing.py L21.
-for mod in ["app.models.agent_models", "langfuse", "langfuse.langchain"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("langfuse", "langfuse.langchain")
+sys.modules.setdefault("app.models.agent_models", MagicMock())
 
 import pytest
 from bson import ObjectId

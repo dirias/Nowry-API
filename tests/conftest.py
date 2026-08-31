@@ -1,15 +1,30 @@
 import sys
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 
+from tests._stubs import stub_if_missing
+
 # ---------------------------------------------------------------------------
 # Phase 10 — heavy dependency stub mocks
-# These packages are not installed in the local Python 3.9 dev env.
-# Stubbing them here (before any test imports orchestrator.py or model_config)
-# allows AIOrchestrator and all graph nodes to be imported without errors.
-# Uses setdefault() so already-mocked modules (from test_model_config.py's
-# top-level guards) are not overwritten.
+#
+# These packages may be absent depending on which interpreter the suite is run
+# with. Stubbing them here (before any test imports orchestrator.py or
+# model_config) lets AIOrchestrator and every graph node import regardless.
+#
+# DEBT-003/DEBT-007: this used to stub UNCONDITIONALLY, which broke the very
+# environment it was meant to support. A MagicMock is not a package, so once
+# `google.generativeai` was stubbed, `google.generativeai.types` could not
+# resolve *through* it — even in the project venv where the real package is
+# installed. `app.main` therefore failed to import, and a collection error
+# aborts the entire run rather than failing one file. The same shape broke
+# `langfuse.langchain`.
+#
+# So: import the real module first and only stub what genuinely is not there.
+# A real package serves its own submodules; a stub is a last resort, not a
+# default. `setdefault` is still used so a module another test file already
+# stubbed at collection time is never overwritten.
 # ---------------------------------------------------------------------------
 _STUB_MOCKS = [
     "langgraph",
@@ -23,9 +38,11 @@ _STUB_MOCKS = [
     "groq",
     "google.generativeai",
     "langfuse",
+    "langfuse.langchain",
 ]
-for _mod in _STUB_MOCKS:
-    sys.modules.setdefault(_mod, MagicMock())
+
+
+stub_if_missing(*_STUB_MOCKS)
 
 
 @pytest.fixture

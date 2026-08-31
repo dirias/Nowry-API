@@ -9,6 +9,7 @@ import and exercise the endpoint function — same pattern as test_stripe_webhoo
 from __future__ import annotations
 
 import sys
+from tests._stubs import stub_if_missing, use_stub_if_missing
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -25,21 +26,17 @@ def _ensure_books_importable():
     environment (groq, google.generativeai, firebase_auth Python-3.10-only syntax).
     Safe to call multiple times — setdefault is a no-op if already set.
     """
-    if "groq" not in sys.modules:
-        sys.modules["groq"] = MagicMock()
-    if "google" not in sys.modules:
-        sys.modules["google"] = MagicMock()
-    if "google.generativeai" not in sys.modules:
-        sys.modules["google.generativeai"] = MagicMock()
+    # Only what is genuinely absent — see tests/_stubs.py.
+    stub_if_missing("groq", "google", "google.generativeai")
 
     mock_firebase = MagicMock()
     mock_firebase.get_firebase_user = MagicMock()
-    sys.modules.setdefault("app.auth.firebase_auth", mock_firebase)
+    use_stub_if_missing("app.auth.firebase_auth", mock_firebase)
 
     mock_deps = MagicMock()
     mock_deps.require_ownership = MagicMock()
     mock_deps.track_ai_usage = MagicMock()
-    sys.modules.setdefault("app.auth.dependencies", mock_deps)
+    use_stub_if_missing("app.auth.dependencies", mock_deps)
 
 
 _ensure_books_importable()
@@ -106,16 +103,19 @@ async def test_ai_expand_tier_routing_free(mock_books_collection, mock_user_doc)
 
     with patch("app.routers.books.books_collection") as mock_col:
         mock_col.find_one = AsyncMock(return_value=book_doc)
-        with patch("app.routers.books._get_groq_client", return_value=mock_groq_instance) as mock_groq_factory:
-            with patch("app.routers.books.Gemini_client") as mock_gemini_cls:
-                result = await ai_expand_text(
-                    book_id="60b8d295f1d2c17f4e4b1234",
-                    body=body,
-                    current_user=user_doc,
-                )
+        # Client selection moved behind `get_client_for_tier` (model_config);
+        # the router no longer holds per-provider factories of its own.
+        with patch("app.routers.books.get_client_for_tier", return_value=mock_groq_instance) as mock_get_client:
+            result = await ai_expand_text(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                current_user=user_doc,
+            )
 
-    mock_groq_factory.assert_called_once()
-    mock_gemini_cls.assert_not_called()
+    mock_get_client.assert_called_once_with("free")
+    # Free tier goes through the Groq-shaped chat API, not Gemini's `request`.
+    mock_groq_instance.chat.completions.create.assert_called_once()
+    mock_groq_instance.request.assert_not_called()
     assert result.expanded_text == "Expanded text from Groq"
 
 
@@ -142,16 +142,18 @@ async def test_ai_expand_tier_routing_plus(mock_books_collection, mock_user_doc_
 
     with patch("app.routers.books.books_collection") as mock_col:
         mock_col.find_one = AsyncMock(return_value=book_doc)
-        with patch("app.routers.books.Gemini_client", return_value=mock_gemini_instance) as mock_gemini_cls:
-            with patch("app.routers.books._get_groq_client") as mock_groq_factory:
-                result = await ai_expand_text(
-                    book_id="60b8d295f1d2c17f4e4b1234",
-                    body=body,
-                    current_user=mock_user_doc_plus,
-                )
+        with patch("app.routers.books.get_client_for_tier", return_value=mock_gemini_instance) as mock_get_client:
+            result = await ai_expand_text(
+                book_id="60b8d295f1d2c17f4e4b1234",
+                body=body,
+                current_user=mock_user_doc_plus,
+            )
 
-    mock_gemini_cls.assert_called_once_with("models/gemini-flash-latest")
-    mock_groq_factory.assert_not_called()
+    # The tier is what this router decides; WHICH Gemini model that maps to is
+    # model_config's business, and is asserted there rather than duplicated here.
+    mock_get_client.assert_called_once_with("plus")
+    mock_gemini_instance.request.assert_called_once()
+    mock_gemini_instance.chat.completions.create.assert_not_called()
     assert result.expanded_text == "Expanded text from Gemini Flash"
 
 
@@ -178,7 +180,7 @@ async def test_ai_expand_no_limit_pro(mock_books_collection, mock_user_doc_pro):
 
     with patch("app.routers.books.books_collection") as mock_col:
         mock_col.find_one = AsyncMock(return_value=book_doc)
-        with patch("app.routers.books.Gemini_client", return_value=mock_gemini_instance):
+        with patch("app.routers.books.get_client_for_tier", return_value=mock_gemini_instance):
             result = await ai_expand_text(
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
@@ -241,10 +243,8 @@ def _ensure_cards_importable():
         mock_plans = MagicMock()
         sys.modules["app.config.subscription_plans"] = mock_plans
     # Stub slowapi + app.core.limiter to unblock quiz_ai.py import on CI (no slowapi installed)
-    if "slowapi" not in sys.modules:
-        sys.modules["slowapi"] = MagicMock()
-    if "slowapi.util" not in sys.modules:
-        sys.modules["slowapi.util"] = MagicMock()
+    stub_if_missing("slowapi")
+    stub_if_missing("slowapi.util")
     if "app.core.limiter" not in sys.modules:
         mock_limiter_mod = MagicMock()
         sys.modules["app.core.limiter"] = mock_limiter_mod
@@ -350,7 +350,7 @@ async def test_generate_from_book_plus_success(mock_books_collection, mock_user_
 
     with patch("app.routers.cards.books_collection") as mock_books_col:
         mock_books_col.find_one = AsyncMock(return_value=book_doc)
-        with patch("app.routers.cards.Gemini_client", return_value=mock_gemini_instance):
+        with patch("app.routers.cards.get_client_for_tier", return_value=mock_gemini_instance):
             result = await generate_cards_from_book(
                 body=body,
                 current_user=mock_user_doc_plus,
@@ -443,7 +443,7 @@ async def test_analyze_deck_pro_success(mock_deck_with_cards, mock_user_doc_pro)
         mock_decks_col.find_one = AsyncMock(return_value=deck_doc)
         with patch("app.routers.cards.cards_collection") as mock_cards_col:
             mock_cards_col.find.return_value = mock_cursor
-            with patch("app.routers.cards.Gemini_client", return_value=mock_gemini_instance):
+            with patch("app.routers.cards.get_client_for_tier", return_value=mock_gemini_instance):
                 result = await analyze_deck(
                     body=body,
                     current_user=mock_user_doc_pro,
@@ -794,7 +794,7 @@ async def test_quiz_analyze_deck_pro_allowed(mock_deck_with_cards, mock_user_doc
         mock_decks_col.find_one = AsyncMock(return_value=deck_doc)
         with patch("app.routers.quiz_ai.cards_collection") as mock_cards_col:
             mock_cards_col.find.return_value = mock_cursor
-            with patch("app.routers.quiz_ai.Gemini_client", return_value=mock_gemini_instance):
+            with patch("app.routers.quiz_ai.get_client_for_tier", return_value=mock_gemini_instance):
                 result = await analyze_deck_for_quiz(
                     deck_id=deck_id_str,
                     current_user=mock_user_doc_pro,

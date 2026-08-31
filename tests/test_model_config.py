@@ -12,12 +12,14 @@ Test isolation strategy mirrors test_langfuse_client.py:
 """
 
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import MagicMock
 
 # Prevent SDK import errors on Python 3.9 test runner
-sys.modules.setdefault("groq", MagicMock())
-sys.modules.setdefault("google.generativeai", MagicMock())
-sys.modules.setdefault("langfuse", MagicMock())
+stub_if_missing("groq")
+stub_if_missing("google.generativeai")
+stub_if_missing("langfuse")
 
 import importlib
 import pytest

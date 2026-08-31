@@ -7,6 +7,8 @@ the system Python 3.9 test runner. Tests mock the dependency chain and test the
 core logic directly — mirroring the approach used in test_stripe_webhooks.py.
 """
 import sys
+
+from tests._stubs import use_stub_if_missing
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from bson import ObjectId
@@ -19,7 +21,7 @@ def _force_real_dependencies_import():
     full test suite runs together, several pre-existing test files
     (test_ai_magic.py, test_advanced_ai.py, test_goal_ai.py, test_sheets.py,
     test_tracing.py) unconditionally do
-    `sys.modules.setdefault("app.auth.dependencies", mock_deps)` at
+    `use_stub_if_missing("app.auth.dependencies", mock_deps)` at
     module-collection time (before any test function runs) to avoid needing
     the real firebase_auth import chain for THEIR unrelated tests. Since
     pytest collects all test modules before running any test, that stub

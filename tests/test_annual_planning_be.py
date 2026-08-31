@@ -10,6 +10,8 @@ as each requirement is implemented.
 from __future__ import annotations
 
 import sys
+
+from tests._stubs import use_stub_if_missing
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from bson import ObjectId
@@ -21,7 +23,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 _mock_firebase = MagicMock()
 _mock_firebase.get_firebase_user = MagicMock()
-sys.modules.setdefault("app.auth.firebase_auth", _mock_firebase)
+use_stub_if_missing("app.auth.firebase_auth", _mock_firebase)
 
 _mock_db = MagicMock()
 sys.modules.setdefault("app.config.database", _mock_db)

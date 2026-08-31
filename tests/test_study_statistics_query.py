@@ -13,6 +13,8 @@ the `patch(...)` target in this file's fixtures will raise AttributeError
 until Task 2 hoists it to module level.
 """
 import sys
+
+from tests._stubs import stub_if_missing
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,9 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 #   - app.auth.firebase_auth: defensively stubbed in case any transitive
 #     import in this module chain relies on Python 3.10+ syntax; matches the
 #     established idiom for router-adjacent test files.
-for mod in ["bcrypt"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("bcrypt")
 
 if "app.auth.firebase_auth" not in sys.modules:
     _mock_firebase_auth_mod = MagicMock()

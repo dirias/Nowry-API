@@ -12,11 +12,13 @@ import asyncio
 import importlib
 import importlib.util
 import sys
+
+from tests._stubs import stub_if_missing
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Prevent langfuse from failing on Python 3.9 type syntax during collection
-sys.modules.setdefault("langfuse", MagicMock())
+stub_if_missing("langfuse")
 
 import pytest
 

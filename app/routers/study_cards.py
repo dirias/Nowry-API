@@ -3,7 +3,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
-from app.models.StudyCard import StudyCard
+from app.models.StudyCard import StudyCard, StudyCardUpdate
 from app.models.deck_config import resolve_deck_budget
 from app.config.database import cards_collection, decks_collection, books_collection
 from app.utils.logger import get_logger
@@ -578,6 +578,7 @@ async def list_study_cards(
     search: Optional[str] = Query(None),
     deck_id: Optional[str] = Query(None),
     due_only: bool = Query(False),
+    marked_only: bool = Query(False),
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ) -> dict:
@@ -619,6 +620,13 @@ async def list_study_cards(
 
     if tags:
         query["tags"] = {"$in": tags}
+
+    if marked_only:
+        # A plain top-level key by design: the deck, search and due clauses all
+        # rewrite `$or`/`$and` below, and this must survive every one of them
+        # rather than competing for the same key. `$ne: None` also excludes the
+        # documents that predate the field, which Mongo treats as null.
+        query["marked_at"] = {"$ne": None}
 
     due_clause: Optional[dict] = None
     if due_only:
@@ -708,11 +716,23 @@ async def list_study_cards(
 @router.patch("/{id}", summary="Update a study card", response_model=StudyCard)
 async def update_study_card(
     id: str,
-    updates: dict,
+    payload: StudyCardUpdate,
     collection: Collection = Depends(get_cards_collection),
     d_collection: Collection = Depends(get_decks_collection),
     existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
+    """Edit a card's content. Scheduling and the user mark are not editable here.
+
+    `StudyCardUpdate` is an allowlist with `extra="forbid"`, so a field this
+    route does not own is refused by validation before any of this runs — see
+    that model for why it is an allowlist and not a denylist (DEBT-002).
+
+    `exclude_unset=True` is what keeps this a genuine PATCH: an omitted field is
+    untouched, while an explicitly-sent `null` still clears the value. That
+    distinction is load-bearing for `deck_id`, where `null` means "remove this
+    card from its deck".
+    """
+    updates = payload.model_dump(exclude_unset=True)
 
     # Handle deck_id change
     new_deck_id = updates.get("deck_id")
@@ -737,14 +757,10 @@ async def update_study_card(
         else:
             updates["deck_id"] = None
 
-    # Prevent internal field modification
-    for field in ["_id", "id", "user_id", "created_at"]:
-        updates.pop(field, None)
-
-    if "last_reviewed" in updates:
-        updates["next_review"] = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
-            days=existing_card.get("interval", 1)
-        )
+    # Nothing to do — a PATCH with no recognised field is a no-op, not an error.
+    if not updates:
+        existing_card["_id"] = str(existing_card["_id"])
+        return existing_card
 
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
 
@@ -791,6 +807,74 @@ async def delete_study_card(
         soft_delete_update,
     )
     return None
+
+
+async def _write_mark(
+    id: str, collection: Collection, marked_at: Optional[datetime]
+) -> dict:
+    """Set or clear `marked_at` on one card, and touch nothing else.
+
+    The narrowness is the guarantee, not an implementation detail: this writes
+    exactly two keys, so no future edit can make the user's mark move the
+    scheduler without visibly widening this function (ADR-010). Ownership is
+    already enforced by the `require_ownership` dependency on both callers.
+    """
+    await collection.update_one(
+        {"_id": ObjectId(id)},
+        {
+            "$set": {
+                "marked_at": marked_at,
+                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            }
+        },
+    )
+
+    card = await collection.find_one({"_id": ObjectId(id)})
+    card["_id"] = str(card["_id"])
+    if card.get("deck_id"):
+        card["deck_id"] = str(card["deck_id"])
+    if card.get("user_id"):
+        card["user_id"] = str(card["user_id"])
+    return card
+
+
+@router.put("/{id}/mark", summary="Mark a card for later review", response_model=StudyCard)
+async def mark_study_card(
+    id: str,
+    collection: Collection = Depends(get_cards_collection),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
+    """Flag a card as one the user wants to come back to.
+
+    This is the user's own axis and is deliberately invisible to SM-2: it does
+    not grade the card, does not move `next_review`, and is never read when a
+    study session is assembled. Its destination is the marked filter in free
+    study (Browse mode), where reviews are refused anyway — so drilling a marked
+    card can never inflate its ease. See ADR-010.
+
+    Idempotent: marking an already-marked card refreshes the timestamp rather
+    than erroring, so a double-tap is harmless.
+    """
+    logger.info(f"Marking card {id}")
+    return await _write_mark(
+        id, collection, datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+
+@router.delete("/{id}/mark", summary="Clear a card's mark", response_model=StudyCard)
+async def unmark_study_card(
+    id: str,
+    collection: Collection = Depends(get_cards_collection),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
+    """Clear the user's mark.
+
+    Only the user clears a mark — nothing in the app does it for them (A5). That
+    is why this has to be reachable in one action from inside the session, and
+    why it is idempotent: unmarking an unmarked card succeeds.
+    """
+    logger.info(f"Unmarking card {id}")
+    return await _write_mark(id, collection, None)
 
 
 @router.post("/{id}/review", summary="Review a card with SM-2 grading")

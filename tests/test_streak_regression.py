@@ -8,6 +8,8 @@ with no `last_reviewed` writes in the reviewed-cards window computes a
 streak of 0 in app.routers.users.get_user_stats.
 """
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Python 3.9 compatibility stubs — mirrors the sys.modules-stub-before-router-
@@ -17,9 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 #     Python 3.9 dev/test venv (same category as slowapi/langfuse elsewhere).
 #   - app.auth.firebase_auth: uses Python 3.10+ `dict | None` syntax and fails
 #     to import on Python 3.9 (same known issue documented for other routers).
-for mod in ["bcrypt"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("bcrypt")
 
 if "app.auth.firebase_auth" not in sys.modules:
     _mock_firebase_auth_mod = MagicMock()

@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import sys
+from tests._stubs import stub_if_missing, use_stub_if_missing
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,26 +21,23 @@ import pytest
 def _ensure_advanced_ai_importable() -> None:
     """Stub out google.cloud.texttospeech and other missing deps so the
     routers can be imported on Python 3.9 test runner without credentials."""
-    if "groq" not in sys.modules:
-        sys.modules["groq"] = MagicMock()
-    if "google" not in sys.modules:
-        sys.modules["google"] = MagicMock()
-    if "google.generativeai" not in sys.modules:
-        sys.modules["google.generativeai"] = MagicMock()
-    # Phase 6 — Google Cloud TTS stubs:
-    if "google.cloud" not in sys.modules:
-        sys.modules["google.cloud"] = MagicMock()
-    if "google.cloud.texttospeech" not in sys.modules:
-        sys.modules["google.cloud.texttospeech"] = MagicMock()
-    if "google.oauth2" not in sys.modules:
-        sys.modules["google.oauth2"] = MagicMock()
-    if "google.oauth2.service_account" not in sys.modules:
-        sys.modules["google.oauth2.service_account"] = MagicMock()
+    # Only what is genuinely absent — see tests/_stubs.py. Replacing a package
+    # that IS installed breaks its submodule imports for every test module
+    # collected afterwards, which is what used to abort the whole run.
+    stub_if_missing(
+        "groq",
+        "google",
+        "google.generativeai",
+        # Phase 6 — Google Cloud TTS stubs:
+        "google.cloud",
+        "google.cloud.texttospeech",
+        "google.oauth2",
+        "google.oauth2.service_account",
+    )
     # app/routers/tts.py catches specific google.api_core / google.auth exception
     # types — these must be real Exception subclasses (not MagicMock attributes),
     # since `except SomeType:` requires SomeType to inherit from BaseException.
-    if "google.api_core" not in sys.modules:
-        sys.modules["google.api_core"] = MagicMock()
+    stub_if_missing("google.api_core")
     if "google.api_core.exceptions" not in sys.modules:
         api_core_exceptions_stub = MagicMock()
         api_core_exceptions_stub.GoogleAPICallError = type(
@@ -49,8 +47,7 @@ def _ensure_advanced_ai_importable() -> None:
             "InvalidArgument", (api_core_exceptions_stub.GoogleAPICallError,), {}
         )
         sys.modules["google.api_core.exceptions"] = api_core_exceptions_stub
-    if "google.auth" not in sys.modules:
-        sys.modules["google.auth"] = MagicMock()
+    stub_if_missing("google.auth")
     if "google.auth.exceptions" not in sys.modules:
         auth_exceptions_stub = MagicMock()
         auth_exceptions_stub.GoogleAuthError = type(
@@ -59,19 +56,19 @@ def _ensure_advanced_ai_importable() -> None:
         sys.modules["google.auth.exceptions"] = auth_exceptions_stub
     mock_firebase = MagicMock()
     mock_firebase.get_firebase_user = MagicMock()
-    sys.modules.setdefault("app.auth.firebase_auth", mock_firebase)
+    use_stub_if_missing("app.auth.firebase_auth", mock_firebase)
     mock_deps = MagicMock()
     mock_deps.track_ai_usage = MagicMock()
     mock_deps.get_subscription_tier = MagicMock()
-    sys.modules.setdefault("app.auth.dependencies", mock_deps)
+    use_stub_if_missing("app.auth.dependencies", mock_deps)
     # Stub orchestrator to prevent langgraph / LangChain import errors on test runner
     # (same pattern as _ensure_cards_importable in test_ai_magic.py)
     if "app.ai_orchestrator.orchestrator" not in sys.modules:
-        sys.modules["app.ai_orchestrator.orchestrator"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.orchestrator")
     if "app.ai_orchestrator.llm_clients.gemini_client" not in sys.modules:
-        sys.modules["app.ai_orchestrator.llm_clients.gemini_client"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.llm_clients.gemini_client")
     if "app.ai_orchestrator.llm_clients.tts_client" not in sys.modules:
-        sys.modules["app.ai_orchestrator.llm_clients.tts_client"] = MagicMock()
+        stub_if_missing("app.ai_orchestrator.llm_clients.tts_client")
 
 
 _ensure_advanced_ai_importable()

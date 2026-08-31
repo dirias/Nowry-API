@@ -972,6 +972,48 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     return prompt, seed_int
 
 
+# ---------------------------------------------------------------------------
+# Portraits — every form the user has generated for a stage, not just the last
+#
+# stage_avatars used to hold ONE url per stage, overwritten on every
+# generation. A Pro user with three generations a month kept only the third;
+# the other two were paid for and destroyed. That also made the generate button
+# a destructive action — spending a scarce resource on a result that might be
+# worse than what you already had, with no way back.
+#
+# It is now a list per stage, with an explicit worn selection. Legacy documents
+# hold a bare string, so every read goes through _portraits_for.
+# ---------------------------------------------------------------------------
+MAX_PORTRAITS_PER_STAGE = 5
+
+
+def _portraits_for(pet_prefs: dict, stage: int) -> list[str]:
+    """Every portrait generated for a stage, oldest first.
+
+    Tolerates the legacy single-string shape so accounts that predate the list
+    keep their portrait instead of appearing to have none.
+    """
+    entry = (pet_prefs.get("stage_avatars") or {}).get(str(stage))
+    if not entry:
+        return []
+    if isinstance(entry, str):
+        return [entry]
+    return [url for url in entry if isinstance(url, str) and url]
+
+
+def _worn_portrait(pet_prefs: dict, stage: int) -> Optional[str]:
+    """The portrait the companion is actually wearing at a stage.
+
+    Falls back to the most recent one, so a stage always shows something even
+    if no explicit choice was ever made.
+    """
+    portraits = _portraits_for(pet_prefs, stage)
+    if not portraits:
+        return None
+    chosen = (pet_prefs.get("worn_avatars") or {}).get(str(stage))
+    return chosen if chosen in portraits else portraits[-1]
+
+
 def _strip_generated_backdrop(image_bytes: bytes) -> bytes:
     """Make the generated backdrop transparent, leaving just the companion.
 
@@ -1072,10 +1114,19 @@ async def _call_fal_avatar(prompt: str, seed: int) -> str:
 
     # Upload to Cloudinary for a permanent HTTPS URL
     storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
+    # format="png" is required, not cosmetic: _strip_generated_backdrop returns
+    # an alpha PNG, and Cloudinary's auto-detection is free to store it as JPEG,
+    # which cannot carry transparency at all. Existing avatars are .jpg for
+    # exactly that reason, which is why their locked silhouettes render as a
+    # featureless disc instead of the creature's outline.
+    #
+    # (`filename` is accepted by the storage backend but never forwarded to
+    # Cloudinary, so it cannot carry the format either.)
     result = await storage.upload(
         file_content=image_bytes,
-        filename=f"pet_avatar_{seed}.png",
+        filename=f"pet_avatar_{seed}",
         folder="nowry/pet_avatars",
+        format="png",
     )
     secure_url: str = result.get("secure_url") or result.get("url")
     if not secure_url:
@@ -1426,13 +1477,12 @@ async def grant_xp(user_id: str, amount: int) -> dict:
         if level_up and user_doc:
             pet_prefs: dict = user_doc.get("preferences", {}).get("pet", {})
             stored_avatar_url = pet_prefs.get("avatar_url")
-            stage_avatars: dict = pet_prefs.get("stage_avatars") or {}
             # Keyed off stage_avatars, not avatar_stage. avatar_stage is only
             # written by manual/evolution generation, so once look-ahead art
             # exists it goes stale — and a stale value made this flag fire for
             # a form that had ALREADY been generated, billing a second image
             # for art the user already owned. stage_avatars is authoritative.
-            already_generated = bool(stage_avatars.get(str(new_stage)))
+            already_generated = bool(_portraits_for(pet_prefs, new_stage))
             if stored_avatar_url and not already_generated:
                 await users_collection.update_one(
                     {"_id": ObjectId(user_id)},
@@ -2656,9 +2706,8 @@ async def get_agent_state(
     pet_prefs: dict = user.get("preferences", {}).get("pet", {})
     # A form generated ahead of time becomes the worn one the moment its stage
     # is reached — the reveal needs no extra request and no extra generation.
-    stage_avatars: dict = pet_prefs.get("stage_avatars") or {}
     current_stage_for_art: int = _level_to_stage(_calculate_level(xp))
-    avatar_url = stage_avatars.get(str(current_stage_for_art)) or pet_prefs.get("avatar_url")
+    avatar_url = _worn_portrait(pet_prefs, current_stage_for_art) or pet_prefs.get("avatar_url")
     avatar_stage = pet_prefs.get("avatar_stage")
     avatar_regen_pending = pet_prefs.get("avatar_regen_pending", False)
     animation_url = pet_prefs.get("animation_url")
@@ -2713,10 +2762,11 @@ class JourneyStage(BaseModel):
     reached_at: Optional[datetime] = None
     # Null once reached; otherwise how much XP still separates the user from it.
     xp_remaining: Optional[int] = None
-    # Real art for THIS form, when it exists. A look-ahead form has art before
-    # it is reached, so its locked silhouette is the true shape rather than a
-    # placeholder — and unlocking it is a genuine reveal, not a swap.
+    # The portrait this form is currently wearing.
     art_url: Optional[str] = None
+    # Every portrait generated for this form. More than one means the user can
+    # choose; a locked stage may hold one (the look-ahead) but cannot be worn.
+    portraits: list[str] = []
 
 
 class JourneyResponse(BaseModel):
@@ -2755,6 +2805,56 @@ async def _days_studied_together(user_id: str) -> int:
         return 0
 
 
+class WearPortraitRequest(BaseModel):
+    stage: int
+    portrait_url: str
+
+
+class WearPortraitResponse(BaseModel):
+    stage: int
+    avatar_url: str
+
+
+@router.put("/pet/portrait", response_model=WearPortraitResponse)
+async def wear_portrait(
+    body: WearPortraitRequest,
+    current_user: dict = Depends(get_firebase_user),
+) -> WearPortraitResponse:
+    """Choose which of a stage's generated portraits the companion wears.
+
+    Costs nothing and generates nothing — the whole point is that a user can
+    change their mind about a form they already paid for.
+
+    Only a stage the user has actually reached can be worn: a look-ahead
+    portrait exists before its stage does, and wearing it early would spoil
+    the reveal it was generated for.
+    """
+    user_id: str = current_user.get("user_id")
+    user = await users_collection.find_one(
+        {"_id": ObjectId(user_id)},
+        {"agent.xp": 1, "preferences.pet.stage_avatars": 1, "preferences.pet.worn_avatars": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    pet_prefs: dict = user.get("preferences", {}).get("pet", {})
+    current_stage: int = _level_to_stage(_calculate_level(user.get("agent", {}).get("xp", 0)))
+
+    if body.stage > current_stage:
+        raise HTTPException(status_code=403, detail="portrait_stage_not_reached")
+
+    # Only a portrait this user actually generated for this stage — never an
+    # arbitrary URL handed to us by the client.
+    if body.portrait_url not in _portraits_for(pet_prefs, body.stage):
+        raise HTTPException(status_code=404, detail="portrait_not_found")
+
+    await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {f"preferences.pet.worn_avatars.{body.stage}": body.portrait_url}},
+    )
+    return WearPortraitResponse(stage=body.stage, avatar_url=body.portrait_url)
+
+
 @router.get("/journey", response_model=JourneyResponse)
 async def get_journey(
     current_user: dict = Depends(get_firebase_user),
@@ -2770,7 +2870,7 @@ async def get_journey(
         {"_id": ObjectId(user_id)},
         {"agent.xp": 1, "preferences.pet.evolution_history": 1,
          "preferences.pet.avatar_url": 1, "preferences.pet.stage_avatars": 1,
-         "created_at": 1},
+         "preferences.pet.worn_avatars": 1, "created_at": 1},
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2788,7 +2888,7 @@ async def get_journey(
         if isinstance(entry, dict) and entry.get("stage") and entry.get("reached_at")
     }
 
-    stage_avatars: dict = user.get("preferences", {}).get("pet", {}).get("stage_avatars") or {}
+    journey_pet: dict = user.get("preferences", {}).get("pet", {})
 
     stages: list[JourneyStage] = []
     for stage in range(1, STAGE_COUNT + 1):
@@ -2803,7 +2903,8 @@ async def get_journey(
                 reached=reached,
                 reached_at=history.get(stage),
                 xp_remaining=None if reached else max(0, xp_required - xp),
-                art_url=stage_avatars.get(str(stage)),
+                art_url=_worn_portrait(journey_pet, stage),
+                portraits=_portraits_for(journey_pet, stage),
             )
         )
 
@@ -2963,14 +3064,13 @@ async def generate_avatar(
     current_stage: int = _level_to_stage(_calculate_level(xp))
     stage: int = current_stage
 
-    stage_avatars: dict = pet.get("stage_avatars") or {}
     if body.trigger == "next_stage":
         stage = current_stage + 1
         if stage > STAGE_COUNT:
             raise HTTPException(status_code=400, detail="avatar_arc_complete")
         # Idempotent by construction — no counter needed, and no way to spend
         # money twice on the same form.
-        if stage_avatars.get(str(stage)):
+        if _portraits_for(pet, stage):
             raise HTTPException(status_code=409, detail="avatar_stage_already_generated")
 
     # Build prompt
@@ -2997,10 +3097,16 @@ async def generate_avatar(
     # For manual trigger: count/month already written atomically in the reservation above.
     # For evolution trigger: count_increment = 0; normalise month field to current_month.
     now = datetime.now(timezone.utc)
-    # Every generated form is kept, keyed by stage: that is what lets the
-    # journey show real art for forms already earned instead of one image.
+    # Append rather than overwrite. Every portrait the user paid for is kept,
+    # so generating is purely additive and can never leave them worse off than
+    # before they pressed the button. Capped, and the newly generated one
+    # becomes the worn form.
+    existing_portraits = _portraits_for(pet, stage)
+    portraits = [*existing_portraits, avatar_url][-MAX_PORTRAITS_PER_STAGE:]
+
     persist_fields: dict = {
-        f"preferences.pet.stage_avatars.{stage}": avatar_url,
+        f"preferences.pet.stage_avatars.{stage}": portraits,
+        f"preferences.pet.worn_avatars.{stage}": avatar_url,
         "preferences.pet.avatar_generated_at": now,
     }
     if body.trigger != "next_stage":

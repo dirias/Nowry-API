@@ -3,13 +3,12 @@ Phase 7 — Smart Pet tier enforcement tests.
 Stubs written in Wave 0; implementations follow in Wave 2.
 """
 import sys
+
+from tests._stubs import stub_if_missing
 from unittest.mock import MagicMock, AsyncMock
 
 # Python 3.9 compatibility stubs for google-generativeai
-for mod in ["google.generativeai", "google.generativeai.types",
-            "google.generativeai.protos", "google.api_core.exceptions"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("google.generativeai", "google.generativeai.types", "google.generativeai.protos", "google.api_core.exceptions")
 
 # Phase 31: app.routers.agent also transitively imports slowapi (app.core.limiter),
 # langfuse, and app.auth.firebase_auth (which uses Python 3.10+ `dict | None` syntax
@@ -17,9 +16,7 @@ for mod in ["google.generativeai", "google.generativeai.types",
 # by the Phase 31 tests below, so they are stubbed the same way test_ai_magic.py /
 # test_tracing.py stub them for other routers (slowapi/limiter not installed locally;
 # firebase_auth needs a real-import bypass, not a functional mock).
-for mod in ["slowapi", "slowapi.util", "langfuse"]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+stub_if_missing("slowapi", "slowapi.util", "langfuse")
 
 if "app.core.limiter" not in sys.modules:
     _mock_limiter_mod = MagicMock()
