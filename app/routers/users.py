@@ -178,26 +178,6 @@ class NotificationPreferences(BaseModel):
     marketing: Optional[bool] = None
 
 
-class FavoriteArticle(BaseModel):
-    url: str
-    title: str
-    description: Optional[str] = None
-    urlToImage: Optional[str] = None
-    category: Optional[str] = None
-
-
-class UserPreferences(BaseModel):
-    interests: Optional[List[str]] = None
-    theme_color: Optional[str] = None
-    language: Optional[str] = None
-    pomodoro_work_minutes: Optional[int] = None
-    pomodoro_short_break_minutes: Optional[int] = None
-    pomodoro_long_break_minutes: Optional[int] = None
-    pomodoro_auto_start: Optional[bool] = None
-    pomodoro_enabled: Optional[bool] = None
-    favorite_news: Optional[List[FavoriteArticle]] = None
-
-
 class GeneralPreferencesUpdate(BaseModel):
     """
     All fields are optional — only fields present in the request payload are written.
@@ -274,6 +254,13 @@ class GeneralPreferencesUpdate(BaseModel):
         le=20,
         description="Number of questions per AI quiz session (5–20). Ignored for free-tier users.",
     )
+    # Pomodoro timer — stored under 'preferences.pomodoro'. The settings page
+    # sends these one key at a time through this same partial update.
+    pomodoro_enabled: bool | None = Field(default=None)
+    pomodoro_work_minutes: int | None = Field(default=None, ge=1, le=120)
+    pomodoro_short_break_minutes: int | None = Field(default=None, ge=1, le=60)
+    pomodoro_long_break_minutes: int | None = Field(default=None, ge=1, le=120)
+    pomodoro_auto_start: bool | None = Field(default=None)
 
 
 class GeneralPreferencesResponse(BaseModel):
@@ -308,6 +295,11 @@ class GeneralPreferencesResponse(BaseModel):
     agent_intervention_streak_milestone: bool = True
     # AI Quiz question count — always returned; effective value depends on tier (free=10 fixed).
     agent_ai_quiz_question_count: int = 10
+    pomodoro_enabled: bool = False
+    pomodoro_work_minutes: int = 25
+    pomodoro_short_break_minutes: int = 5
+    pomodoro_long_break_minutes: int = 15
+    pomodoro_auto_start: bool = False
     updated_at: datetime
 
     @field_validator('interests', mode='before')
@@ -679,6 +671,17 @@ async def update_notification_preferences(
     return {"message": "Notification preferences updated successfully"}
 
 
+def _pomodoro_response_fields(pomodoro_prefs: dict) -> dict:
+    """Map the stored `preferences.pomodoro` sub-document onto response fields."""
+    return {
+        "pomodoro_enabled": bool(pomodoro_prefs.get("enabled", False)),
+        "pomodoro_work_minutes": int(pomodoro_prefs.get("work_minutes", 25)),
+        "pomodoro_short_break_minutes": int(pomodoro_prefs.get("short_break_minutes", 5)),
+        "pomodoro_long_break_minutes": int(pomodoro_prefs.get("long_break_minutes", 15)),
+        "pomodoro_auto_start": bool(pomodoro_prefs.get("auto_start", False)),
+    }
+
+
 @router.get("/preferences/general", response_model=GeneralPreferencesResponse)
 async def get_general_preferences(
     current_user: dict = Depends(get_firebase_user),
@@ -691,6 +694,7 @@ async def get_general_preferences(
 
     general_prefs: dict = user.get("preferences", {}).get("general", {})
     agent_prefs: dict = user.get("preferences", {}).get("agent", {})
+    pomodoro_prefs: dict = user.get("preferences", {}).get("pomodoro", {})
     updated_at = general_prefs.get("updated_at", datetime.now(timezone.utc))
 
     return GeneralPreferencesResponse(
@@ -713,6 +717,7 @@ async def get_general_preferences(
         agent_intervention_re_engagement=bool(agent_prefs.get("intervention_re_engagement", True)),
         agent_intervention_streak_milestone=bool(agent_prefs.get("intervention_streak_milestone", True)),
         agent_ai_quiz_question_count=int(agent_prefs.get("ai_quiz_question_count", 10)),
+        **_pomodoro_response_fields(pomodoro_prefs),
         updated_at=updated_at,
     )
 
@@ -750,6 +755,13 @@ async def update_general_preferences(
         "agent_intervention_re_engagement":    "preferences.agent.intervention_re_engagement",
         "agent_intervention_streak_milestone": "preferences.agent.intervention_streak_milestone",
         "agent_ai_quiz_question_count":        "preferences.agent.ai_quiz_question_count",
+        # Pomodoro timer settings live under their own sub-key; PomodoroContext.js
+        # and AccountSettings.js both read `preferences.pomodoro.*`.
+        "pomodoro_enabled":                    "preferences.pomodoro.enabled",
+        "pomodoro_work_minutes":               "preferences.pomodoro.work_minutes",
+        "pomodoro_short_break_minutes":        "preferences.pomodoro.short_break_minutes",
+        "pomodoro_long_break_minutes":         "preferences.pomodoro.long_break_minutes",
+        "pomodoro_auto_start":                 "preferences.pomodoro.auto_start",
     }
     set_doc: dict = {"preferences.general.updated_at": updated_at}
     for field_name, db_path in field_map.items():
@@ -773,6 +785,7 @@ async def update_general_preferences(
 
     general_prefs: dict = result.get("preferences", {}).get("general", {})
     agent_prefs: dict = result.get("preferences", {}).get("agent", {})
+    pomodoro_prefs: dict = result.get("preferences", {}).get("pomodoro", {})
 
     return GeneralPreferencesResponse(
         language=general_prefs.get("language", "en"),
@@ -794,6 +807,7 @@ async def update_general_preferences(
         agent_intervention_re_engagement=bool(agent_prefs.get("intervention_re_engagement", True)),
         agent_intervention_streak_milestone=bool(agent_prefs.get("intervention_streak_milestone", True)),
         agent_ai_quiz_question_count=int(agent_prefs.get("ai_quiz_question_count", 10)),
+        **_pomodoro_response_fields(pomodoro_prefs),
         updated_at=general_prefs.get("updated_at", updated_at),
     )
 
