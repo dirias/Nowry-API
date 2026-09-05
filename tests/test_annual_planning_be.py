@@ -603,3 +603,167 @@ async def test_close_quarter_routine_count(mock_firebase_user):
     saved_doc = mock_qr.insert_one.call_args[0][0]
     assert saved_doc["routines_summary"]["active_days"] == 1
     assert saved_doc["routines_summary"]["total_items_checked"] == 2
+
+
+# ---------------------------------------------------------------------------
+# ADR-015 / PRIO-002 — completing a task-linked priority carries its task
+# ---------------------------------------------------------------------------
+
+def _fake_agent_module():
+    """Stand-in for app.routers.agent so the lazy XP import never loads the
+    real module (which drags in the LLM client)."""
+    agent = MagicMock()
+    agent.grant_xp = AsyncMock(return_value={})
+    agent.XP_PER_TASK_COMPLETE = 10
+    return agent
+
+
+def _task_linked_priority(priority_id: str, task_id: str):
+    return {
+        **make_priority(is_completed=False, order=0),
+        "_id": ObjectId(priority_id),
+        "annual_plan_id": PLAN_ID,
+        "linked_entity_type": "task",
+        "linked_entity_id": task_id,
+    }
+
+
+def _matched():
+    result = MagicMock()
+    result.matched_count = 1
+    return result
+
+
+async def _complete_priority(existing_doc, payload, task_doc, mock_firebase_user):
+    """Runs update_priority with every collection mocked; returns (tasks mock, agent stub)."""
+    from app.routers.annual_planning import update_priority
+
+    agent = _fake_agent_module()
+    with patch("app.routers.annual_planning.annual_plans_collection") as mock_plans, \
+         patch("app.routers.annual_planning.priorities_collection") as mock_pri, \
+         patch("app.routers.annual_planning.tasks_collection") as mock_tasks, \
+         patch.dict(sys.modules, {"app.routers.agent": agent}):
+        mock_plans.find_one = AsyncMock(return_value=make_plan())
+        mock_pri.find_one = AsyncMock(return_value=existing_doc)
+        mock_pri.update_one = AsyncMock(return_value=_matched())
+        mock_tasks.find_one = AsyncMock(return_value=task_doc)
+        mock_tasks.update_one = AsyncMock(return_value=_matched())
+
+        await update_priority(
+            id=str(existing_doc["_id"]),
+            priority_update=payload,
+            current_user=mock_firebase_user,
+        )
+    return mock_tasks, agent
+
+
+@pytest.mark.asyncio
+async def test_complete_task_linked_priority_completes_task_and_awards_xp(mock_firebase_user):
+    """ADR-015 point 4: the task follows the priority, and the task's XP is
+    awarded once because the task was not complete before."""
+    task_id = str(ObjectId())
+    existing = _task_linked_priority(str(ObjectId()), task_id)
+    task_doc = {"_id": ObjectId(task_id), "user_id": USER_ID, "is_completed": False, "deleted_at": None}
+
+    mock_tasks, agent = await _complete_priority(existing, {"is_completed": True}, task_doc, mock_firebase_user)
+
+    mock_tasks.find_one.assert_awaited_once()
+    task_set = mock_tasks.update_one.call_args[0][1]["$set"]
+    assert task_set["is_completed"] is True
+    agent.grant_xp.assert_awaited_once_with(USER_ID, 10)
+
+
+@pytest.mark.asyncio
+async def test_complete_task_linked_priority_is_noop_when_task_already_done(mock_firebase_user):
+    """Idempotent: a task that is already complete is neither rewritten nor re-awarded."""
+    task_id = str(ObjectId())
+    existing = _task_linked_priority(str(ObjectId()), task_id)
+    task_doc = {"_id": ObjectId(task_id), "user_id": USER_ID, "is_completed": True, "deleted_at": None}
+
+    mock_tasks, agent = await _complete_priority(existing, {"is_completed": True}, task_doc, mock_firebase_user)
+
+    mock_tasks.update_one.assert_not_called()
+    agent.grant_xp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_uncomplete_task_linked_priority_reverts_task_without_xp(mock_firebase_user):
+    task_id = str(ObjectId())
+    existing = {**_task_linked_priority(str(ObjectId()), task_id), "is_completed": True}
+    task_doc = {"_id": ObjectId(task_id), "user_id": USER_ID, "is_completed": True, "deleted_at": None}
+
+    mock_tasks, agent = await _complete_priority(existing, {"is_completed": False}, task_doc, mock_firebase_user)
+
+    task_set = mock_tasks.update_one.call_args[0][1]["$set"]
+    assert task_set["is_completed"] is False
+    agent.grant_xp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_complete_priority_skips_task_owned_by_someone_else(mock_firebase_user):
+    """Ownership is transitive through the priority, but a linked id that points
+    at another user's task must still never be written."""
+    task_id = str(ObjectId())
+    existing = _task_linked_priority(str(ObjectId()), task_id)
+    task_doc = {"_id": ObjectId(task_id), "user_id": "someone-else", "is_completed": False, "deleted_at": None}
+
+    mock_tasks, agent = await _complete_priority(existing, {"is_completed": True}, task_doc, mock_firebase_user)
+
+    mock_tasks.update_one.assert_not_called()
+    agent.grant_xp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_complete_priority_with_missing_task_is_silent(mock_firebase_user):
+    task_id = str(ObjectId())
+    existing = _task_linked_priority(str(ObjectId()), task_id)
+
+    mock_tasks, agent = await _complete_priority(existing, {"is_completed": True}, None, mock_firebase_user)
+
+    mock_tasks.update_one.assert_not_called()
+    agent.grant_xp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_complete_goal_linked_priority_never_touches_tasks(mock_firebase_user):
+    """A goal-linked priority completes on its own: no task lookup, no goal write (point 4)."""
+    existing = {
+        **make_priority(is_completed=False, order=0),
+        "annual_plan_id": PLAN_ID,
+        "linked_entity_type": "goal",
+        "linked_entity_id": str(ObjectId()),
+    }
+
+    mock_tasks, agent = await _complete_priority(existing, {"is_completed": True}, None, mock_firebase_user)
+
+    mock_tasks.find_one.assert_not_called()
+    mock_tasks.update_one.assert_not_called()
+    agent.grant_xp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_patch_priority_is_completed_rejects_non_bool(mock_firebase_user):
+    """The same guard is_active has: a stringified boolean is a 400, never a coerced write."""
+    from app.routers.annual_planning import update_priority
+    from fastapi import HTTPException
+
+    existing = _task_linked_priority(str(ObjectId()), str(ObjectId()))
+
+    with patch("app.routers.annual_planning.annual_plans_collection") as mock_plans, \
+         patch("app.routers.annual_planning.priorities_collection") as mock_pri, \
+         patch("app.routers.annual_planning.tasks_collection") as mock_tasks:
+        mock_plans.find_one = AsyncMock(return_value=make_plan())
+        mock_pri.find_one = AsyncMock(return_value=existing)
+        mock_pri.update_one = AsyncMock()
+        mock_tasks.find_one = AsyncMock()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await update_priority(
+                id=str(existing["_id"]),
+                priority_update={"is_completed": "true"},
+                current_user=mock_firebase_user,
+            )
+
+    assert exc_info.value.status_code == 400
+    mock_pri.update_one.assert_not_called()
+    mock_tasks.find_one.assert_not_called()

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.Task import Task
-from app.config.database import db
+from app.config.database import db, priorities_collection
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
 
@@ -22,6 +22,17 @@ logger = get_logger(__name__)
 
 def get_tasks_collection() -> Collection:
     return db.get_collection("tasks")
+
+
+async def sync_linked_priorities_completion(task_id: str, is_completed: bool) -> None:
+    """ADR-015 point 4, task-to-priority: every yearly priority linked to this
+    task follows its completion state. Scoped by linked id *and* type, so goal-
+    and routine-linked priorities are never touched."""
+    now = datetime.now(timezone.utc)
+    await priorities_collection.update_many(
+        {"linked_entity_id": task_id, "linked_entity_type": "task"},
+        {"$set": {"is_completed": is_completed, "completed_at": now if is_completed else None, "updated_at": now}},
+    )
 
 
 @router.post("/", summary="Create a new task", response_model=Task)
@@ -112,6 +123,10 @@ async def update_task(
 
     # Update the task
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
+
+    # Keep any priority linked to this task in step (ADR-015 point 4)
+    if "is_completed" in updates and bool(is_now_completed) != bool(was_completed):
+        await sync_linked_priorities_completion(id, bool(is_now_completed))
 
     # Award XP when a task is marked complete for the first time
     if just_completed:

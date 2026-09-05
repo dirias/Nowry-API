@@ -17,6 +17,7 @@ from app.config.database import (
     daily_routines_collection,
     quarter_reports_collection,
     books_collection,
+    tasks_collection,
 )
 from app.models.AnnualPlan import AnnualPlan
 from app.models.FocusArea import FocusArea
@@ -80,6 +81,33 @@ async def verify_priority_ownership(priority_id: str, user_id: str):
     if not p:
         raise HTTPException(status_code=404, detail="Priority not found")
     await verify_annual_plan_ownership(p["annual_plan_id"], user_id)
+
+
+async def sync_linked_task_completion(task_id: str, is_completed: bool, user_id: str) -> None:
+    """ADR-015 point 4: a task-linked priority and its task complete together.
+
+    No-op when the task is gone, belongs to someone else, or is already in the
+    requested state. Awards the task's completion XP once, exactly as
+    PATCH /tasks does, so finishing the work from the planning side is worth
+    the same as finishing it from the task list.
+    """
+    from bson.errors import InvalidId
+    try:
+        task_obj_id = ObjectId(task_id)
+    except (InvalidId, TypeError):
+        return
+    task = await tasks_collection.find_one({"_id": task_obj_id, "deleted_at": None})
+    if not task or str(task.get("user_id")) != str(user_id):
+        return
+    if bool(task.get("is_completed", False)) == is_completed:
+        return
+    await tasks_collection.update_one(
+        {"_id": task_obj_id},
+        {"$set": {"is_completed": is_completed, "updated_at": datetime.now(timezone.utc)}},
+    )
+    if is_completed:
+        from app.routers.agent import grant_xp, XP_PER_TASK_COMPLETE
+        await grant_xp(user_id, XP_PER_TASK_COMPLETE)
 
 
 router = APIRouter(
@@ -838,8 +866,12 @@ async def update_priority(
     if "deadline" in priority_update:
         update_data["deadline"] = priority_update["deadline"]
     if "is_completed" in priority_update:
-        update_data["is_completed"] = priority_update["is_completed"]
-        update_data["completed_at"] = datetime.now(timezone.utc) if priority_update["is_completed"] else None
+        # Same rule as is_active below: a real boolean or nothing (ADR-015).
+        raw_is_completed = priority_update["is_completed"]
+        if not isinstance(raw_is_completed, bool):
+            raise HTTPException(status_code=400, detail="is_completed must be a boolean")
+        update_data["is_completed"] = raw_is_completed
+        update_data["completed_at"] = datetime.now(timezone.utc) if raw_is_completed else None
     if "is_active" in priority_update:
         # No completed_at-style timestamp needed — is_active is a manual "not right now"
         # toggle (D-04), not a completion event. Reject non-boolean values outright
@@ -870,6 +902,12 @@ async def update_priority(
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Priority not found")
+
+    # A task-linked priority carries its task with it (ADR-015 point 4). Goal-
+    # linked priorities are deliberately one-way: a goal has several priorities,
+    # so one finishing says nothing about the goal.
+    if "is_completed" in update_data and existing.get("linked_entity_type") == "task" and existing.get("linked_entity_id"):
+        await sync_linked_task_completion(existing["linked_entity_id"], update_data["is_completed"], user_id)
 
     return await priorities_collection.find_one({"_id": obj_id})
 
