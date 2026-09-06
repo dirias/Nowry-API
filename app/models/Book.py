@@ -34,6 +34,10 @@ class Book(BaseModel, SoftDeleteMixin):
     page_count: Optional[int] = None        # imports only
     word_count: Optional[int] = None
     section_count: Optional[int] = None
+    # docs/prd-books-library.md D2 / FR-001: where the reader was. The editor writes them,
+    # debounced; a position-only update never counts as an edit (updated_at untouched).
+    last_section: Optional[str] = None      # heading text of the section the reader was under
+    reading_position: Optional[int] = None  # active page, imports only
 
     is_public: bool = False
     published_at: Optional[datetime] = None

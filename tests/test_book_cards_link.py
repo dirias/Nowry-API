@@ -259,3 +259,71 @@ def test_book_summary_keeps_the_computed_counts():
     summary = BookSummary(title="N3", cards=18, due=4, sections_with_cards=3)
     dumped = summary.model_dump()
     assert (dumped["cards"], dumped["due"], dumped["sections_with_cards"]) == (18, 4, 3)
+
+
+
+# --- BOOK-005: the document remembers where you were (docs/prd-books-library.md FR-001) ----------
+
+
+def _edit_fakes(existing: dict):
+    """The collection `edit_book` writes to: records the $set and hands back the merged document."""
+    from unittest.mock import AsyncMock
+
+    col = MagicMock()
+    col.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+    col.find_one = AsyncMock(return_value={**existing, "_id": existing["_id"]})
+    return col
+
+
+@pytest.mark.asyncio
+async def test_a_position_only_update_stores_the_pointer_and_leaves_updated_at_alone():
+    from app.models.Book import Book
+    from app.routers.books import edit_book
+
+    col = _edit_fakes(BOOK)
+    await edit_book(
+        BOOK_ID, Book(last_section="Particles"), MagicMock(), books_collection=col, existing_book=BOOK, current_user={"uid": OWNER, "user_id": OWNER}
+    )
+    written = col.update_one.await_args.args[1]["$set"]
+    assert written == {"last_section": "Particles"}
+
+    col = _edit_fakes(BOOK)
+    await edit_book(
+        BOOK_ID, Book(reading_position=140), MagicMock(), books_collection=col, existing_book=BOOK, current_user={"uid": OWNER, "user_id": OWNER}
+    )
+    assert col.update_one.await_args.args[1]["$set"] == {"reading_position": 140}
+
+
+@pytest.mark.asyncio
+async def test_an_edit_that_touches_content_still_bumps_updated_at():
+    from app.models.Book import Book
+    from app.routers.books import edit_book
+
+    col = _edit_fakes(BOOK)
+    with patch("app.routers.books.index_book", create=True):
+        await edit_book(
+            BOOK_ID, Book(title="N3 Grammar (2nd ed.)"), MagicMock(), books_collection=col, existing_book=BOOK, current_user={"uid": OWNER, "user_id": OWNER}
+        )
+    written = col.update_one.await_args.args[1]["$set"]
+    assert written["title"] == "N3 Grammar (2nd ed.)" and "updated_at" in written
+
+
+def test_book_summary_carries_the_pointer():
+    from app.models.Book import BookSummary
+
+    dumped = BookSummary(title="Deep Work", last_section=None, reading_position=140).model_dump()
+    assert dumped["reading_position"] == 140 and dumped["last_section"] is None
+
+
+@pytest.mark.asyncio
+async def test_saving_content_recomputes_words_and_sections():
+    from app.models.Book import Book
+    from app.routers.books import edit_book
+
+    col = _edit_fakes(BOOK)
+    with patch("app.utils.book_rag.index_book", create=True):
+        await edit_book(
+            BOOK_ID, Book(full_content=BOOK["full_content"]), MagicMock(), books_collection=col, existing_book=BOOK, current_user={"uid": OWNER, "user_id": OWNER}
+        )
+    written = col.update_one.await_args.args[1]["$set"]
+    assert written["section_count"] == 2 and written["word_count"] > 2 * MIN_SECTION_WORDS and "updated_at" in written

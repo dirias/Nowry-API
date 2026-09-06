@@ -97,6 +97,9 @@ async def create_book(
     raise HTTPException(status_code=500, detail="Failed to create book")
 
 
+POSITION_FIELDS = {"last_section", "reading_position"}
+
+
 @router.put("/edit/{book_id}", summary="Edit a book by ID", response_model=Book)
 async def edit_book(
     book_id: str,
@@ -111,15 +114,23 @@ async def edit_book(
     
     # Remove immutable/system fields that shouldn't be updated by user.
     # forked_from is permanently set at fork time and must never be overwritten.
-    fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from"]
+    fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from", "source", "page_count"]
     for field in fields_to_remove:
         update_data.pop(field, None)
+
+    # docs/prd-book-cards.md E5 / prd-books-library.md D6: words and sections are computed on
+    # save, so the library never parses content to draw a row.
+    if update_data.get("full_content"):
+        content = update_data["full_content"]
+        update_data.update(document_stats(parse_lexical(content), content))
     
     if not update_data:
         raise HTTPException(status_code=400, detail="No data provided for update")
 
-    # Add updated_at timestamp
-    update_data["updated_at"] = datetime.now()
+    # docs/prd-books-library.md FR-001: a scroll is not an edit. The pointer fields update on
+    # their own without bumping updated_at, so "edited Yesterday" keeps meaning edited.
+    if not set(update_data) <= POSITION_FIELDS:
+        update_data["updated_at"] = datetime.now()
 
     res = await books_collection.update_one(
         {"_id": ObjectId(existing_book["_id"]) if len(existing_book["_id"]) == 24 else existing_book["_id"]},
