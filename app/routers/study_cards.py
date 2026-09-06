@@ -236,8 +236,10 @@ def _group_stage(now_dt: datetime, key_expr) -> dict:
 
 
 def _summary_row(row: dict) -> dict:
-    decks = {str(d) for d in row.get("deck_ids", []) if d is not None}
-    return {"cards": row.get("cards", 0), "decks": len(decks), "due": row.get("due", 0), "new": row.get("new", 0)}
+    decks = sorted({str(d) for d in row.get("deck_ids", []) if d is not None})
+    # `deck_ids` lets the study centre list a group's decks as rows without a
+    # second query; capped so a group over many decks stays a small payload.
+    return {"cards": row.get("cards", 0), "decks": len(decks), "deck_ids": decks[:50], "due": row.get("due", 0), "new": row.get("new", 0)}
 
 
 def _local_day_bounds_utc(tz_name: str, days: int) -> list:
@@ -308,11 +310,11 @@ async def get_groups(
             {"$match": {**scope, **narrow}},
             _group_stage(now_dt, None),
         ]).to_list(length=1)
-        return _summary_row(rows[0]) if rows else {"cards": 0, "decks": 0, "due": 0, "new": 0}
+        return _summary_row(rows[0]) if rows else {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0}
 
     marked = await summarise({"marked_at": {"$ne": None}})
     struggling_ids = _object_ids((await _struggling_cards(user_id, now_dt)).keys())
-    struggling = await summarise({"_id": {"$in": struggling_ids}}) if struggling_ids else {"cards": 0, "decks": 0, "due": 0, "new": 0}
+    struggling = await summarise({"_id": {"$in": struggling_ids}}) if struggling_ids else {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0}
 
     return {
         "system": [
