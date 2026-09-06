@@ -5,7 +5,8 @@ from bson import ObjectId
 from pymongo.collection import Collection
 from app.models.StudyCard import StudyCard, StudyCardUpdate
 from app.models.deck_config import resolve_deck_budget
-from app.config.database import cards_collection, decks_collection, books_collection
+from app.config.database import cards_collection, decks_collection, books_collection, study_sessions_collection
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
 
@@ -55,8 +56,15 @@ async def _select_session_cards(
     review_cap: int,
     now_dt: datetime,
     today_start: datetime,
+    narrow: Optional[dict] = None,
 ) -> tuple[list, list]:
     """Pick the new + review cards for a study session, locking today's plan.
+
+    `narrow` (STUDY-001, ADR-014 point 1 server-side) restricts the POOL the
+    budgets draw from — `{"tags": {"$in": [...]}}` or `{"_id": {"$in": [...]}}`
+    — so a narrowed session is still SM-2's own selection for those cards. It
+    is applied to the sticky-pool lookups and the fresh top-up alike, so a
+    capped session never introduces a new card the uncapped one would not.
 
     New-card selection is sticky for the day:
       1. Cards already introduced today (`introduced_at >= today_start`) are the
@@ -70,7 +78,7 @@ async def _select_session_cards(
     Review cards keep the simple "due now, capped by remaining daily budget"
     behaviour — they are intrinsically deterministic by `next_review`.
     """
-    base_match = {"user_id": user_id, "deleted_at": None, "$or": deck_or}
+    base_match = {"user_id": user_id, "deleted_at": None, "$or": deck_or, **(narrow or {})}
 
     # 1. Calculate how many NEW cards were studied today to adjust the remaining budget
     new_studied_today = await collection.count_documents({
@@ -100,6 +108,7 @@ async def _select_session_cards(
             "user_id": user_id,
             "deleted_at": None,
             "last_reviewed": None,
+            **(narrow or {}),
             "$and": [
                 {"$or": deck_or},
                 {"$or": [
@@ -150,6 +159,168 @@ def _get_deck_budget(deck_doc: dict) -> tuple[int, int]:
     """
     _, new_per_day, max_reviews = resolve_deck_budget(deck_doc)
     return new_per_day, max_reviews
+
+
+# ---------------------------------------------------------------------------
+# STUDY-001 — groups, forecast and narrowed sessions (docs/prd-study-center.md,
+# docs/architecture.md addendum)
+# ---------------------------------------------------------------------------
+
+STRUGGLING_WINDOW_DAYS = 14
+STRUGGLING_GRADES = ("again", "hard")
+GROUP_KEYS = ("marked", "struggling")
+
+
+async def _active_deck_or(user_id: str) -> list:
+    """The `$or` clause that scopes a card query to the user's active decks
+    (and orphans). Mirrors the inline version in list_study_cards / get_card_tags
+    so every count on the study centre agrees with the list it summarises.
+    perf(33): the 500-deck cap bounds one user's own deck list, not a fan-out."""
+    active_decks = await decks_collection.find(
+        {"user_id": user_id, "deleted_at": None}, {"_id": 1}
+    ).to_list(length=500)
+    active_deck_ids: list = []
+    for d in active_decks:
+        active_deck_ids.append(d["_id"])
+        active_deck_ids.append(str(d["_id"]))
+    return [
+        {"deck_id": None},
+        {"deck_id": {"$exists": False}},
+        {"deck_id": {"$in": active_deck_ids}},
+    ]
+
+
+async def _struggling_cards(user_id: str, now_dt: datetime) -> dict:
+    """card_id (str) -> {"last_grade", "last_graded_at"} for every card graded
+    `again` or `hard` in a logged session within the window (PRD D8). Grades
+    live on study_sessions.cards, not on the card, so the answer is a session
+    aggregation; the window bounds it to one user's recent sessions (≤ 2000
+    distinct cards, which is a fortnight of heavy use)."""
+    since = now_dt - timedelta(days=STRUGGLING_WINDOW_DAYS)
+    pipeline = [
+        {"$match": {"user_id": user_id, "deleted_at": None, "completed_at": {"$gte": since}}},
+        {"$sort": {"completed_at": -1}},
+        {"$unwind": "$cards"},
+        {"$match": {"cards.grade": {"$in": list(STRUGGLING_GRADES)}}},
+        {"$group": {
+            "_id": "$cards.card_id",
+            "last_grade": {"$first": "$cards.grade"},
+            "last_graded_at": {"$first": "$completed_at"},
+        }},
+        {"$limit": 2000},
+    ]
+    rows = await study_sessions_collection.aggregate(pipeline).to_list(length=2000)
+    return {
+        str(row["_id"]): {"last_grade": row["last_grade"], "last_graded_at": row["last_graded_at"]}
+        for row in rows
+        if row.get("_id")
+    }
+
+
+def _object_ids(ids) -> list:
+    return [ObjectId(i) for i in ids if ObjectId.is_valid(str(i))]
+
+
+def _group_stage(now_dt: datetime, key_expr) -> dict:
+    """One $group that yields cards / decks / due / new for a set of cards.
+    due = reviewed before and next_review ≤ now; new = never reviewed. The two
+    never overlap, so the study centre can add them for "Study · N"."""
+    return {"$group": {
+        "_id": key_expr,
+        "cards": {"$sum": 1},
+        "deck_ids": {"$addToSet": "$deck_id"},
+        "due": {"$sum": {"$cond": [
+            {"$and": [{"$ne": ["$last_reviewed", None]}, {"$lte": ["$next_review", now_dt]}]}, 1, 0]}},
+        "new": {"$sum": {"$cond": [{"$eq": [{"$ifNull": ["$last_reviewed", None]}, None]}, 1, 0]}},
+    }}
+
+
+def _summary_row(row: dict) -> dict:
+    decks = {str(d) for d in row.get("deck_ids", []) if d is not None}
+    return {"cards": row.get("cards", 0), "decks": len(decks), "due": row.get("due", 0), "new": row.get("new", 0)}
+
+
+def _local_day_bounds_utc(tz_name: str, days: int) -> list:
+    """UTC boundaries [tomorrow_start, +1d, …] for `days` local days starting
+    tomorrow, as naive UTC datetimes (the collection stores naive UTC). Today is
+    deliberately absent — it is summary.due_today in /statistics, one owner."""
+    try:
+        user_tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError):
+        raise HTTPException(status_code=400, detail=f"Invalid timezone: {tz_name!r}")
+    today_local = datetime.now(tz=user_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    bounds = []
+    for i in range(1, days + 2):
+        local = today_local + timedelta(days=i)
+        bounds.append(local.astimezone(timezone.utc).replace(tzinfo=None))
+    return bounds
+
+
+@router.get("/forecast", summary="Due counts per local day for the coming days (STUDY-001)")
+async def get_forecast(
+    days: int = Query(7, ge=1, le=30),
+    tz: str = Query("UTC", description="IANA timezone name, e.g. America/New_York"),
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> dict:
+    user_id = user.get("user_id")
+    bounds = _local_day_bounds_utc(tz, days)
+    pipeline = [
+        {"$match": {
+            "user_id": user_id,
+            "deleted_at": None,
+            "last_reviewed": {"$ne": None},
+            "next_review": {"$gte": bounds[0], "$lt": bounds[-1]},
+            "$or": await _active_deck_or(user_id),
+        }},
+        {"$bucket": {"groupBy": "$next_review", "boundaries": bounds, "default": "other", "output": {"due": {"$sum": 1}}}},
+    ]
+    rows = await collection.aggregate(pipeline).to_list(length=days + 1)
+    by_bound = {row["_id"]: row["due"] for row in rows if row["_id"] != "other"}
+    user_tz = ZoneInfo(tz)
+    out = []
+    for i in range(days):
+        local_date = (bounds[i].replace(tzinfo=timezone.utc).astimezone(user_tz)).date().isoformat()
+        out.append({"date": local_date, "due": by_bound.get(bounds[i], 0)})
+    return {"days": out, "total": sum(d["due"] for d in out)}
+
+
+@router.get("/groups", summary="Tags and system groups with due and new counts (STUDY-001)")
+async def get_groups(
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> dict:
+    user_id = user.get("user_id")
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    scope = {"user_id": user_id, "deleted_at": None, "$or": await _active_deck_or(user_id)}
+
+    tag_rows = await collection.aggregate([
+        {"$match": {**scope, "tags": {"$exists": True, "$ne": []}}},
+        {"$unwind": "$tags"},
+        _group_stage(now_dt, "$tags"),
+        {"$sort": {"due": -1, "cards": -1, "_id": 1}},
+        {"$limit": 500},
+    ]).to_list(length=500)
+    tags = [{"tag": row["_id"], **_summary_row(row)} for row in tag_rows]
+
+    async def summarise(narrow: dict) -> dict:
+        rows = await collection.aggregate([
+            {"$match": {**scope, **narrow}},
+            _group_stage(now_dt, None),
+        ]).to_list(length=1)
+        return _summary_row(rows[0]) if rows else {"cards": 0, "decks": 0, "due": 0, "new": 0}
+
+    marked = await summarise({"marked_at": {"$ne": None}})
+    struggling_ids = _object_ids((await _struggling_cards(user_id, now_dt)).keys())
+    struggling = await summarise({"_id": {"$in": struggling_ids}}) if struggling_ids else {"cards": 0, "decks": 0, "due": 0, "new": 0}
+
+    return {
+        "system": [
+            {"key": "marked", **marked},
+            {"key": "struggling", **struggling, "window_days": STRUGGLING_WINDOW_DAYS},
+        ],
+        "tags": tags,
+    }
 
 
 @router.post("", summary="Create a new study card", response_model=StudyCard)
@@ -504,10 +675,20 @@ async def get_card_tags(
 
 @router.get("/daily-review", summary="Get today's locked daily review session across all decks")
 async def get_daily_review_cards(
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Cap the session; due cards first (Quick 10)"),
+    tags: Optional[List[str]] = Query(None, description="Narrow the pool to cards carrying any of these tags"),
+    group: Optional[str] = Query(None, pattern="^(struggling)$", description="Only a group the scheduler may read (ADR-014 point 2); anything else is a 422"),
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ) -> dict:
     """Aggregate today's session across every active deck.
+
+    `tags` / `group` narrow the pool before the per-deck budgets apply
+    (STUDY-001, ADR-014 point 1). The `group` pattern admits only groups the
+    scheduler may read, so an axis it must not see (ADR-014 point 2, ADR-010)
+    never reaches this function — validation refuses it first. `limit` slices
+    the selection already made — due cards first, then new — so a capped
+    session never introduces more new cards than the full one.
 
     Each deck contributes its own locked new-card pool (capped at the deck's
     `new_per_day`) and its own remaining review budget. The selection is sticky
@@ -517,6 +698,12 @@ async def get_daily_review_cards(
     user_id = user.get("user_id")
     now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    narrow: dict = {}
+    if tags:
+        narrow["tags"] = {"$in": tags}
+    if group == "struggling":
+        narrow["_id"] = {"$in": _object_ids((await _struggling_cards(user_id, now_dt)).keys())}
 
     # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
     # doc per deck), not a per-deck card fan-out; a single user's deck count
@@ -543,9 +730,16 @@ async def get_daily_review_cards(
             review_cap=review_cap,
             now_dt=now_dt,
             today_start=today_start,
+            narrow=narrow or None,
         )
         all_new.extend(new_raw)
         all_review.extend(review_raw)
+
+    if limit is not None and len(all_new) + len(all_review) > limit:
+        # Due first, then new, on the pool already selected and stamped above.
+        keep_review = all_review[:limit]
+        keep_new = all_new[: max(0, limit - len(keep_review))]
+        all_review, all_new = keep_review, keep_new
 
     cards = all_new + all_review
     for c in cards:
@@ -579,11 +773,19 @@ async def list_study_cards(
     deck_id: Optional[str] = Query(None),
     due_only: bool = Query(False),
     marked_only: bool = Query(False),
+    group: Optional[str] = Query(None, pattern="^(marked|struggling)$"),
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ) -> dict:
     user_id = user.get("user_id")
     logger.info(f"Listing study cards for user: {user_id}")
+    # STUDY-001: a system group is a narrowing like `tags`. Struggling carries
+    # its grades back onto the cards it returns (PRD FR-003).
+    struggling: dict = {}
+    if group == "marked":
+        marked_only = True
+    elif group == "struggling":
+        struggling = await _struggling_cards(user_id, datetime.now(timezone.utc).replace(tzinfo=None))
 
     query: dict = {
         "user_id": user_id,
@@ -620,6 +822,9 @@ async def list_study_cards(
 
     if tags:
         query["tags"] = {"$in": tags}
+
+    if group == "struggling":
+        query["_id"] = {"$in": _object_ids(struggling.keys())}
 
     if marked_only:
         # A plain top-level key by design: the deck, search and due clauses all
@@ -704,6 +909,9 @@ async def list_study_cards(
             c["deck_id"] = str(c.get("deck_id"))
         if c.get("user_id"):
             c["user_id"] = str(c.get("user_id"))
+        if struggling and c["_id"] in struggling:
+            c["last_grade"] = struggling[c["_id"]]["last_grade"]
+            c["last_graded_at"] = struggling[c["_id"]]["last_graded_at"]
 
     return {
         "cards": cards,
