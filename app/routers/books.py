@@ -242,6 +242,8 @@ async def get_all_books(
     for book in books:
         book["_id"] = str(book["_id"])
 
+    await _backfill_document_stats(books_collection, books)
+
     # docs/prd-book-cards.md D6 / FR-004: cards · due · sections_with_cards per book from
     # ONE aggregation over this user's linked cards, so a row never costs a request.
     counts = await _card_counts_for_books(user_id, [b["_id"] for b in books])
@@ -253,6 +255,23 @@ async def get_all_books(
         book.setdefault("source", "written")
 
     return books
+
+
+BACKFILL_PER_REQUEST = 20
+
+
+async def _backfill_document_stats(books_collection: Collection, books: list[dict]) -> None:
+    """Documents saved before the stats existed (BOOK-001/005) have no word or section count, and
+    the library would draw them thin until their next save. Compute and store the stats for up to
+    BACKFILL_PER_REQUEST such documents per list request — once each, then the row is true."""
+    missing = [b for b in books if b.get("word_count") is None][:BACKFILL_PER_REQUEST]
+    for book in missing:
+        oid = ObjectId(book["_id"]) if ObjectId.is_valid(book["_id"]) else book["_id"]
+        full = await books_collection.find_one({"_id": oid}, {"full_content": 1})
+        content = (full or {}).get("full_content") or ""
+        stats = document_stats(parse_lexical(content), content)
+        book.update(stats)
+        await books_collection.update_one({"_id": oid}, {"$set": stats})
 
 
 async def _card_counts_for_books(user_id: str, book_ids: list[str]) -> dict:

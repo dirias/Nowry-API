@@ -72,6 +72,12 @@ class FakeCollection:
         self.pipelines.append(pipeline)
         return FakeCursor(self.aggregate_rows)
 
+    async def find_one(self, query, projection=None):
+        return next((r for r in self.find_rows if r.get("_id") == query.get("_id") or str(r.get("_id")) == str(query.get("_id"))), None)
+
+    async def update_one(self, query, update):
+        self.updates = getattr(self, "updates", []) + [(query, update)]
+
 
 # ---------------------------------------------------------------------------
 # FR-002 — sections with their card counts
@@ -327,3 +333,18 @@ async def test_saving_content_recomputes_words_and_sections():
         )
     written = col.update_one.await_args.args[1]["$set"]
     assert written["section_count"] == 2 and written["word_count"] > 2 * MIN_SECTION_WORDS and "updated_at" in written
+
+
+@pytest.mark.asyncio
+async def test_the_list_backfills_missing_stats_once_per_document():
+    from unittest.mock import AsyncMock
+    from app.routers.books import _backfill_document_stats
+
+    col = MagicMock()
+    col.find_one = AsyncMock(return_value={"_id": BOOK_ID, "full_content": BOOK["full_content"]})
+    col.update_one = AsyncMock()
+    rows = [{"_id": BOOK_ID, "title": "N3"}, {"_id": "x", "title": "Done", "word_count": 12, "section_count": 1}]
+    await _backfill_document_stats(col, rows)
+    assert rows[0]["section_count"] == 2 and rows[0]["word_count"] > 0
+    col.update_one.assert_awaited_once()
+    assert col.update_one.await_args.args[1]["$set"]["section_count"] == 2
