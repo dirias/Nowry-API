@@ -171,6 +171,29 @@ STRUGGLING_GRADES = ("again", "hard")
 GROUP_KEYS = ("marked", "struggling")
 
 
+
+async def _annotate_source_books(cards: list) -> list:
+    """docs/prd-book-cards.md D12/D13: a card outlives its document. `source_book_deleted` says
+    whether the link still resolves; the title follows the live document so a rename reads true.
+    One bounded query for the whole list; cards without a source are untouched."""
+    ids = {c["source_book_id"] for c in cards if c.get("source_book_id")}
+    if not ids:
+        return cards
+    object_ids = [ObjectId(i) for i in ids if ObjectId.is_valid(i)]
+    rows = await books_collection.find(
+        {"_id": {"$in": object_ids}}, {"title": 1, "deleted_at": 1}
+    ).to_list(length=max(len(object_ids), 1))
+    live = {str(r["_id"]): r for r in rows}
+    for c in cards:
+        book_id = c.get("source_book_id")
+        if not book_id:
+            continue
+        book = live.get(book_id)
+        c["source_book_deleted"] = book is None or book.get("deleted_at") is not None
+        if book and book.get("title"):
+            c["source_book_title"] = book["title"]
+    return cards
+
 async def _active_deck_or(user_id: str) -> list:
     """The `$or` clause that scopes a card query to the user's active decks
     (and orphans). Mirrors the inline version in list_study_cards / get_card_tags
@@ -750,6 +773,7 @@ async def get_daily_review_cards(
             c["deck_id"] = str(c["deck_id"])
         if c.get("user_id"):
             c["user_id"] = str(c["user_id"])
+    await _annotate_source_books(cards)
 
     return {
         "cards": cards,
@@ -891,6 +915,7 @@ async def list_study_cards(
                 c["deck_id"] = str(c["deck_id"])
             if c.get("user_id"):
                 c["user_id"] = str(c["user_id"])
+        await _annotate_source_books(cards)
 
         return {
             "cards": cards,
@@ -914,6 +939,7 @@ async def list_study_cards(
         if struggling and c["_id"] in struggling:
             c["last_grade"] = struggling[c["_id"]]["last_grade"]
             c["last_graded_at"] = struggling[c["_id"]]["last_graded_at"]
+    await _annotate_source_books(cards)
 
     return {
         "cards": cards,

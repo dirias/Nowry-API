@@ -210,3 +210,52 @@ def test_the_source_fields_are_not_editable_through_patch():
 
     assert {"source_book_id", "source_book_title", "source_section"} <= set(StudyCard.model_fields)
     assert not ({"source_book_id", "source_book_title", "source_section"} & set(StudyCardUpdate.model_fields))
+
+
+
+# --- BOOK-004: the card outlives its document (D12, D13) ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_source_books_flags_deleted_and_missing_documents_and_follows_a_rename():
+    from bson import ObjectId
+    from app.routers import study_cards
+
+    live_id, gone_id, missing_id = ObjectId(), ObjectId(), ObjectId()
+    rows = [
+        {"_id": live_id, "title": "N3 Grammar (2nd ed.)", "deleted_at": None},
+        {"_id": gone_id, "title": "Old notes", "deleted_at": datetime(2026, 9, 1)},
+    ]
+    books = MagicMock()
+    books.find.return_value.to_list = AsyncMock(return_value=rows)
+    cards = [
+        {"_id": "a", "source_book_id": str(live_id), "source_book_title": "N3 Grammar"},
+        {"_id": "b", "source_book_id": str(gone_id), "source_book_title": "Old notes"},
+        {"_id": "c", "source_book_id": str(missing_id), "source_book_title": "Vanished"},
+        {"_id": "d"},
+    ]
+    with patch.object(study_cards, "books_collection", books):
+        out = await study_cards._annotate_source_books(cards)
+
+    assert [c.get("source_book_deleted") for c in out] == [False, True, True, None]
+    assert out[0]["source_book_title"] == "N3 Grammar (2nd ed.)"
+    assert out[1]["source_book_title"] == "Old notes"
+    books.find.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_annotate_source_books_skips_the_query_when_no_card_has_a_source():
+    from app.routers import study_cards
+
+    books = MagicMock()
+    with patch.object(study_cards, "books_collection", books):
+        await study_cards._annotate_source_books([{"_id": "a"}])
+    books.find.assert_not_called()
+
+
+def test_book_summary_keeps_the_computed_counts():
+    from app.models.Book import BookSummary
+
+    summary = BookSummary(title="N3", cards=18, due=4, sections_with_cards=3)
+    dumped = summary.model_dump()
+    assert (dumped["cards"], dumped["due"], dumped["sections_with_cards"]) == (18, 4, 3)

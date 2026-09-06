@@ -83,6 +83,9 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     source_book_id: Optional[str] = None
     source_book_title: Optional[str] = None
     source_section: Optional[SourceSection] = None
+    # Computed on read (D12): the document is gone or soft-deleted, so the readout says so and
+    # nothing links to it. Never stored.
+    source_book_deleted: Optional[bool] = None
 
     # Quiz Specific Fields
     card_type: str = Field(default="flashcard")  # "flashcard", "quiz", "visual"

@@ -50,3 +50,8 @@ class BookSummary(Book):
     It deliberately excludes the heavy `full_content` payload.
     """
     full_content: Optional[str] = Field(default=None, exclude=True)
+    # docs/prd-book-cards.md D6/D8 (FR-004): computed by /all from the cards that carry the
+    # document; never stored. Declared so the response model keeps them.
+    cards: Optional[int] = None
+    due: Optional[int] = None
+    sections_with_cards: Optional[int] = None
