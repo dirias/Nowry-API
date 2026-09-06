@@ -4,7 +4,7 @@ import asyncio
 import json
 import random
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -317,7 +317,7 @@ async def create_card(
 
 
 async def _generate_cards_for_text(
-    *, plain_text: str, card_limit: int | None, tier: str, user_id: str, llm_client
+    *, plain_text: str, card_limit: Optional[int], tier: str, user_id: str, llm_client
 ) -> list[dict]:
     """One generation for one text (the whole document, or one section — docs/prd-book-cards.md D4).
     Returns the parsed card dicts, capped at `card_limit` when given."""
@@ -449,7 +449,7 @@ async def generate_cards_from_book(
     book_title = book.get("title") or ""
 
     if body.sections:
-        from app.services.book_sections import parse_lexical, split_sections
+        from app.services.book_sections import PLUS_CARDS_PER_SECTION, parse_lexical, split_sections
         from app.models.CardGenerationRequest import compute_effective_cap
         sections = split_sections(parse_lexical(raw_content), book_title)
         by_index = {section.index: section for section in sections}
@@ -459,7 +459,7 @@ async def generate_cards_from_book(
         cards: list[GeneratedCard] = []
         for section in wanted:
             cap = compute_effective_cap(section.text, None)
-            section_limit = min(cap, card_limit) if card_limit else cap
+            section_limit = min(cap, PLUS_CARDS_PER_SECTION) if card_limit else cap
             parsed = await _generate_cards_for_text(
                 plain_text=section.text, card_limit=section_limit, tier=tier, user_id=user_id, llm_client=llm_client
             )

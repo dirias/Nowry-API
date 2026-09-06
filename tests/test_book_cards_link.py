@@ -91,7 +91,10 @@ async def test_sections_endpoint_reports_cards_and_changed_per_section(monkeypat
     result = await books.get_book_sections(book_id=BOOK_ID, existing_book=BOOK, current_user={"user_id": OWNER})
 
     assert [s["heading"] for s in result["sections"]] == ["Particles", "Verbs"], "the 2-word section is not a section"
-    assert result["sections"][0] == {"index": 0, "heading": "Particles", "level": "h2", "words": MIN_SECTION_WORDS + 10, "hash": particles_hash, "cards": 2, "changed": True}
+    first = result["sections"][0]
+    estimate = first.pop("estimate")
+    assert 1 <= estimate <= 20
+    assert first == {"index": 0, "heading": "Particles", "level": "h2", "words": MIN_SECTION_WORDS + 10, "hash": particles_hash, "cards": 2, "changed": True}
     assert result["sections"][1]["cards"] == 0 and result["sections"][1]["changed"] is False
     assert cards.queries[0]["source_book_id"] == BOOK_ID and cards.queries[0]["deleted_at"] is None
 

@@ -7,7 +7,8 @@ from bson import ObjectId
 from app.models.Book import Book, BookSummary
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection
-from app.services.book_sections import annotate_with_cards, document_stats, parse_lexical, split_sections
+from app.models.CardGenerationRequest import compute_effective_cap
+from app.services.book_sections import PLUS_CARDS_PER_SECTION, annotate_with_cards, document_stats, parse_lexical, split_sections
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils.logger import get_logger
@@ -299,7 +300,12 @@ async def get_book_sections(
         heading = (card.get("source_section") or {}).get("heading")
         if heading is not None:
             by_heading.setdefault(heading, []).append(card)
-    return {"book_id": str(existing_book["_id"]), "title": title, "sections": annotate_with_cards(sections, by_heading)}
+    rows = annotate_with_cards(sections, by_heading)
+    # `estimate`: the cards one run would make for the section, from the same adaptive cap the
+    # generation applies, so the sheet's budget line (D10) is the server's number, not a guess.
+    for section, row in zip(sections, rows):
+        row["estimate"] = min(compute_effective_cap(section.text, None), PLUS_CARDS_PER_SECTION)
+    return {"book_id": str(existing_book["_id"]), "title": title, "sections": rows}
 
 
 @router.get("/{book_id}", response_model=Book)
