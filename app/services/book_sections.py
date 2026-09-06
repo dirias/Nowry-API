@@ -15,6 +15,8 @@ from dataclasses import dataclass, asdict
 from typing import Any, Iterable, Optional
 
 MIN_SECTION_WORDS: int = 40
+# The 20-card cap per run applies per section on Plus (docs/prd-book-cards.md D10).
+PLUS_CARDS_PER_SECTION: int = 20
 SECTION_HEADING_TAGS: tuple[str, ...] = ("h1", "h2")
 HASH_LENGTH: int = 12
 
@@ -62,8 +64,10 @@ def _word_count(text: str) -> int:
 
 
 def section_hash(text: str) -> str:
+    """A change-detection fingerprint (D5), not a security hash."""
     normalised = re.sub(r"\s+", " ", text).strip().lower()
-    return hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:HASH_LENGTH]
+    digest = hashlib.sha1(normalised.encode("utf-8"), usedforsecurity=False)
+    return digest.hexdigest()[:HASH_LENGTH]
 
 
 def _top_level_blocks(lexical_state: Any) -> list[dict]:
