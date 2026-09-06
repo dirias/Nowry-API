@@ -3,7 +3,16 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from pymongo.collection import Collection
-from app.models.StudyCard import StudyCard, StudyCardUpdate
+from app.models.StudyCard import (
+    MAX_BULK_IDS,
+    BulkCardAction,
+    BulkCardResult,
+    StudyCard,
+    StudyCardUpdate,
+    TagRemove,
+    TagRename,
+    TagVerbResult,
+)
 from app.models.deck_config import resolve_deck_budget
 from app.config.database import cards_collection, decks_collection, books_collection, study_sessions_collection
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -194,13 +203,23 @@ async def _annotate_source_books(cards: list) -> list:
             c["source_book_title"] = book["title"]
     return cards
 
+ACTIVE_DECK_FILTER: dict = {"deleted_at": None, "archived_at": None}
+
+
+def _untagged_or() -> list:
+    """A card with no tag: the key absent, null, or an empty list (PRD D15)."""
+    return [{"tags": None}, {"tags": {"$exists": False}}, {"tags": []}]
+
+
 async def _active_deck_or(user_id: str) -> list:
     """The `$or` clause that scopes a card query to the user's active decks
-    (and orphans). Mirrors the inline version in list_study_cards / get_card_tags
-    so every count on the study centre agrees with the list it summarises.
+    (and orphans). One clause for every count on the study centre and the list
+    it summarises: list_study_cards, get_card_tags, get_groups, get_forecast
+    and get_statistics all take it, so an archived deck (ADR-023 point 4) or a
+    soft-deleted one is out of all of them at once.
     perf(33): the 500-deck cap bounds one user's own deck list, not a fan-out."""
     active_decks = await decks_collection.find(
-        {"user_id": user_id, "deleted_at": None}, {"_id": 1}
+        {"user_id": user_id, **ACTIVE_DECK_FILTER}, {"_id": 1}
     ).to_list(length=500)
     active_deck_ids: list = []
     for d in active_decks:
@@ -329,8 +348,11 @@ async def get_groups(
     tags = [{"tag": row["_id"], **_summary_row(row)} for row in tag_rows]
 
     async def summarise(narrow: dict) -> dict:
+        match = {**scope, **narrow}
+        if "$and" in narrow:
+            match.pop("$or")
         rows = await collection.aggregate([
-            {"$match": {**scope, **narrow}},
+            {"$match": match},
             _group_stage(now_dt, None),
         ]).to_list(length=1)
         return _summary_row(rows[0]) if rows else {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0}
@@ -338,6 +360,9 @@ async def get_groups(
     marked = await summarise({"marked_at": {"$ne": None}})
     struggling_ids = _object_ids((await _struggling_cards(user_id, now_dt)).keys())
     struggling = await summarise({"_id": {"$in": struggling_ids}}) if struggling_ids else {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0}
+    # D15: untagged is a filter, not a group — a readout, so no deck list. Its
+    # `$or` must not collide with the scope's deck `$or`, hence `$and`.
+    untagged = await summarise({"$and": [{"$or": scope["$or"]}, {"$or": _untagged_or()}]})
 
     return {
         "system": [
@@ -345,6 +370,7 @@ async def get_groups(
             {"key": "struggling", **struggling, "window_days": STRUGGLING_WINDOW_DAYS},
         ],
         "tags": tags,
+        "untagged": {"cards": untagged["cards"], "due": untagged["due"], "new": untagged["new"]},
     }
 
 
@@ -581,12 +607,13 @@ async def get_statistics(
         recent_performance = recent_performance[:10]
 
         # Overall stats — use count_documents so deleted cards are excluded and
-        # the counts are not skewed by the 90-day window on all_cards.
-        total_cards = await collection.count_documents(
-            {"user_id": user_id, "deleted_at": None}
-        )
+        # the counts are not skewed by the 90-day window on all_cards. The
+        # Today object counts only active decks (ADR-023 point 4): an archived
+        # deck's cards are in none of these three numbers.
+        active_scope = {"user_id": user_id, "deleted_at": None, "$or": await _active_deck_or(user_id)}
+        total_cards = await collection.count_documents(active_scope)
         reviewed_count = await collection.count_documents(
-            {"user_id": user_id, "deleted_at": None, "last_reviewed": {"$ne": None}}
+            {**active_scope, "last_reviewed": {"$ne": None}}
         )
         new_cards = total_cards - reviewed_count
 
@@ -595,11 +622,14 @@ async def get_statistics(
         due_today_count = await collection.count_documents({
             "user_id": user_id,
             "deleted_at": None,
-            "$or": [
-                {"next_review": {"$exists": False}},
-                {"next_review": None},
-                {"next_review": {"$lte": now_dt}}
-            ]
+            "$and": [
+                {"$or": active_scope["$or"]},
+                {"$or": [
+                    {"next_review": {"$exists": False}},
+                    {"next_review": None},
+                    {"next_review": {"$lte": now_dt}},
+                ]},
+            ],
         })
 
         # Current streak (consecutive days ending today with >=1 review),
@@ -663,31 +693,14 @@ async def get_card_tags(
 ):
     user_id = user.get("user_id")
 
-    # Mirror the same active-deck filter used in list_study_cards so tag counts
-    # match the number of cards actually returned when a tag is selected.
-    # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
-    # doc per deck), not a per-deck card fan-out; a single user's deck count
-    # stays far below 500 at this app's current scale. Retained as-is, not
-    # lowered — truncating would silently drop a legitimate power user's own
-    # decks (D-01 finding #2).
-    active_decks = await decks_collection.find(
-        {"user_id": user_id, "deleted_at": None}, {"_id": 1}
-    ).to_list(length=500)
-    active_deck_ids = []
-    for d in active_decks:
-        active_deck_ids.append(d["_id"])
-        active_deck_ids.append(str(d["_id"]))
-
+    # The same active-deck clause as list_study_cards so tag counts match the
+    # number of cards actually returned when a tag is selected.
     pipeline = [
         {"$match": {
             "user_id": user_id,
             "deleted_at": None,
             "tags": {"$exists": True, "$ne": []},
-            "$or": [
-                {"deck_id": None},
-                {"deck_id": {"$exists": False}},
-                {"deck_id": {"$in": active_deck_ids}},
-            ],
+            "$or": await _active_deck_or(user_id),
         }},
         {"$unwind": "$tags"},
         {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
@@ -736,7 +749,7 @@ async def get_daily_review_cards(
     # lowered — truncating would silently drop a legitimate power user's own
     # decks (D-01 finding #2).
     active_decks = await decks_collection.find(
-        {"user_id": user_id, "deleted_at": None}
+        {"user_id": user_id, **ACTIVE_DECK_FILTER}
     ).to_list(length=500)
 
     all_new: list = []
@@ -783,11 +796,203 @@ async def get_daily_review_cards(
     }
 
 
+# ---------------------------------------------------------------------------
+# MGMT-001 — the bulk writer and the tag verbs (PRD FR-010, FR-011; ADR-023).
+# Declared BEFORE every `/{id}`-shaped route so `/bulk` and `/tags/…` are
+# never read as a card id.
+# ---------------------------------------------------------------------------
+
+def _now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _active_cards_scope(user_id: str) -> dict:
+    return {"user_id": user_id, "deleted_at": None}
+
+
+async def _owned_active_cards(ids: List[str], user_id: str, collection: Collection) -> list:
+    """`_id` and `deck_id` of the caller's own, non-deleted cards among `ids`.
+    An unknown or foreign id simply is not in the answer (FR-010)."""
+    object_ids = _object_ids(ids)
+    if not object_ids:
+        return []
+    return await collection.find(
+        {"_id": {"$in": object_ids}, **_active_cards_scope(user_id)},
+        {"_id": 1, "deck_id": 1},
+    ).to_list(length=MAX_BULK_IDS)
+
+
+def _ids_by_deck(docs: list) -> dict:
+    """Group card ids by the deck they sit in, keyed by the deck id as a string
+    (deck_id is stored as ObjectId or string in legacy data). Orphans are
+    skipped: there is no counter to keep."""
+    by_deck: dict = {}
+    for doc in docs:
+        if doc.get("deck_id"):
+            by_deck.setdefault(str(doc["deck_id"]), []).append(doc["_id"])
+    return by_deck
+
+
+async def _pull_cards_from_decks(docs: list, d_collection: Collection) -> None:
+    """For every old deck: `$inc total_cards` by minus its own count and
+    `$pull` its ids — the many-card form of what DELETE /{id} does."""
+    for deck_key, ids in _ids_by_deck(docs).items():
+        if not ObjectId.is_valid(deck_key):
+            continue
+        await d_collection.update_one(
+            {"_id": ObjectId(deck_key)},
+            {"$inc": {"total_cards": -len(ids)}, "$pull": {"cards": {"$in": ids}}},
+        )
+
+
+async def _bulk_move(
+    docs: list, deck_id: Optional[str], user_id: str,
+    collection: Collection, d_collection: Collection,
+) -> int:
+    """Move the cards to `deck_id` (None: out of any deck). Cards already in
+    the target are not moving and are not counted."""
+    if deck_id:
+        await _verify_deck_ownership(deck_id, user_id)
+    moving = [d for d in docs if str(d.get("deck_id") or "") != str(deck_id or "")]
+    if not moving:
+        return 0
+    await _pull_cards_from_decks(moving, d_collection)
+    target = ObjectId(deck_id) if deck_id else None
+    moving_ids = [d["_id"] for d in moving]
+    if target is not None:
+        await d_collection.update_one(
+            {"_id": target},
+            {"$inc": {"total_cards": len(moving_ids)}, "$push": {"cards": {"$each": moving_ids}}},
+        )
+    await collection.update_many(
+        {"_id": {"$in": moving_ids}},
+        {"$set": {"deck_id": target, "updated_at": _now_naive()}},
+    )
+    return len(moving_ids)
+
+
+async def _bulk_delete(docs: list, user_id: str, collection: Collection, d_collection: Collection) -> int:
+    """Soft delete, with the per-deck counters, as DELETE /{id} does."""
+    if not docs:
+        return 0
+    await _pull_cards_from_decks(docs, d_collection)
+    now = datetime.now(timezone.utc)
+    await collection.update_many(
+        {"_id": {"$in": [d["_id"] for d in docs]}},
+        {"$set": {"deleted_at": now, "deleted_by": user_id, "updated_at": now}},
+    )
+    return len(docs)
+
+
+async def _bulk_tag(ids: List[ObjectId], tags: List[str], collection: Collection) -> int:
+    """`$addToSet` the tags. A card stored with `tags: null` cannot take
+    `$addToSet`, so those are given an empty list first."""
+    if not ids:
+        return 0
+    await collection.update_many(
+        {"_id": {"$in": ids}, "tags": None}, {"$set": {"tags": []}}
+    )
+    result = await collection.update_many(
+        {"_id": {"$in": ids}},
+        {"$addToSet": {"tags": {"$each": tags}}, "$set": {"updated_at": _now_naive()}},
+    )
+    return int(result.matched_count)
+
+
+async def _bulk_untag(ids: List[ObjectId], tags: List[str], collection: Collection) -> int:
+    """`$pull` the tags from the cards that carry any of them (a null `tags`
+    cannot take `$pull` and has nothing to lose anyway)."""
+    if not ids:
+        return 0
+    result = await collection.update_many(
+        {"_id": {"$in": ids}, "tags": {"$in": tags}},
+        {"$pull": {"tags": {"$in": tags}}, "$set": {"updated_at": _now_naive()}},
+    )
+    return int(result.matched_count)
+
+
+@router.post("/bulk", summary="Apply one verb to many of the user's cards (MGMT-001)", response_model=BulkCardResult)
+async def bulk_update_study_cards(
+    body: BulkCardAction,
+    collection: Collection = Depends(get_cards_collection),
+    d_collection: Collection = Depends(get_decks_collection),
+    user: dict = Depends(get_firebase_user),
+) -> BulkCardResult:
+    """The one bulk writer (ADR-023). Only the caller's own, non-deleted cards
+    are touched; ids that are not are ignored, not an error. `mark` / `unmark`
+    go through `_write_mark_many` so the mark keeps one writer (ADR-010)."""
+    user_id = user.get("user_id")
+    docs = await _owned_active_cards(body.ids, user_id, collection)
+    ids = [d["_id"] for d in docs]
+    logger.info(f"Bulk {body.action} on {len(ids)} cards for user {user_id}")
+
+    if body.action == "move":
+        updated = await _bulk_move(docs, body.deck_id, user_id, collection, d_collection)
+    elif body.action == "delete":
+        updated = await _bulk_delete(docs, user_id, collection, d_collection)
+    elif body.action == "tag":
+        updated = await _bulk_tag(ids, body.tags or [], collection)
+    elif body.action == "untag":
+        updated = await _bulk_untag(ids, body.tags or [], collection)
+    elif body.action == "mark":
+        updated = await _write_mark_many(ids, collection, _now_naive())
+    else:
+        updated = await _write_mark_many(ids, collection, None)
+    return BulkCardResult(updated=updated)
+
+
+@router.post("/tags/rename", summary="Rename a tag on every card; a merge is a rename onto an existing tag (MGMT-001)", response_model=TagVerbResult)
+async def rename_tag(
+    body: TagRename,
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> TagVerbResult:
+    """Cards already carrying `to` get `from` pulled, so no card ends with the
+    tag twice; the rest have the element rewritten in place (FR-011)."""
+    scope = _active_cards_scope(user.get("user_id"))
+    now = _now_naive()
+    merged = await collection.update_many(
+        {**scope, "tags": {"$all": [body.from_tag, body.to]}},
+        {"$pull": {"tags": body.from_tag}, "$set": {"updated_at": now}},
+    )
+    renamed = await collection.update_many(
+        {**scope, "tags": body.from_tag},
+        {"$set": {"tags.$[el]": body.to, "updated_at": now}},
+        array_filters=[{"el": body.from_tag}],
+    )
+    return TagVerbResult(cards=int(merged.matched_count) + int(renamed.matched_count))
+
+
+@router.post("/tags/remove", summary="Remove a tag from every card (MGMT-001)", response_model=TagVerbResult)
+async def remove_tag(
+    body: TagRemove,
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> TagVerbResult:
+    result = await collection.update_many(
+        {**_active_cards_scope(user.get("user_id")), "tags": body.tag},
+        {"$pull": {"tags": body.tag}, "$set": {"updated_at": _now_naive()}},
+    )
+    return TagVerbResult(cards=int(result.matched_count))
+
+
 @router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)
 async def get_study_card(
     card: dict = Depends(require_ownership(get_cards_collection, "id")),
 ):
     return card
+
+
+def _tag_clause(tags: Optional[List[str]], untagged: bool) -> Optional[dict]:
+    """The tag narrowing of the list (PRD D15). `tags` alone is a plain key;
+    `untagged` alone is the no-tag `$or`; both together are their union."""
+    if tags and untagged:
+        return {"$or": [{"tags": {"$in": tags}}, *_untagged_or()]}
+    if untagged:
+        return {"$or": _untagged_or()}
+    if tags:
+        return {"tags": {"$in": tags}}
+    return None
 
 
 @router.get("", summary="List all study cards")
@@ -800,6 +1005,7 @@ async def list_study_cards(
     due_only: bool = Query(False),
     marked_only: bool = Query(False),
     group: Optional[str] = Query(None, pattern="^(marked|struggling)$"),
+    untagged: bool = Query(False, description="Cards with no tag; with `tags` the two are a union (PRD D15)"),
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ) -> dict:
@@ -827,27 +1033,18 @@ async def list_study_cards(
             deck_filter = [deck_id]
         query["$or"] = [{"deck_id": v} for v in deck_filter]
     else:
-        # Collect active deck IDs (both ObjectId and string forms) to exclude orphans
-        # perf(33): 500-deck cap — bounds this user's OWN active-deck list (one
-        # doc per deck), not a per-deck card fan-out; a single user's deck count
-        # stays far below 500 at this app's current scale. Retained as-is, not
-        # lowered — truncating would silently drop a legitimate power user's own
-        # decks (D-01 finding #2).
-        active_decks = await decks_collection.find(
-            {"user_id": user_id, "deleted_at": None}, {"_id": 1}
-        ).to_list(length=500)
-        active_deck_ids: list = []
-        for d in active_decks:
-            active_deck_ids.append(d["_id"])
-            active_deck_ids.append(str(d["_id"]))
-        query["$or"] = [
-            {"deck_id": None},
-            {"deck_id": {"$exists": False}},
-            {"deck_id": {"$in": active_deck_ids}},
-        ]
+        # Scope to the user's active decks (and orphans) through the one clause.
+        query["$or"] = await _active_deck_or(user_id)
 
-    if tags:
-        query["tags"] = {"$in": tags}
+    # `and_clauses` collects every clause that carries its own `$or`; they are
+    # folded in beside the deck `$or` at the end so nothing collides.
+    and_clauses: list = []
+    tag_clause = _tag_clause(tags, untagged)
+    if tag_clause is not None:
+        if "$or" in tag_clause:
+            and_clauses.append(tag_clause)
+        else:
+            query.update(tag_clause)
 
     if group == "struggling":
         query["_id"] = {"$in": _object_ids(struggling.keys())}
@@ -871,17 +1068,15 @@ async def list_study_cards(
     if search:
         import re
         safe_search = re.escape(search)
-        search_or = {"$or": [
+        and_clauses.append({"$or": [
             {"title": {"$regex": safe_search, "$options": "i"}},
             {"content": {"$regex": safe_search, "$options": "i"}},
-        ]}
-        and_clauses: list = [{"$or": query.pop("$or")}, search_or]
-        if due_clause is not None:
-            and_clauses.append(due_clause)
-        query["$and"] = and_clauses
-    elif due_clause is not None:
-        # Wrap existing top-level $or and the due clause together
-        query["$and"] = [{"$or": query.pop("$or")}, due_clause]
+        ]})
+    if due_clause is not None:
+        and_clauses.append(due_clause)
+    if and_clauses:
+        # Wrap the deck $or and every other $or-shaped clause together
+        query["$and"] = [{"$or": query.pop("$or")}, *and_clauses]
 
     # When fetching due cards for a specific deck, apply the deck's daily budget:
     # new cards (never reviewed) are capped at new_per_day,
@@ -1072,6 +1267,27 @@ async def _write_mark(
     if card.get("user_id"):
         card["user_id"] = str(card["user_id"])
     return card
+
+
+async def _write_mark_many(
+    ids: List[ObjectId], collection: Collection, marked_at: Optional[datetime]
+) -> int:
+    """`_write_mark` for a selection: the same two keys, and nothing else, on
+    every card in `ids`. Kept beside `_write_mark` so the mark still has one
+    writer location (ADR-010, ADR-023). Returns the number of cards matched.
+    The caller has already narrowed `ids` to the user's own active cards."""
+    if not ids:
+        return 0
+    result = await collection.update_many(
+        {"_id": {"$in": ids}},
+        {
+            "$set": {
+                "marked_at": marked_at,
+                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            }
+        },
+    )
+    return int(result.matched_count)
 
 
 @router.put("/{id}/mark", summary="Mark a card for later review", response_model=StudyCard)

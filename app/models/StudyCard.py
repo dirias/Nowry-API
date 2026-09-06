@@ -1,7 +1,7 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from .types import PyObjectId
 from .mixins import SoftDeleteMixin
-from typing import List, Optional
+from typing import List, Literal, Optional
 from datetime import datetime, timedelta
 
 MAX_TAG_LENGTH: int = 40
@@ -163,3 +163,92 @@ class StudyCardUpdate(BaseModel):
     @classmethod
     def validate_tags(cls, value: Optional[List[str]]) -> Optional[List[str]]:
         return validate_tag_list(value)
+
+
+# ---------------------------------------------------------------------------
+# MGMT-001 — library management bodies (docs/prd-study-center.md FR-010, FR-011)
+# ---------------------------------------------------------------------------
+
+MAX_BULK_IDS: int = 500
+
+BulkAction = Literal["move", "tag", "untag", "mark", "unmark", "delete"]
+
+
+def _clean_tag(value: str) -> str:
+    """One tag, trimmed and bounded — the single-tag form of `validate_tag_list`."""
+    cleaned = validate_tag_list([value]) or []
+    if not cleaned:
+        raise ValueError("Tag must not be empty")
+    return cleaned[0]
+
+
+class BulkCardAction(BaseModel):
+    """One verb over up to 500 of the caller's own cards (FR-010, ADR-023 point 2).
+
+    An allowlist with `extra="forbid"`, like `StudyCardUpdate`: the verb names
+    what changes, and the body cannot smuggle a scheduler field in beside it.
+    `move` takes `deck_id` (an explicit `null` removes the cards from their
+    deck); `tag` / `untag` take a non-empty `tags`; the other verbs take
+    nothing. A verb without its field is refused by validation, so the route
+    never has to guess.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: List[str] = Field(min_length=1, max_length=MAX_BULK_IDS)
+    action: BulkAction
+    deck_id: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        return validate_tag_list(value)
+
+    @model_validator(mode="after")
+    def require_the_verbs_field(self) -> "BulkCardAction":
+        if self.action == "move" and "deck_id" not in self.model_fields_set:
+            raise ValueError("`move` requires `deck_id` (null removes the cards from their deck)")
+        if self.action in ("tag", "untag") and not self.tags:
+            raise ValueError(f"`{self.action}` requires a non-empty `tags`")
+        return self
+
+
+class BulkCardResult(BaseModel):
+    updated: int
+
+
+class TagRename(BaseModel):
+    """`{from, to}` — `from` is a Python keyword, hence the alias (FR-011).
+    A merge is this call with an existing `to`."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_tag: str = Field(alias="from", max_length=MAX_TAG_LENGTH)
+    to: str = Field(max_length=MAX_TAG_LENGTH)
+
+    @field_validator("from_tag", "to")
+    @classmethod
+    def clean(cls, value: str) -> str:
+        return _clean_tag(value)
+
+    @model_validator(mode="after")
+    def must_differ(self) -> "TagRename":
+        if self.from_tag == self.to:
+            raise ValueError("`from` and `to` must differ")
+        return self
+
+
+class TagRemove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tag: str = Field(max_length=MAX_TAG_LENGTH)
+
+    @field_validator("tag")
+    @classmethod
+    def clean(cls, value: str) -> str:
+        return _clean_tag(value)
+
+
+class TagVerbResult(BaseModel):
+    cards: int

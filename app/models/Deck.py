@@ -19,6 +19,8 @@ class DeckWithStats(BaseModel):
     is_public: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # ADR-023 point 4: archive is a state the deck is in, read by one clause.
+    archived_at: Optional[datetime] = None
     # Computed at request time
     total_cards: int = 0
     due_cards: int = 0
@@ -47,6 +49,8 @@ class Deck(BaseModel, SoftDeleteMixin):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     deck_type: Literal["flashcard", "quiz", "visual"] = "flashcard"
+    # Set by POST /decks/{id}/archive, cleared by /restore; never through PATCH.
+    archived_at: Optional[datetime] = None
     voice_settings: Optional[dict] = {
         "front": {"voice_name": None, "rate": 1.0, "pitch": 1.0},
         "back": {"voice_name": None, "rate": 1.0, "pitch": 1.0}

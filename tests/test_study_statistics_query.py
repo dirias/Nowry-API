@@ -114,8 +114,11 @@ async def test_get_statistics_equivalence_shape():
         counts=[10, 6, 4],  # total_cards, reviewed_cards, due_today
     )
 
-    with patch("app.routers.study_cards.books_collection") as mock_books_collection:
+    with patch("app.routers.study_cards.books_collection") as mock_books_collection, \
+            patch("app.routers.study_cards.decks_collection") as mock_decks_collection:
         mock_books_collection.find.return_value.to_list = AsyncMock(return_value=[])
+        # MGMT-001: the counts take the active-deck clause; no decks -> orphans only.
+        mock_decks_collection.find.return_value.to_list = AsyncMock(return_value=[])
 
         result = await get_statistics(
             collection=collection,
@@ -167,8 +170,10 @@ async def test_get_statistics_bola_match_scoping():
         counts=[0, 0, 0],
     )
 
-    with patch("app.routers.study_cards.books_collection") as mock_books_collection:
+    with patch("app.routers.study_cards.books_collection") as mock_books_collection, \
+            patch("app.routers.study_cards.decks_collection") as mock_decks_collection:
         mock_books_collection.find.return_value.to_list = AsyncMock(return_value=[])
+        mock_decks_collection.find.return_value.to_list = AsyncMock(return_value=[])
         await get_statistics(collection=collection, current_user={"user_id": USER_ID})
 
     assert collection.aggregate.called, "get_statistics must call collection.aggregate(...)"

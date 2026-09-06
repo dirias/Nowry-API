@@ -84,14 +84,23 @@ async def list_decks(
         default=None,
         description="Filter decks by deck_type. Omit to return all types (used by content-library views).",
     ),
+    archived: bool = Query(
+        default=False,
+        description="Only archived decks (ADR-023). The default list excludes them.",
+    ),
     collection: Collection = Depends(get_decks_collection),
     user: dict = Depends(get_firebase_user),
 ):
     user_id = user.get("user_id")
-    logger.info(f"Listing decks for user: {user_id} (type filter: {type})")
+    logger.info(f"Listing decks for user: {user_id} (type filter: {type}, archived: {archived})")
 
-    # Filter by user_id to ensure users only see their own decks
-    base_filter: dict = {"user_id": user_id, "deleted_at": None}
+    # Filter by user_id to ensure users only see their own decks. `archived_at:
+    # None` also matches decks that predate the field.
+    base_filter: dict = {
+        "user_id": user_id,
+        "deleted_at": None,
+        "archived_at": {"$ne": None} if archived else None,
+    }
 
     if type == "flashcard":
         # Legacy decks predate the deck_type field entirely, or may have it
@@ -286,7 +295,8 @@ async def update_deck(
 
     # Do not allow updating internal or immutable fields.
     # forked_from is permanently set at fork time and must never be overwritten.
-    for field in ["_id", "id", "user_id", "created_at", "forked_from"]:
+    # archived_at is a state written only by /archive and /restore (ADR-023).
+    for field in ["_id", "id", "user_id", "created_at", "forked_from", "archived_at"]:
         updates.pop(field, None)
 
     try:
@@ -345,6 +355,65 @@ async def delete_deck(
     )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# MGMT-001 — archive is a state a deck is in (ADR-023 point 4, PRD D18)
+# ---------------------------------------------------------------------------
+
+def _serialise_deck(deck: dict) -> dict:
+    """ObjectIds to strings, the way every deck response in this router does."""
+    deck["_id"] = str(deck["_id"])
+    if deck.get("user_id"):
+        deck["user_id"] = str(deck["user_id"])
+    if deck.get("cards"):
+        deck["cards"] = [str(c) for c in deck["cards"]]
+    return deck
+
+
+async def _deck_has_reviewed_cards(deck_oid: ObjectId) -> bool:
+    count = await cards_collection.count_documents({
+        "deck_id": {"$in": [deck_oid, str(deck_oid)]},
+        "deleted_at": None,
+        "last_reviewed": {"$ne": None},
+    })
+    return count > 0
+
+
+async def _set_archived(collection: Collection, deck: dict, archived_at: Optional[datetime], deck_status: str) -> dict:
+    deck_oid = ObjectId(deck["_id"])
+    await collection.update_one(
+        {"_id": deck_oid},
+        {"$set": {"archived_at": archived_at, "status": deck_status, "updated_at": datetime.now(timezone.utc)}},
+    )
+    updated = await collection.find_one({"_id": deck_oid})
+    return _serialise_deck(updated)
+
+
+@router.post("/{id}/archive", summary="Archive a deck: out of every count, history kept", response_model=Deck)
+async def archive_deck(
+    collection: Collection = Depends(get_decks_collection),
+    deck: dict = Depends(require_ownership(get_decks_collection, "id")),
+) -> dict:
+    """Sets `archived_at` and `status: "archived"`. Every active-deck scope on
+    the study routes reads `archived_at` through one clause, so the deck's
+    cards leave the Today object, the forecast, the groups and the default
+    list together (ADR-023 point 4). Idempotent: re-archiving refreshes the stamp."""
+    logger.info(f"Archiving deck {deck['_id']}")
+    return await _set_archived(collection, deck, datetime.now(timezone.utc), "archived")
+
+
+@router.post("/{id}/restore", summary="Restore an archived deck with its history intact", response_model=Deck)
+async def restore_deck(
+    collection: Collection = Depends(get_decks_collection),
+    deck: dict = Depends(require_ownership(get_decks_collection, "id")),
+) -> dict:
+    """Clears `archived_at` and nothing else about the cards: `next_review`
+    stays where it was, so every number comes back unchanged. `status` goes
+    back to `review` if any card has been reviewed, else `new`."""
+    logger.info(f"Restoring deck {deck['_id']}")
+    reviewed = await _deck_has_reviewed_cards(ObjectId(deck["_id"]))
+    return await _set_archived(collection, deck, None, "review" if reviewed else "new")
 
 
 # ---------------------------------------------------------------------------
