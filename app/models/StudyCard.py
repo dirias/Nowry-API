@@ -41,6 +41,13 @@ def validate_tag_list(value: Optional[List[str]]) -> Optional[List[str]]:
     return deduped_tags
 
 
+class SourceSection(BaseModel):
+    """Which part of a document a generated card came from (D1, D3, D5)."""
+    heading: str = Field(max_length=200)
+    index: int = Field(ge=0)
+    hash: str = Field(max_length=16)
+
+
 class StudyCard(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: Optional[PyObjectId] = None
@@ -69,6 +76,13 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     # by the generic PATCH. `None` means unmarked; the timestamp is what orders
     # a future cross-deck marked session (MARK-007).
     marked_at: Optional[datetime] = None
+
+    # The book→cards link (docs/prd-book-cards.md D1). Written by the generator
+    # and the save-to-deck flow only; absent from StudyCardUpdate, so the generic
+    # PATCH cannot change where a card came from. A hand-written card has neither.
+    source_book_id: Optional[str] = None
+    source_book_title: Optional[str] = None
+    source_section: Optional[SourceSection] = None
 
     # Quiz Specific Fields
     card_type: str = Field(default="flashcard")  # "flashcard", "quiz", "visual"

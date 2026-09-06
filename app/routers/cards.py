@@ -316,49 +316,11 @@ async def create_card(
     return {**card_dict, "id": str(result.inserted_id)}
 
 
-@router.post("/generate-from-book", response_model=GenerateFromBookResponse)
-async def generate_cards_from_book(
-    body: GenerateFromBookRequest,
-    current_user: dict = Depends(track_ai_usage),
-    tier: str = Depends(get_subscription_tier),
-) -> GenerateFromBookResponse:
-    """Generate flashcards from full book content. Plus+ only."""
-    if tier == "free":
-        raise HTTPException(status_code=403, detail="Book-wide card generation requires Plus or Pro.")
-
-    user_id: str = current_user.get("user_id", "")
-
-    try:
-        from bson import ObjectId as _ObjId
-        book = await books_collection.find_one({"_id": _ObjId(body.book_id), "deleted_at": None})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid book ID.")
-
-    if not book or book.get("user_id") != user_id:
-        raise HTTPException(status_code=404, detail="Book not found.")
-
-    raw_content: str = book.get("full_content", "")
-    try:
-        lexical_state = json.loads(raw_content)
-        plain_text = _extract_text_from_lexical(lexical_state)
-    except (json.JSONDecodeError, KeyError):
-        plain_text = raw_content
-
-    if len(plain_text) > MAX_BOOK_TEXT_CHARS:
-        logger_cards.warning(
-            f"[generate_cards_from_book] Book text truncated {len(plain_text)} → {MAX_BOOK_TEXT_CHARS}"
-        )
-        plain_text = plain_text[:MAX_BOOK_TEXT_CHARS]
-
-    if not plain_text.strip():
-        raise HTTPException(status_code=400, detail="Book has no text content to analyze.")
-
-    card_limit = 20 if tier == "plus" else None  # Pro = unlimited
-
-    llm_client = get_client_for_tier(tier)
-    if llm_client is None:
-        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
-
+async def _generate_cards_for_text(
+    *, plain_text: str, card_limit: int | None, tier: str, user_id: str, llm_client
+) -> list[dict]:
+    """One generation for one text (the whole document, or one section — docs/prd-book-cards.md D4).
+    Returns the parsed card dicts, capped at `card_limit` when given."""
     system_prompt = prompt_manager.get_prompt(
         "nowry-book-cards",
         card_limit=card_limit if card_limit else "as many as appropriate",
@@ -446,8 +408,89 @@ async def generate_cards_from_book(
     if card_limit:
         parsed = parsed[:card_limit]
 
+    return parsed
+
+
+@router.post("/generate-from-book", response_model=GenerateFromBookResponse)
+async def generate_cards_from_book(
+    body: GenerateFromBookRequest,
+    current_user: dict = Depends(track_ai_usage),
+    tier: str = Depends(get_subscription_tier),
+) -> GenerateFromBookResponse:
+    """Generate flashcards from a document. Plus+ only.
+
+    Without `sections`: the whole document as one text (the pre-BOOK-001 behaviour,
+    truncated at MAX_BOOK_TEXT_CHARS). With `sections` (docs/prd-book-cards.md D4): one
+    generation per requested section with the adaptive cap bounded by the plan's cap,
+    every card stamped with its section, and no truncation.
+    """
+    if tier == "free":
+        raise HTTPException(status_code=403, detail="Book-wide card generation requires Plus or Pro.")
+
+    user_id: str = current_user.get("user_id", "")
+
+    try:
+        from bson import ObjectId as _ObjId
+        book = await books_collection.find_one({"_id": _ObjId(body.book_id), "deleted_at": None})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid book ID.")
+
+    if not book or book.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Book not found.")
+
+    raw_content: str = book.get("full_content", "")
+    card_limit = 20 if tier == "plus" else None  # Pro = unlimited
+
+    llm_client = get_client_for_tier(tier)
+    if llm_client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable. API key not configured.")
+
+    book_id = str(book["_id"])
+    book_title = book.get("title") or ""
+
+    if body.sections:
+        from app.services.book_sections import parse_lexical, split_sections
+        from app.models.CardGenerationRequest import compute_effective_cap
+        sections = split_sections(parse_lexical(raw_content), book_title)
+        by_index = {section.index: section for section in sections}
+        wanted = [by_index[i] for i in dict.fromkeys(body.sections) if i in by_index]
+        if not wanted:
+            raise HTTPException(status_code=400, detail="None of the requested sections exist.")
+        cards: list[GeneratedCard] = []
+        for section in wanted:
+            cap = compute_effective_cap(section.text, None)
+            section_limit = min(cap, card_limit) if card_limit else cap
+            parsed = await _generate_cards_for_text(
+                plain_text=section.text, card_limit=section_limit, tier=tier, user_id=user_id, llm_client=llm_client
+            )
+            cards.extend(
+                GeneratedCard(title=c.get("title", ""), content=c.get("content", ""), source_section=section.stamp())
+                for c in parsed[:section_limit]
+            )
+        return GenerateFromBookResponse(cards=cards, source_book_id=book_id, source_book_title=book_title)
+
+    try:
+        lexical_state = json.loads(raw_content)
+        plain_text = _extract_text_from_lexical(lexical_state)
+    except (json.JSONDecodeError, KeyError):
+        plain_text = raw_content
+
+    if len(plain_text) > MAX_BOOK_TEXT_CHARS:
+        logger_cards.warning(
+            f"[generate_cards_from_book] Book text truncated {len(plain_text)} → {MAX_BOOK_TEXT_CHARS}"
+        )
+        plain_text = plain_text[:MAX_BOOK_TEXT_CHARS]
+
+    if not plain_text.strip():
+        raise HTTPException(status_code=400, detail="Book has no text content to analyze.")
+
+    parsed = await _generate_cards_for_text(
+        plain_text=plain_text, card_limit=card_limit, tier=tier, user_id=user_id, llm_client=llm_client
+    )
+    if card_limit:
+        parsed = parsed[:card_limit]
     cards = [GeneratedCard(title=c.get("title", ""), content=c.get("content", "")) for c in parsed]
-    return GenerateFromBookResponse(cards=cards)
+    return GenerateFromBookResponse(cards=cards, source_book_id=book_id, source_book_title=book_title)
 
 
 @router.post("/analyze-deck", response_model=DeckAnalysisResponse)

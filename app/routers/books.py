@@ -6,7 +6,8 @@ from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book, BookSummary
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
-from app.config.database import books_collection
+from app.config.database import books_collection, cards_collection
+from app.services.book_sections import annotate_with_cards, document_stats, parse_lexical, split_sections
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils.logger import get_logger
@@ -228,8 +229,77 @@ async def get_all_books(
 
     for book in books:
         book["_id"] = str(book["_id"])
-    
+
+    # docs/prd-book-cards.md D6 / FR-004: cards · due · sections_with_cards per book from
+    # ONE aggregation over this user's linked cards, so a row never costs a request.
+    counts = await _card_counts_for_books(user_id, [b["_id"] for b in books])
+    for book in books:
+        row = counts.get(book["_id"], {})
+        book["cards"] = row.get("cards", 0)
+        book["due"] = row.get("due", 0)
+        book["sections_with_cards"] = row.get("sections_with_cards", 0)
+        book.setdefault("source", "written")
+
     return books
+
+
+async def _card_counts_for_books(user_id: str, book_ids: list[str]) -> dict:
+    """{book_id: {cards, due, sections_with_cards}} for the cards that carry a source link.
+    due = reviewed before and next_review <= now, the same rule as the study centre's groups."""
+    if not book_ids:
+        return {}
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = await cards_collection.aggregate([
+        {"$match": {"user_id": user_id, "deleted_at": None, "source_book_id": {"$in": book_ids}}},
+        {"$group": {
+            "_id": "$source_book_id",
+            "cards": {"$sum": 1},
+            "due": {"$sum": {"$cond": [
+                {"$and": [{"$ne": ["$last_reviewed", None]}, {"$lte": ["$next_review", now_dt]}]}, 1, 0]}},
+            "headings": {"$addToSet": "$source_section.heading"},
+        }},
+        {"$limit": 100},
+    ]).to_list(length=100)
+    return {
+        str(row["_id"]): {
+            "cards": row.get("cards", 0),
+            "due": row.get("due", 0),
+            "sections_with_cards": len([h for h in row.get("headings", []) if h]),
+        }
+        for row in rows
+    }
+
+
+@router.get("/{book_id}/sections", summary="The document's sections with their card counts (BOOK-001)")
+async def get_book_sections(
+    book_id: str,
+    existing_book: dict = Depends(require_ownership(get_books_collection, "book_id")),
+    current_user: dict = Depends(get_firebase_user),
+) -> dict:
+    """docs/prd-book-cards.md FR-002: index · heading · words · cards · changed per section (D2, D3, D5).
+    The section text never leaves the server; a legacy HTML document is one section."""
+    user_id = current_user.get("user_id")
+    title = existing_book.get("title") or ""
+    raw = existing_book.get("full_content") or ""
+    state = parse_lexical(raw)
+    sections = split_sections(state, title)
+    if not sections and not state and raw.strip():
+        from app.services.book_sections import Section, section_hash
+        import re as _re
+        text = _re.sub(r"<[^>]+>", " ", raw)
+        words = len(text.split())
+        if words:
+            sections = [Section(0, title, "doc", text, words, section_hash(text))]
+    linked = await cards_collection.find(
+        {"user_id": user_id, "deleted_at": None, "source_book_id": str(existing_book["_id"])},
+        {"source_section": 1},
+    ).to_list(length=2000)
+    by_heading: dict = {}
+    for card in linked:
+        heading = (card.get("source_section") or {}).get("heading")
+        if heading is not None:
+            by_heading.setdefault(heading, []).append(card)
+    return {"book_id": str(existing_book["_id"]), "title": title, "sections": annotate_with_cards(sections, by_heading)}
 
 
 @router.get("/{book_id}", response_model=Book)
@@ -362,6 +432,9 @@ async def import_book_from_file(
         updated_at=datetime.now(),
         full_content=full_content,
         cover_color="#4A90E2",
+        source="imported",
+        page_count=len(extracted_pages),
+        **document_stats(parse_lexical(full_content), full_content),
     )
 
     # Exclude 'id' so MongoDB generates a proper ObjectId, identifying this as a new document

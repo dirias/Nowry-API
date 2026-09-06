@@ -28,6 +28,13 @@ class Book(BaseModel, SoftDeleteMixin):
     illustration_count: Optional[int] = 0  # Per-book diagram generation counter (Phase 6)
 
     # Public Sharing
+    # docs/prd-book-cards.md D9 / FR-004: what kind of document this is and its shape,
+    # computed on save so the library never parses content to draw a row.
+    source: Optional[str] = "written"       # "written" | "imported"
+    page_count: Optional[int] = None        # imports only
+    word_count: Optional[int] = None
+    section_count: Optional[int] = None
+
     is_public: bool = False
     published_at: Optional[datetime] = None
     public_metadata: Optional[PublicMetadata] = None

@@ -7,15 +7,22 @@ from pydantic import BaseModel, Field
 
 class GenerateFromBookRequest(BaseModel):
     book_id: str
+    # docs/prd-book-cards.md D4: which sections to generate for (indexes from
+    # GET /books/{id}/sections). Absent = the whole document, as before.
+    sections: Optional[list[int]] = None
 
 
 class GeneratedCard(BaseModel):
     title: str
     content: str
+    # The stamp a card saved from this draft should carry (D1); None for whole-document runs.
+    source_section: Optional[dict] = None
 
 
 class GenerateFromBookResponse(BaseModel):
     cards: list[GeneratedCard]
+    source_book_id: Optional[str] = None
+    source_book_title: Optional[str] = None
 
 
 class GenerateQuizFromBookRequest(BaseModel):
