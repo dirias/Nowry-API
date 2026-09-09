@@ -4,7 +4,7 @@ Handles user profile management, settings, and preferences
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from fastapi.responses import JSONResponse
 from pymongo.collection import Collection
 from bson import ObjectId
@@ -32,6 +32,7 @@ from app.models.User import (
     later_onboarding_point,
     normalize_onboarding_state,
     onboarding_resume_screen,
+    onboarding_show_next_steps,
     onboarding_show_reentry,
 )
 from app.models.topics import (
@@ -48,6 +49,7 @@ from app.models.common import (
     DataExportResponse,
 )
 from app.config.database import (
+    device_tokens_collection,
     users_collection,
     study_cards_collection,
     study_sessions_collection,
@@ -849,8 +851,10 @@ class OnboardingStateResponse(BaseModel):
     last_meaningful_point: OnboardingPoint
     postponed_at: Optional[datetime] = None
     activated_at: Optional[datetime] = None
+    next_steps_dismissed_at: Optional[datetime] = None
     updated_at: datetime
     show_reentry: bool
+    show_next_steps: bool
     resume_screen: Optional[OnboardingPoint] = None
 
 
@@ -862,7 +866,9 @@ class OnboardingStateUpdate(BaseModel):
     ``400 invalid_action`` instead of FastAPI's generic ``422``.
     """
 
-    action: str = Field(..., description="record_point | postpone")
+    action: str = Field(
+        ..., description="record_point | postpone | dismiss_next_steps"
+    )
     point: Optional[str] = Field(
         default=None,
         description="personalization | first_deck (record_point only)",
@@ -893,8 +899,10 @@ def _build_onboarding_response(
         last_meaningful_point=state.last_meaningful_point,
         postponed_at=state.postponed_at,
         activated_at=state.activated_at,
+        next_steps_dismissed_at=state.next_steps_dismissed_at,
         updated_at=state.updated_at,
         show_reentry=onboarding_show_reentry(state, reference),
+        show_next_steps=onboarding_show_next_steps(state),
         resume_screen=onboarding_resume_screen(state),
     )
 
@@ -905,6 +913,8 @@ def _resolve_onboarding_action(data: OnboardingStateUpdate) -> str:
         return "record_point"
     if data.action == "postpone" and data.point is None:
         return "postpone"
+    if data.action == "dismiss_next_steps" and data.point is None:
+        return "dismiss_next_steps"
     raise HTTPException(status_code=400, detail="invalid_action")
 
 
@@ -916,9 +926,28 @@ def _build_onboarding_update(
 ) -> dict:
     """Build the ``$set`` document for one action using server UTC time.
 
-    Progress is monotonic: recording an earlier screen, and postponing after
-    the user already resumed further, both keep the later meaningful point.
+    Two families of action meet here, and they have opposite status
+    preconditions (ADR-024):
+
+    * ``record_point`` and ``postpone`` move an **incomplete** journey. Neither
+      may touch an activated one, so both raise ``409
+      onboarding_already_activated``. Progress stays monotonic: recording an
+      earlier screen, and postponing after the user already resumed further,
+      both keep the later meaningful point.
+    * ``dismiss_next_steps`` retires a Home surface that only an **activated**
+      journey ever sees, so it is the one action the guard above must not
+      cover, and the one that raises ``409 onboarding_not_activated`` instead.
+      It writes a single timestamp: status, last meaningful point and
+      postponement are none of its business (FR-072).
     """
+    if action == "dismiss_next_steps":
+        if state.status != "activated":
+            raise HTTPException(status_code=409, detail="onboarding_not_activated")
+        return {
+            "onboarding.next_steps_dismissed_at": now,
+            "onboarding.updated_at": now,
+        }
+
     if state.status == "activated":
         raise HTTPException(status_code=409, detail="onboarding_already_activated")
 
@@ -954,11 +983,12 @@ async def update_onboarding_state(
     data: OnboardingStateUpdate,
     current_user: dict = Depends(get_firebase_user),
 ) -> OnboardingStateResponse:
-    """Record a meaningful point or postpone the journey (FR-041, FR-042).
+    """Record a point, postpone, or dismiss next steps (FR-041, FR-042, FR-072).
 
-    Only these two actions exist, both keep the journey incomplete, and both
-    are timestamped with server UTC time so the 24-hour grace period stays
-    truthful regardless of the client clock.
+    ``record_point`` and ``postpone`` both keep the journey incomplete;
+    ``dismiss_next_steps`` acts only on an activated one and leaves journey
+    progress alone. Every action is timestamped with server UTC time, so the
+    24-hour grace period stays truthful regardless of the client clock.
     """
     action = _resolve_onboarding_action(data)
     user = await _get_user_document(current_user)
@@ -1179,6 +1209,11 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
         {"$pull": {"collaborators": user_id}, "$set": {"updated_at": now}}
     )
 
+    # Push targets — removed outright, not soft-deleted. A token is a routing
+    # address, not content: leaving one for the recovery window would leave a
+    # deleted account reachable by a notification.
+    await device_tokens_collection.delete_many({"user_id": user_id})
+
     # 3. Revoke Firebase credentials AFTER all MongoDB soft-deletes (D-08)
     if firebase_uid:
         try:
@@ -1203,6 +1238,102 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
         message="Account deleted successfully. Your data will be retained for 30 days before permanent removal.",
         recovery_deadline=(now + timedelta(days=30)).isoformat(),
     )
+
+
+# ── Push device registry (MOB-027) ────────────────────────────────────────────
+#
+# One row per (user, token). A token identifies a DEVICE, so it may belong to
+# only one account at a time — see `register_device` for why that matters.
+#
+# Nothing sends pushes yet. This is the registry the send path will read, and it
+# exists now so the client work (MOB-028) has somewhere to register.
+
+#: A user with more than this many live devices has a bug, not a device
+#: collection. The bound exists so the send path can never fan out unbounded.
+MAX_DEVICES_PER_USER = 20
+
+
+class DeviceRegisterRequest(BaseModel):
+    """A push target, as the device reports itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=512)
+    platform: Literal["ios", "android"]
+    #: The device's language, so a future send path can address the user in it
+    #: rather than in whatever the account was last saved with.
+    locale: str = Field(min_length=2, max_length=35)
+
+
+@router.post(
+    "/me/devices",
+    summary="Register this device for push notifications",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def register_device(
+    body: DeviceRegisterRequest,
+    current_user: dict = Depends(get_firebase_user),
+) -> None:
+    """Upsert on (user_id, token); re-registering the same device changes nothing but the timestamps.
+
+    A token belongs to one account at a time. Two people signing in on one
+    phone would otherwise leave the first account's row in place, and a push
+    meant for them would arrive on a device now showing somebody else's data.
+    So any other user's claim on this token is released first.
+    """
+    user_id = current_user.get("user_id")
+    now = datetime.now(timezone.utc)
+
+    await device_tokens_collection.delete_many(
+        {"token": body.token, "user_id": {"$ne": user_id}}
+    )
+
+    await device_tokens_collection.update_one(
+        {"user_id": user_id, "token": body.token},
+        {
+            "$set": {
+                "platform": body.platform,
+                "locale": body.locale,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": user_id,
+                "token": body.token,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+
+@router.delete(
+    "/me/devices/{token}",
+    summary="Deregister this device",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def deregister_device(
+    token: str,
+    current_user: dict = Depends(get_firebase_user),
+) -> None:
+    """Idempotent: signing out twice, or from a device already removed, is a 204.
+
+    Scoped to the caller, so a token cannot be used to unregister somebody
+    else's device.
+    """
+    await device_tokens_collection.delete_many(
+        {"user_id": current_user.get("user_id"), "token": token}
+    )
+
+
+async def device_tokens_for_user(user_id: str) -> List[dict]:
+    """Every live push target for one user, bounded.
+
+    Not an endpoint: nothing a client needs to read. It is the seam the send
+    path will call, written here so the bound is part of the registry rather
+    than something the sender has to remember.
+    """
+    cursor = device_tokens_collection.find({"user_id": user_id})
+    return await cursor.to_list(length=MAX_DEVICES_PER_USER)
 
 
 @router.post("/create_user")

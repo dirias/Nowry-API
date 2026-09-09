@@ -35,6 +35,8 @@ def make_collection(matched_count: int = 1, docs=None) -> MagicMock:
     result.matched_count = matched_count
     collection.update_one = AsyncMock(return_value=result)
     collection.update_many = AsyncMock(return_value=result)
+    # The push registry is deleted from rather than soft-deleted (MOB-027).
+    collection.delete_many = AsyncMock(return_value=result)
     collection.count_documents = AsyncMock(return_value=0)
     cursor = MagicMock()
     cursor.to_list = AsyncMock(return_value=list(docs or []))
@@ -81,6 +83,7 @@ async def test_delete_account_cascades_blackboards(mock_firebase_user):
          patch("app.routers.users.focus_areas_collection", make_collection()), \
          patch("app.routers.users.goals_collection", make_collection()), \
          patch("app.routers.users.tasks_collection", make_collection()), \
+         patch("app.routers.users.device_tokens_collection", make_collection()), \
          patch("app.routers.users.blackboards_collection", mock_blackboards):
 
         await delete_account(current_user=mock_firebase_user)

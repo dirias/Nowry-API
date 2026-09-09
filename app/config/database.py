@@ -56,6 +56,12 @@ rate_limits_collection = db["rate_limits"]
 # Fork idempotency records — one per (content type, source, user) (ADR-005).
 content_forks_collection = db["content_forks"]
 
+# Push targets — one row per (user, device token) (MOB-027). A token is a
+# routing address for a device, not user content, so rows here are removed
+# outright rather than soft-deleted: a soft-deleted push target would still be
+# a place a notification could be sent.
+device_tokens_collection = db["device_tokens"]
+
 #: Index names for curated official browse (ADR-004). Named so deployment can
 #: verify them, and so the verification step below can report a missing one.
 CURATED_BROWSE_INDEX = "decks_curated_browse"
