@@ -1,11 +1,21 @@
 # Centralized prompt templates for the application
 
-# Shared instruction appended to book-wide generation prompts (cards, quiz) so AI-generated
-# math notation/symbols/arrows reliably trigger the frontend's single-$-delimiter LaTeX renderer.
+# Shared instruction appended to book-wide generation prompts (cards, quiz).
+#
+# It used to ask for single-$ LaTeX delimiters "so they reliably trigger the frontend's
+# single-$-delimiter LaTeX renderer". No such renderer exists on these surfaces. `katex` is
+# mounted by the document editor's MathNode and nowhere else: a study card is plain text in
+# both clients, and the assistant's markdown renderer supports bold, italics, lists, inline
+# code and line breaks by design and no maths. So every generated card carrying an arrow
+# printed "$\rightarrow$" verbatim — on the web exactly as on the phone. Reported from a
+# phone, 2026-09-12, and true since the instruction was written.
+#
+# The symbol itself is what both clients already draw, in every font, with no renderer.
 MATH_NOTATION_INSTRUCTION = (
-    "When the content includes mathematical notation, symbols, or arrows (e.g. →, ∈, ≠), "
-    "always wrap them in single dollar-sign LaTeX delimiters, e.g. $\\rightarrow$ — do not use "
-    "\\(...\\), \\[...\\], or double $$...$$ delimiters."
+    "When the content includes mathematical notation, symbols, or arrows, write the symbol "
+    "itself as plain Unicode (→, ∈, ≠, ≤, ×, ±). Do not wrap it in delimiters of any kind: "
+    "not $...$, not \\(...\\), not \\[...\\], not $$...$$. Do not use LaTeX command names "
+    "such as \\rightarrow."
 )
 
 # RAG / Card Generation
