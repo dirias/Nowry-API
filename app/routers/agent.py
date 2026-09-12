@@ -30,7 +30,8 @@ import httpx
 from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from app.core.limiter import limiter
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic.alias_generators import to_camel
 
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import cards_collection, decks_collection, study_sessions_collection, users_collection
@@ -82,6 +83,33 @@ class ChatMessage(BaseModel):
 
 
 class ScreenContextPayload(BaseModel):
+    """
+    What the user is looking at, as the companion is told it.
+
+    **The frontend speaks camelCase and this model is declared in snake_case.**
+    Without the alias generator below, Pydantic ignores every key it does not
+    recognise, so `deckId`, `cardIndex`, `totalCards`, `cardType`, `isFlipped`
+    and `isDailyReview` were all silently dropped on arrival and every field
+    here fell back to None. Two things followed from that:
+
+    1. `_build_context_injection` had no anchor to name. It told the model "the
+       user is looking at a card in a study deck" with no deck, no position and
+       no side, so the only thing identifying WHICH card was the chat history —
+       which is why the pet answered about a previous card, and why correcting
+       it worked (PEND-003).
+    2. `strip_back_if_not_flipped` below compares against `False`. An absent
+       `is_flipped` is None, not False, so the guard never fired and the answer
+       was handed to the model while the learner was still looking at the
+       question. A security rule that depends on a field is only as good as
+       that field's arrival.
+
+    `populate_by_name` keeps the snake_case spelling working, so any caller
+    already sending it — and every test that constructs this directly — is
+    unaffected.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
     page: Literal['study_session', 'book', 'annual_planning', 'dashboard']
     # study_session fields
     deck_id: Optional[str] = None
