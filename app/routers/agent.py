@@ -405,6 +405,23 @@ def _build_language_directive(language_code: str) -> str:
     )
 
 
+def _intervention_language_directive(language_code: str) -> str:
+    """Which language a message the learner did not ask for should be in.
+
+    Not `_build_language_directive`: that one is about MIRRORING, and mirroring
+    needs something to mirror. Nobody wrote anything here — the companion is
+    speaking first — so the interface language is the only signal there is, and
+    it decides rather than defaults.
+    """
+    lang: str = LANGUAGE_NAMES.get(language_code.split('-')[0].lower(), 'English')
+    return (
+        f"\n\nLANGUAGE: Write the message in {lang}. The learner did not ask for it, "
+        f"so there is no message of theirs to mirror — their interface language is "
+        f"{lang} and that is the language to use. Card content quoted from the prompt "
+        f"stays in the language it is written in."
+    )
+
+
 TUTOR_RULES = """
 TUTOR BEHAVIOR (core teaching identity — always active):
 
@@ -2098,6 +2115,10 @@ class InterventionRequest(BaseModel):
     session_wrong_count: Optional[int] = None
     most_missed_card_id: Optional[str] = None
     most_missed_card_front: Optional[str] = None
+    # The learner's interface language, exactly as `ChatRequest` takes it. The
+    # companion answers in it when asked; it spoke English when it spoke first,
+    # about the same card, seconds apart (MOB-099).
+    language: str = 'en'   # BCP 47 language code (e.g. 'es', 'fr-CA')
     # --- Phase 2 new fields ---
     deck_id: Optional[str] = None
     deck_name: Optional[str] = None
@@ -2294,7 +2315,7 @@ HARD RULES — never break these:
 5. Diagnostic tone only: state what the data shows, what the concept actually means, or what the pattern is.
 6. Reference only content explicitly present in the user prompt — never invent card content, deck names, or statistics.
 7. Do not ask questions. Do not end with a question mark.
-8. Write in plain English. No markdown, no bullet points, no headers."""
+8. Write in plain prose, in the language the LANGUAGE instruction names. No markdown, no bullet points, no headers."""
 
 
 _INTERVENTION_PROMPT_TEMPLATES: dict[str, str] = {
@@ -2377,7 +2398,7 @@ async def _fetch_intervention_context(
         ctx["card_front"] = (body.card_front or "").strip() or "Unknown"
         ctx["card_back"] = (body.card_back or "").strip() or "Unknown"
         ctx["card_notes"] = (body.card_notes or "").strip() or "None provided"
-        ctx["deck_name"] = "this deck"
+        ctx["deck_name"] = _deck_name_for_prompt(body.deck_name)
         ctx["wrong_count"] = 1
         try:
             if body.card_id:
@@ -2394,7 +2415,7 @@ async def _fetch_intervention_context(
         ctx["most_attention_front"] = (body.most_missed_card_front or "None").strip()
         ctx["most_attention_back"] = "None"
         ctx["duration_minutes"] = body.session_duration_minutes or 0
-        ctx["deck_name"] = "this deck"
+        ctx["deck_name"] = _deck_name_for_prompt(body.deck_name)
         try:
             if body.most_missed_card_id:
                 card = await cards_collection.find_one(
@@ -2461,6 +2482,20 @@ async def _fetch_intervention_context(
     return ctx
 
 
+def _deck_name_for_prompt(deck_name: Optional[str]) -> str:
+    """A deck's NAME, or the word every other absent field here uses.
+
+    This was the literal string "this deck", handed to the model as
+    `Deck name: {deck_name}` — so a summary came back reading "The deck this
+    deck had no cards identified as needing most attention". The placeholder was
+    a phrase standing where a name was promised, and the system prompt's own
+    rule 6 (never invent a deck name) is precisely why the model would not
+    paper over it. "Unknown" is what `card_back` already says when it does not
+    know, and it is a word the model can decline to use (MOB-099).
+    """
+    return (deck_name or "").strip() or "Unknown"
+
+
 async def _generate_intervention_message(
     event_type: str,
     context_dict: dict,
@@ -2471,14 +2506,22 @@ async def _generate_intervention_message(
     Single-shot LLM call. Falls back to Phase 1/2 builder on any failure.
     Uses the existing AgentLLM singleton — tools=None disables the tool loop.
     Wraps with a 10-second timeout.
+
+    The system prompt carries the learner's language. Without it every
+    intervention was English — the prompt says so in as many words — while
+    `/agent/chat` mirrored whatever the learner wrote, so the same companion
+    answered in Spanish when asked and in English when it spoke first
+    (MOB-099).
     """
     user_prompt: str = _INTERVENTION_PROMPT_TEMPLATES[event_type].format(**context_dict)
+    language: str = getattr(fallback_args, "language", None) or "en"
+    system_prompt: str = _INTERVENTION_SYSTEM_PROMPT + _intervention_language_directive(language)
     try:
         raw: str = await asyncio.wait_for(
             agent_llm.chat(
                 message=user_prompt,
                 history=[],
-                system_prompt=_INTERVENTION_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 tools=None,
                 tool_dispatcher=None,
                 user_id=None,
