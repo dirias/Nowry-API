@@ -326,11 +326,21 @@ from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 async def get_user_stats(user_id: str) -> dict:
     """Calculate user statistics"""
     try:
-        # Convert user_id to ObjectId for collections that use PyObjectId/ObjectId
-        try:
-            user_oid = ObjectId(user_id)
-        except Exception:
-            user_oid = user_id  # Fallback if not a valid ObjectId
+        # A study card's owner is the id as a STRING. Everything that writes or
+        # reads one does it that way — the insert in `create_study_card`, the
+        # library's `base_match`, the due queue, the review write — and nothing
+        # anywhere stores an ObjectId in that field. This function used to
+        # convert first, so every count below returned nought on every account,
+        # in both clients, while `books_collection` (queried with the string on
+        # the same line) returned a real number beside them. A wrong key is not
+        # an error: it is a confident zero, which is why it read as a product
+        # decision rather than a bug.
+        #
+        # `deleted_at: None` for the same reason every other count of this
+        # collection carries it: a deleted card is not a card the account has,
+        # and a profile that counted them would disagree with the number the
+        # Study Center shows on the screen next door.
+        owned = {"user_id": user_id, "deleted_at": None}
 
         # Parallelize independent count queries
         (
@@ -341,12 +351,12 @@ async def get_user_stats(user_id: str) -> dict:
             quiz_questions,
             visual_diagrams
         ) = await asyncio.gather(
-            study_cards_collection.count_documents({"user_id": user_oid}),
-            study_cards_collection.count_documents({"user_id": user_oid, "card_type": {"$in": [None, "flashcard"]}}),
-            study_cards_collection.count_documents({"user_id": user_oid, "last_reviewed": {"$exists": True}}),
-            books_collection.count_documents({"user_id": user_id}),
-            study_cards_collection.count_documents({"user_id": user_oid, "card_type": "quiz"}),
-            study_cards_collection.count_documents({"user_id": user_oid, "card_type": "visual"})
+            study_cards_collection.count_documents({**owned}),
+            study_cards_collection.count_documents({**owned, "card_type": {"$in": [None, "flashcard"]}}),
+            study_cards_collection.count_documents({**owned, "last_reviewed": {"$exists": True}}),
+            books_collection.count_documents({"user_id": user_id, "deleted_at": None}),
+            study_cards_collection.count_documents({**owned, "card_type": "quiz"}),
+            study_cards_collection.count_documents({**owned, "card_type": "visual"})
         )
 
         # Calculate study streak efficiently via a user-scoped aggregation that
@@ -354,7 +364,7 @@ async def get_user_stats(user_id: str) -> dict:
         # document per reviewed card over an async-for cursor iteration).
         one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
         streak_pipeline = [
-            {"$match": {"user_id": user_oid, "last_reviewed": {"$gt": one_year_ago}}},
+            {"$match": {**owned, "last_reviewed": {"$gt": one_year_ago}}},
             {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed"}}}},
         ]
         distinct_dates = await study_cards_collection.aggregate(streak_pipeline).to_list(length=366)
@@ -372,8 +382,9 @@ async def get_user_stats(user_id: str) -> dict:
             check_date -= timedelta(days=1)
 
         # Fetch ai_usage_count from user's subscription subdoc
+        # The one place the ObjectId is correct: the users collection's own key.
         user_doc = await users_collection.find_one(
-            {"_id": ObjectId(user_oid)},
+            {"_id": ObjectId(user_id)},
             {"subscription.ai_usage_count": 1},
         )
 
