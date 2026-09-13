@@ -765,9 +765,23 @@ AVATAR_INTEREST_TRAITS: dict[str, list[str]] = {
 # violet regardless of what the user had chosen. Two colour systems existed;
 # only one was ever set, and the generator read the other.
 #
-# Keys are the eight accent presets from the frontend's getColorPresets().
-AVATAR_THEME_COLOR_NAMES: dict[str, str] = {
+# The eight accent presets from the frontend's getColorPresets() (ADR-034).
+# They share one lightness and are deliberately muted, so their wording says
+# so; the hue fallback below would call three of them "clear blue".
+_ACCENT_PRESET_NAMES: dict[str, str] = {
     "#2a6971": "deep ocean teal",
+    "#346898": "calm lake blue",
+    "#5f5c99": "soft iris violet",
+    "#825080": "muted plum",
+    "#924968": "dusty rose",
+    "#805c43": "warm umber brown",
+    "#6e6634": "earthy olive",
+    "#5c666f": "cool graphite grey",
+}
+
+# The presets before ADR-034. Accounts that picked one still store it, and
+# their companion should keep being described as what they chose.
+_RETIRED_PRESET_NAMES: dict[str, str] = {
     "#0b6bcb": "clear sky blue",
     "#9c27b0": "rich royal purple",
     "#e91e63": "vivid rose pink",
@@ -776,6 +790,8 @@ AVATAR_THEME_COLOR_NAMES: dict[str, str] = {
     "#4caf50": "fresh forest green",
     "#795548": "earthy warm brown",
 }
+
+AVATAR_THEME_COLOR_NAMES: dict[str, str] = {**_ACCENT_PRESET_NAMES, **_RETIRED_PRESET_NAMES}
 
 DEFAULT_THEME_COLOR = "#2a6971"
 
@@ -796,7 +812,7 @@ MAX_AVATAR_TOPICS = 5
 
 DEFAULT_PET_NAME = "Nowry"
 DEFAULT_PET_SPECIES = "owl"
-DEFAULT_PET_THEME_COLOR = "#4caf50"   # Forest Green
+DEFAULT_PET_THEME_COLOR = DEFAULT_THEME_COLOR   # Teal, the app default (ADR-034)
 DEFAULT_PET_INTERESTS = ["artificial_intelligence", "technology", "science", "music", "health"]
 DEFAULT_PET_STUDY_GOAL = "hobby"      # labelled "Personal Interest" in the UI
 
@@ -843,7 +859,9 @@ def _describe_theme_color(theme_color: Optional[str]) -> str:
 
     high, low = max(r, g, b), min(r, g, b)
     delta = high - low
-    if delta == 0:
+    # Near-grey, not only perfect grey: a slate with a trace of blue is still
+    # grey to the eye, and its hue is noise.
+    if delta < 0.1:
         return "soft slate grey"
 
     if high == r:

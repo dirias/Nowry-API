@@ -83,10 +83,15 @@ TOPICS = [
 ]
 STUDY_GOALS = ["general", "academic", "career", "language", "hobby"]
 
-# getColorPresets() in nowry/src/theme/colorSchemeGenerator.js.
+# getColorPresets() in nowry/packages/core/tokens/colorSchemeGenerator.js (ADR-034).
 ACCENT_PRESETS = [
-    "#2a6971", "#0b6bcb", "#9c27b0", "#e91e63",
-    "#f44336", "#ff9800", "#4caf50", "#795548",
+    "#2a6971", "#346898", "#5f5c99", "#825080",
+    "#924968", "#805c43", "#6e6634", "#5c666f",
+]
+
+# Stored by accounts that chose them before ADR-034.
+RETIRED_PRESETS = [
+    "#0b6bcb", "#9c27b0", "#e91e63", "#f44336", "#ff9800", "#4caf50", "#795548",
 ]
 
 
@@ -174,7 +179,7 @@ class TestTopicMatching:
 
 
 class TestColour:
-    @pytest.mark.parametrize("accent", ACCENT_PRESETS)
+    @pytest.mark.parametrize("accent", ACCENT_PRESETS + RETIRED_PRESETS)
     def test_every_accent_preset_has_its_own_wording(self, accent: str) -> None:
         assert AVATAR_THEME_COLOR_NAMES[accent]
 
@@ -187,6 +192,13 @@ class TestColour:
         prompt, _ = _build_avatar_prompt(build_user(theme_color="#4caf50"), 2)
         assert "fresh forest green" in prompt
         assert "violet" not in prompt
+
+    def test_the_muted_presets_are_not_all_called_blue(self) -> None:
+        # Audit, ADR-034: before their own wording, lake, iris and graphite all
+        # fell through to the hue band "clear blue".
+        names = {_describe_theme_color(accent) for accent in ("#346898", "#5f5c99", "#5c666f")}
+        assert len(names) == 3
+        assert "clear blue" not in names
 
     def test_a_custom_hex_is_described_by_hue_not_defaulted(self) -> None:
         assert _describe_theme_color("#1e8f3a") == "fresh green"
