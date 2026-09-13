@@ -284,14 +284,27 @@ def _summary_row(row: dict) -> dict:
     return {"cards": row.get("cards", 0), "decks": len(decks), "deck_ids": decks[:50], "due": row.get("due", 0), "new": row.get("new", 0)}
 
 
+def _local_zone(tz_name: str) -> ZoneInfo:
+    """The learner's zone, or a 400 naming the one we were given.
+
+    A day is a local thing. Studying at 08:20 in Tokyo is 23:20 UTC the day
+    before, so anything that buckets reviews into days — the week strip, the
+    streak, "reviewed today" — has to be told where the learner is or it will
+    end their day at some other hour. `/forecast` has taken this parameter since
+    STUDY-001; `/statistics` had not, which is why a Tokyo streak reset at 09:00
+    local every morning (MOB-098).
+    """
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError):
+        raise HTTPException(status_code=400, detail=f"Invalid timezone: {tz_name!r}")
+
+
 def _local_day_bounds_utc(tz_name: str, days: int) -> list:
     """UTC boundaries [tomorrow_start, +1d, …] for `days` local days starting
     tomorrow, as naive UTC datetimes (the collection stores naive UTC). Today is
     deliberately absent — it is summary.due_today in /statistics, one owner."""
-    try:
-        user_tz = ZoneInfo(tz_name)
-    except (ZoneInfoNotFoundError, KeyError):
-        raise HTTPException(status_code=400, detail=f"Invalid timezone: {tz_name!r}")
+    user_tz = _local_zone(tz_name)
     today_local = datetime.now(tz=user_tz).replace(hour=0, minute=0, second=0, microsecond=0)
     bounds = []
     for i in range(1, days + 2):
@@ -458,6 +471,7 @@ async def create_study_card(
 # Statistics endpoint for dashboard (MUST be before /{id} route)
 @router.get("/statistics", summary="Get study statistics for the current user")
 async def get_statistics(
+    tz: str = Query("UTC", description="IANA timezone name, e.g. Asia/Tokyo. Day boundaries are the learner's."),
     collection: Collection = Depends(get_cards_collection),
     current_user: dict = Depends(get_firebase_user),
 ):
@@ -477,14 +491,15 @@ async def get_statistics(
         # pipeline's FIRST stage — the sole BOLA enforcement point for this
         # aggregation (T-33-01). $group buckets by (day, type) so weekly
         # buckets and the streak can both be derived from pre-grouped counts.
-        # No `timezone` param on $dateToString — the Motor client stores
-        # naive-UTC datetimes (no tz_aware), so the default UTC formatting
-        # matches the day boundaries already used throughout this file
-        # (A2 spot-check: a review at 2026-07-30T00:00:00 UTC groups into
-        # "2026-07-30", the same calendar day datetime.now(utc).replace(tzinfo=None)
-        # would bucket it into).
+        # `timezone` on $dateToString, because a day is a LOCAL thing. The
+        # stored datetimes are naive UTC and Mongo reads a BSON date as UTC, so
+        # this shifts them into the learner's day before grouping. Without it a
+        # review at 08:20 in Tokyo — 23:20 UTC the day before — landed in
+        # yesterday's bucket, and the streak and the day's progress both reset
+        # at 09:00 local every morning (MOB-098).
         from datetime import datetime, timedelta, timezone
 
+        user_tz = _local_zone(tz)
         ninety_days_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
         weekly_pipeline = [
             {"$match": {
@@ -494,7 +509,7 @@ async def get_statistics(
             }},
             {"$group": {
                 "_id": {
-                    "day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed"}},
+                    "day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed", "timezone": tz}},
                     "type": {"$ifNull": ["$card_type", "flashcard"]},
                 },
                 "count": {"$sum": 1},
@@ -514,14 +529,19 @@ async def get_statistics(
         # import so it is patchable in tests.
         all_books = await books_collection.find({"user_id": user_id, "deleted_at": None}).to_list(length=500)
 
-        # Calculate weekly progress (last 7 days) - separated by type
-        today = datetime.now(timezone.utc).replace(tzinfo=None).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Calculate weekly progress (last 7 days) - separated by type.
+        # `today_local` is the learner's midnight; the two UTC instants below
+        # are what the collection's naive-UTC datetimes are compared against.
+        today_local = datetime.now(tz=user_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        # The struggle query below wants an instant, not a label.
+        today = today_local.astimezone(timezone.utc).replace(tzinfo=None)
         weekly_data = []
 
         for i in range(6, -1, -1):  # Last 7 days (6 days ago to today)
-            day_start = today - timedelta(days=i)
-            day_end = day_start + timedelta(days=1)
-            date_str = day_start.strftime("%Y-%m-%d")
+            local_day = today_local - timedelta(days=i)
+            day_start = local_day.astimezone(timezone.utc).replace(tzinfo=None)
+            day_end = (local_day + timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None)
+            date_str = local_day.strftime("%Y-%m-%d")
             type_counts = day_type_totals.get(date_str, {})
 
             flashcards_count = type_counts.get("flashcard", 0)
@@ -539,7 +559,7 @@ async def get_statistics(
 
             weekly_data.append(
                 {
-                    "day": day_start.strftime("%A")[:3],  # Mon, Tue, etc.
+                    "day": local_day.strftime("%A")[:3],  # Mon, Tue, etc.
                     "date": date_str,
                     "cards": total_count,  # Keep for backwards compatibility
                     "flashcards": flashcards_count,
@@ -639,7 +659,7 @@ async def get_statistics(
         # ninety_days_ago), matching the prior Python-loop's implicit cap.
         reviewed_days = set(day_type_totals.keys())
         streak = 0
-        check_date = today
+        check_date = today_local
         while True:
             if check_date.strftime("%Y-%m-%d") in reviewed_days:
                 streak += 1
@@ -679,6 +699,11 @@ async def get_statistics(
             },
         }
 
+    except HTTPException:
+        # A deliberate answer, not a fault. The broad handler below turned the
+        # 400 for an unknown timezone into a 500 whose detail was the 400 —
+        # which tells a client "we broke" about something the client got wrong.
+        raise
     except Exception as e:
         logger.error(f"Error fetching statistics: {str(e)}", exc_info=True)
         raise HTTPException(

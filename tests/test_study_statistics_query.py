@@ -121,6 +121,10 @@ async def test_get_statistics_equivalence_shape():
         mock_decks_collection.find.return_value.to_list = AsyncMock(return_value=[])
 
         result = await get_statistics(
+            # Passed explicitly because these call the handler directly: FastAPI
+            # resolves a `Query` default per request, and a direct call gets the
+            # `Query` object itself (MOB-098).
+            tz="UTC",
             collection=collection,
             current_user={"user_id": USER_ID},
         )
@@ -174,7 +178,7 @@ async def test_get_statistics_bola_match_scoping():
             patch("app.routers.study_cards.decks_collection") as mock_decks_collection:
         mock_books_collection.find.return_value.to_list = AsyncMock(return_value=[])
         mock_decks_collection.find.return_value.to_list = AsyncMock(return_value=[])
-        await get_statistics(collection=collection, current_user={"user_id": USER_ID})
+        await get_statistics(tz="UTC", collection=collection, current_user={"user_id": USER_ID})
 
     assert collection.aggregate.called, "get_statistics must call collection.aggregate(...)"
     pipeline_arg = collection.aggregate.call_args[0][0]

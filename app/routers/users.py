@@ -4,12 +4,13 @@ Handles user profile management, settings, and preferences
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
 from fastapi.responses import JSONResponse
 from pymongo.collection import Collection
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Literal, Optional, List
 import bcrypt
 import base64
@@ -323,8 +324,30 @@ from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 
 
 # Helper Functions
-async def get_user_stats(user_id: str) -> dict:
-    """Calculate user statistics"""
+def _user_zone(tz_name: str):
+    """The learner's zone, falling back to UTC rather than failing a profile.
+
+    `/study-cards/statistics` answers 400 for a zone it does not know, because
+    that endpoint exists to bucket days and a wrong bucket is a wrong answer.
+    A profile is mostly counts that have no day in them, so a bad zone here
+    costs the streak its accuracy and nothing else — which is not worth
+    refusing the whole page for.
+    """
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return timezone.utc
+
+
+async def get_user_stats(user_id: str, tz: str = "UTC") -> dict:
+    """Calculate user statistics.
+
+    `tz` is the learner's IANA zone. A streak is a count of consecutive LOCAL
+    days, so bucketing reviews in UTC ends the day at some other hour: in Tokyo
+    a morning session lands in yesterday and the streak resets at 09:00 local
+    (MOB-098). `/study-cards/statistics` computes the same number from the same
+    reviews and now takes the same parameter, so the two agree.
+    """
     try:
         # A study card's owner is the id as a STRING. Everything that writes or
         # reads one does it that way — the insert in `create_study_card`, the
@@ -365,15 +388,15 @@ async def get_user_stats(user_id: str) -> dict:
         one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
         streak_pipeline = [
             {"$match": {**owned, "last_reviewed": {"$gt": one_year_ago}}},
-            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed"}}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$last_reviewed", "timezone": tz}}}},
         ]
         distinct_dates = await study_cards_collection.aggregate(streak_pipeline).to_list(length=366)
 
         # Collect unique dates locally
         reviewed_dates = {datetime.strptime(d["_id"], "%Y-%m-%d").date() for d in distinct_dates}
 
-        # Calculate streak
-        today = datetime.now(timezone.utc).date()
+        # Calculate streak, from the learner's own midnight.
+        today = datetime.now(tz=_user_zone(tz)).date()
         streak = 0
         check_date = today
         
@@ -415,7 +438,10 @@ async def get_user_stats(user_id: str) -> dict:
 
 # Routes
 @router.get("/profile", response_model=ProfileResponse)
-async def get_profile(current_user: dict = Depends(get_firebase_user)) -> ProfileResponse:
+async def get_profile(
+    tz: str = Query("UTC", description="IANA timezone name, e.g. Asia/Tokyo. The streak is counted in local days."),
+    current_user: dict = Depends(get_firebase_user),
+) -> ProfileResponse:
     """Get current user's profile"""
     user_id = current_user.get("user_id")
 
@@ -428,7 +454,7 @@ async def get_profile(current_user: dict = Depends(get_firebase_user)) -> Profil
         raise HTTPException(status_code=404, detail="User not found")
 
     # Get user stats (usage)
-    stats = await get_user_stats(user_id)
+    stats = await get_user_stats(user_id, tz)
 
     # Get subscription info
     stored_sub = user.get("subscription", {"tier": "free", "status": "active"})
