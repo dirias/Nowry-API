@@ -618,6 +618,10 @@ STAGE_PERSONALITY: dict[int, str] = {
 
 
 SPECIES_PERSONALITY_HINTS: dict[str, str] = {
+    "spiral": (
+        "You think in cycles: every return is a step further out. "
+        "You favour spaced returns over cramming, and you help the user notice how far a review, a focus round or a year has carried them."
+    ),
     "owl": (
         "You carry the quiet wisdom of a scholar. "
         "You prefer depth over speed, and you gently guide the user toward understanding rather than just answers."
@@ -665,6 +669,11 @@ ANIMATION_MOTION_PROMPTS: dict[str, str] = {
     # Prompts are intentionally explicit about WHICH body parts move.
     # Luma Ray 2 Flash will animate the whole scene unless constrained.
     # Pattern: "only animate X and Y — keep Z, background, and colors perfectly still."
+    "spiral": (
+        "Only the coil breathes: the whole spiral swells very slightly and settles back, "
+        "as if inhaling and exhaling, while its head turns a few degrees and returns. "
+        "The eye, the background, colors, lighting and style do not change. Seamless loop."
+    ),
     "owl": (
         "Only the owl's wings move: both wings slowly beat up and down in a smooth, rhythmic flap, "
         "rising gently overhead then lowering back. "
@@ -799,10 +808,11 @@ DEFAULT_THEME_COLOR = "#2a6971"
 # The default companion.
 #
 # Free users, and anyone who has not personalised a pet, get Nowry — the
-# brand's own owl — rather than a procedural orb wearing a randomly guessed
-# species. Nowry ships as six hand-directed illustrations, so the default
-# experience costs nothing to serve, never waits on an image model and cannot
-# fail. Personalisation then means "make it yours", not "get a picture at all".
+# brand's own Spiral (ADR-034, BRAND-007) — rather than a procedural orb
+# wearing a randomly guessed species. Nowry is drawn by both clients from
+# geometry they ship, so the default experience costs nothing to serve, never
+# waits on an image model and cannot fail. Personalisation then means "make it
+# yours", not "get a picture at all".
 #
 # A user is on the default companion until they have a generated portrait:
 # free users can never generate one, so they stay with Nowry by design.
@@ -811,7 +821,7 @@ DEFAULT_THEME_COLOR = "#2a6971"
 MAX_AVATAR_TOPICS = 5
 
 DEFAULT_PET_NAME = "Nowry"
-DEFAULT_PET_SPECIES = "owl"
+DEFAULT_PET_SPECIES = "spiral"
 DEFAULT_PET_THEME_COLOR = DEFAULT_THEME_COLOR   # Teal, the app default (ADR-034)
 DEFAULT_PET_INTERESTS = ["artificial_intelligence", "technology", "science", "music", "health"]
 DEFAULT_PET_STUDY_GOAL = "hobby"      # labelled "Personal Interest" in the UI
@@ -950,6 +960,18 @@ AVATAR_STAGE_NAMES: dict[int, str] = {
     1: "Wisp", 2: "Sprite", 3: "Scout", 4: "Sage", 5: "Oracle", 6: "Luminary",
 }
 
+# What the image model is told a species IS. Most species are a word it already
+# knows; the Spiral is not, and left as the bare word it draws a swirl or a
+# staircase. The wording carries the brand's guardrails (BRAND.md): a coil
+# first, one round eye, and nothing that reads as a threat or as medicine.
+AVATAR_SPECIES_DESCRIPTORS: dict[str, str] = {
+    "spiral": (
+        "smooth coiled spiral serpent creature, its body a single tapering coil "
+        "whose gaps widen with every turn, a round head with one large round eye, "
+        "no fangs, no tongue, no scale texture, no staff"
+    ),
+}
+
 AVATAR_STYLE_SUFFIX = (
     "flat design illustration, game mascot character art, expressive eyes, "
     "soft cel-shading, white background, no text, no watermark, no letters, "
@@ -966,7 +988,10 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     pet = prefs.get("pet", {})
     general = prefs.get("general", {})
 
-    species = pet.get("pet_species") or "owl"
+    species = AVATAR_SPECIES_DESCRIPTORS.get(
+        pet.get("pet_species") or DEFAULT_PET_SPECIES,
+        pet.get("pet_species") or DEFAULT_PET_SPECIES,
+    )
     # Every topic the user ranked, not just the first two. Rank carries meaning:
     # #1 shapes the creature, the rest add accents.
     interests = [_canonical_topic(i) for i in (general.get("interests") or [])[:MAX_AVATAR_TOPICS]]

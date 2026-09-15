@@ -1384,7 +1384,7 @@ async def create_user():
 # ---------------------------------------------------------------------------
 
 VALID_SPECIES: frozenset[str] = frozenset({
-    "owl", "fox", "cat", "dragon", "robot",
+    "spiral", "owl", "fox", "cat", "dragon", "robot",
     "star", "phoenix", "crystal", "leaf", "music",
 })
 

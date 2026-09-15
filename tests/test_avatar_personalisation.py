@@ -251,7 +251,9 @@ class TestPromptComposition:
             {"username": "", "preferences": {"pet": {}, "general": {}}}, 1
         )
         assert "Wisp" in prompt
-        assert "owl companion" in prompt
+        # Nothing chosen means the brand's own creature (BRAND-007), never the owl.
+        assert "coiled spiral" in prompt
+        assert "owl" not in prompt
         assert isinstance(seed, int)
 
     def test_the_seed_is_stable_for_the_same_user(self) -> None:
@@ -441,3 +443,47 @@ class TestRegenerationGate:
         }
         assert prefs["avatar_stage"] < 3          # the stale comparison was true
         assert self._should_regenerate(prefs, 3) is False
+
+
+# ---------------------------------------------------------------------------
+# BRAND-007 — the default species is the Spiral, not the owl
+# ---------------------------------------------------------------------------
+class TestDefaultSpeciesIsTheSpiral:
+    """An account that never chose a species is drawn as the brand's own creature."""
+
+    def _doc(self, species: str | None) -> dict:
+        pet = {"avatar_seed": "22222222-2222-2222-2222-222222222222"}
+        if species is not None:
+            pet["pet_species"] = species
+        return {
+            "username": "Didier Irias",
+            "preferences": {"pet": pet, "general": {"interests": ["science"], "study_goal": "hobby"}},
+        }
+
+    def test_the_default_species_is_the_spiral(self) -> None:
+        from app.routers.agent import DEFAULT_PET_SPECIES
+        from app.routers.users import VALID_SPECIES
+
+        assert DEFAULT_PET_SPECIES == "spiral"
+        assert "spiral" in VALID_SPECIES
+
+    def test_an_unset_species_is_described_as_a_coil_and_never_as_an_owl(self) -> None:
+        prompt, _ = _build_avatar_prompt(self._doc(None), 3)
+        assert "coiled spiral" in prompt
+        assert "one large round eye" in prompt
+        assert "owl" not in prompt
+
+    def test_the_spiral_carries_the_brand_guardrails_into_the_prompt(self) -> None:
+        prompt, _ = _build_avatar_prompt(self._doc("spiral"), 6)
+        for forbidden in ("no fangs", "no tongue", "no scale texture"):
+            assert forbidden in prompt
+
+    def test_a_chosen_species_is_still_named_plainly(self) -> None:
+        prompt, _ = _build_avatar_prompt(self._doc("owl"), 2)
+        assert "owl companion" in prompt
+
+    def test_the_spiral_has_a_personality_and_a_motion(self) -> None:
+        from app.routers.agent import ANIMATION_MOTION_PROMPTS, SPECIES_PERSONALITY_HINTS
+
+        assert "spiral" in SPECIES_PERSONALITY_HINTS
+        assert "breathes" in ANIMATION_MOTION_PROMPTS["spiral"]
