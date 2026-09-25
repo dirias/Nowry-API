@@ -67,6 +67,7 @@ from app.routers import (
     sheets,
     goal_ai,
     comments,
+    contact,
 )
 
 
@@ -175,6 +176,7 @@ app.include_router(illustrations.router)  # Illustration Magic — POST /book/{b
 app.include_router(sheets.router)         # Micro Sheets — CRUD /sheets
 app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (Pro-only)
 app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  # Text-anchored annotations
+app.include_router(contact.router)        # The public contact form — POST /contact (SITE-006)
 
 
 @app.get("/")

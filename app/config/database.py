@@ -22,6 +22,7 @@ cards_collection = db["cards"]
 study_cards_collection = db["cards"]  # Alias for cards collection
 tasks_collection = db["tasks"]
 bugs_collection = db["bugs"]
+contact_messages_collection = db["contact_messages"]  # the public contact form (SITE-006)
 
 # --- Annual Planning Collections ---
 annual_plans_collection = db["annual_plans"]
