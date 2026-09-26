@@ -35,8 +35,10 @@ EXPECTED_RESPONSE_KEYS = {
     "last_meaningful_point",
     "postponed_at",
     "activated_at",
+    "next_steps_dismissed_at",
     "updated_at",
     "show_reentry",
+    "show_next_steps",
     "resume_screen",
 }
 
@@ -472,3 +474,162 @@ def test_onboarding_routes_require_a_firebase_token():
     assert client.patch(
         "/users/onboarding", json={"action": "postpone"}
     ).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# ONB-022 / ADR-024 — next-steps visibility and durable dismissal
+# ---------------------------------------------------------------------------
+
+
+def activated_doc(**onboarding) -> dict:
+    """An activated journey, optionally carrying a dismissal timestamp."""
+    state = {
+        "status": "activated",
+        "last_meaningful_point": "first_deck",
+        "activated_at": datetime(2026, 8, 13, 3, 0, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 8, 13, 3, 0, tzinfo=timezone.utc),
+    }
+    state.update(onboarding)
+    return user_doc(state, wizard_completed=True)
+
+
+@pytest.mark.asyncio
+async def test_get_activated_user_is_offered_next_steps(mock_firebase_user):
+    """Activated and never dismissed => the panel is offered, re-entry is not."""
+    collection = mock_users_collection(found=activated_doc())
+
+    response = await call_get(collection, mock_firebase_user)
+
+    assert response.show_next_steps is True
+    assert response.show_reentry is False
+    assert response.next_steps_dismissed_at is None
+    collection.find_one_and_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_dismissed_user_is_not_offered_next_steps(mock_firebase_user):
+    """A stored dismissal retires the panel on every device, permanently."""
+    collection = mock_users_collection(
+        found=activated_doc(
+            next_steps_dismissed_at=datetime(2026, 8, 14, tzinfo=timezone.utc)
+        )
+    )
+
+    response = await call_get(collection, mock_firebase_user)
+
+    assert response.show_next_steps is False
+    assert response.next_steps_dismissed_at == datetime(
+        2026, 8, 14, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_legacy_activated_user_reads_as_not_dismissed(mock_firebase_user):
+    """A document written before ADR-024 has no field; absent means not dismissed."""
+    collection = mock_users_collection(found=user_doc(wizard_completed=True))
+
+    response = await call_get(collection, mock_firebase_user)
+
+    assert response.status == "activated"
+    assert response.next_steps_dismissed_at is None
+    assert response.show_next_steps is True
+    # No migration: normalization stays a pure read.
+    collection.find_one_and_update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        None,
+        {"status": "incomplete", "last_meaningful_point": "welcome"},
+        {
+            "status": "incomplete",
+            "last_meaningful_point": "personalization",
+            "postponed_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
+        },
+        {"status": "activated", "last_meaningful_point": "first_deck"},
+        {
+            "status": "activated",
+            "last_meaningful_point": "first_deck",
+            "next_steps_dismissed_at": datetime(2026, 8, 14, tzinfo=timezone.utc),
+        },
+    ],
+)
+def test_the_two_home_surfaces_are_never_both_offered(stored):
+    """FR-074 holds by construction: the status tests are complements."""
+    from app.models.User import (
+        normalize_onboarding_state,
+        onboarding_show_next_steps,
+        onboarding_show_reentry,
+    )
+
+    doc = user_doc(stored) if stored is not None else user_doc()
+    state = normalize_onboarding_state(doc)
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+    assert not (onboarding_show_reentry(state, now) and onboarding_show_next_steps(state))
+
+
+@pytest.mark.asyncio
+async def test_patch_dismiss_next_steps_writes_only_its_own_timestamp(
+    mock_firebase_user,
+):
+    """FR-072: dismissal touches no journey field, and uses server UTC time."""
+    before = activated_doc()
+    after = activated_doc(
+        next_steps_dismissed_at=datetime(2026, 9, 7, tzinfo=timezone.utc)
+    )
+    collection = mock_users_collection(found=before, updated=after)
+
+    response = await call_patch(
+        collection, mock_firebase_user, {"action": "dismiss_next_steps"}
+    )
+
+    applied = applied_set(collection)
+    assert set(applied) == {
+        "onboarding.next_steps_dismissed_at",
+        "onboarding.updated_at",
+    }
+    assert applied["onboarding.next_steps_dismissed_at"].tzinfo is not None
+    # Status, progress and postponement are none of this action's business.
+    assert response.status == "activated"
+    assert response.last_meaningful_point == "first_deck"
+    assert response.postponed_at is None
+    assert response.show_next_steps is False
+
+
+@pytest.mark.asyncio
+async def test_patch_dismiss_next_steps_rejects_an_incomplete_journey(
+    mock_firebase_user,
+):
+    """The panel only exists after activation, so dismissing it before is a 409."""
+    incomplete = user_doc(
+        {"status": "incomplete", "last_meaningful_point": "personalization"}
+    )
+    collection = mock_users_collection(found=incomplete, updated=incomplete)
+
+    with pytest.raises(HTTPException) as exc:
+        await call_patch(
+            collection, mock_firebase_user, {"action": "dismiss_next_steps"}
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "onboarding_not_activated"
+    collection.find_one_and_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_patch_dismiss_next_steps_rejects_a_point(mock_firebase_user):
+    """It carries no point; sending one is an invalid pairing, not a silent ignore."""
+    collection = mock_users_collection(found=activated_doc())
+
+    with pytest.raises(HTTPException) as exc:
+        await call_patch(
+            collection,
+            mock_firebase_user,
+            {"action": "dismiss_next_steps", "point": "first_deck"},
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "invalid_action"
+    collection.find_one_and_update.assert_not_called()

@@ -94,6 +94,7 @@ class OnboardingState(BaseModel):
     last_meaningful_point: OnboardingPoint = "welcome"
     postponed_at: Optional[datetime] = None
     activated_at: Optional[datetime] = None
+    next_steps_dismissed_at: Optional[datetime] = None
     updated_at: datetime
 
 
@@ -158,6 +159,7 @@ def normalize_onboarding_state(
         last_meaningful_point=point,
         postponed_at=coerce_utc(raw.get("postponed_at")),
         activated_at=coerce_utc(raw.get("activated_at")),
+        next_steps_dismissed_at=coerce_utc(raw.get("next_steps_dismissed_at")),
         updated_at=updated_at,
     )
 
@@ -177,6 +179,23 @@ def onboarding_show_reentry(
         return True
     reference = now or datetime.now(timezone.utc)
     return reference - state.postponed_at >= ONBOARDING_REENTRY_GRACE
+
+
+def onboarding_show_next_steps(state: OnboardingState) -> bool:
+    """Server-derived Home next-steps visibility (FR-068, FR-074, ADR-024).
+
+    True only while the journey is activated and the panel has not been
+    dismissed. The status test is the exact complement of
+    :func:`onboarding_show_reentry`'s, so the two Home surfaces are mutually
+    exclusive by construction rather than by a client-side comparison.
+
+    A document written before ADR-024 carries no ``next_steps_dismissed_at``,
+    which normalizes to ``None`` and therefore reads as "not dismissed". No
+    migration is required.
+    """
+    if state.status != "activated":
+        return False
+    return state.next_steps_dismissed_at is None
 
 
 def onboarding_resume_screen(state: OnboardingState) -> Optional[str]:
