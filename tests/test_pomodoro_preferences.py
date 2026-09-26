@@ -141,3 +141,20 @@ def test_durations_are_bounded():
     with pytest.raises(ValidationError):
         GeneralPreferencesUpdate(pomodoro_short_break_minutes=61)
     assert GeneralPreferencesUpdate(pomodoro_long_break_minutes=120).pomodoro_long_break_minutes == 120
+
+
+@pytest.mark.asyncio
+async def test_the_sound_preference_maps_to_its_own_path_and_defaults_on(mock_firebase_user):
+    """POMO-008: `pomodoro_sound` is stored under preferences.pomodoro.sound and is on unless turned off."""
+    stored = user_doc({"general": {}, "pomodoro": {"enabled": True, "sound": False}})
+    collection = mock_users_collection(found=user_doc(), updated=stored)
+
+    response = await call_put(collection, mock_firebase_user, {"pomodoro_sound": False})
+
+    set_doc = applied_set(collection)
+    assert set_doc["preferences.pomodoro.sound"] is False
+    assert "preferences.pomodoro.enabled" not in set_doc
+    assert response.pomodoro_sound is False
+
+    defaults = await call_get(mock_users_collection(found=user_doc()), mock_firebase_user)
+    assert defaults.pomodoro_sound is True

@@ -264,6 +264,9 @@ class GeneralPreferencesUpdate(BaseModel):
     pomodoro_short_break_minutes: int | None = Field(default=None, ge=1, le=60)
     pomodoro_long_break_minutes: int | None = Field(default=None, ge=1, le=120)
     pomodoro_auto_start: bool | None = Field(default=None)
+    # Whether the end of a session plays a sound (ADR-036). Default on; the web
+    # skips its chime when off, the phone schedules its notification silent.
+    pomodoro_sound: bool | None = Field(default=None)
 
 
 class GeneralPreferencesResponse(BaseModel):
@@ -303,6 +306,7 @@ class GeneralPreferencesResponse(BaseModel):
     pomodoro_short_break_minutes: int = 5
     pomodoro_long_break_minutes: int = 15
     pomodoro_auto_start: bool = False
+    pomodoro_sound: bool = True
     updated_at: datetime
 
     @field_validator('interests', mode='before')
@@ -718,6 +722,7 @@ def _pomodoro_response_fields(pomodoro_prefs: dict) -> dict:
         "pomodoro_short_break_minutes": int(pomodoro_prefs.get("short_break_minutes", 5)),
         "pomodoro_long_break_minutes": int(pomodoro_prefs.get("long_break_minutes", 15)),
         "pomodoro_auto_start": bool(pomodoro_prefs.get("auto_start", False)),
+        "pomodoro_sound": bool(pomodoro_prefs.get("sound", True)),
     }
 
 
@@ -801,6 +806,7 @@ async def update_general_preferences(
         "pomodoro_short_break_minutes":        "preferences.pomodoro.short_break_minutes",
         "pomodoro_long_break_minutes":         "preferences.pomodoro.long_break_minutes",
         "pomodoro_auto_start":                 "preferences.pomodoro.auto_start",
+        "pomodoro_sound":                      "preferences.pomodoro.sound",
     }
     set_doc: dict = {"preferences.general.updated_at": updated_at}
     for field_name, db_path in field_map.items():
