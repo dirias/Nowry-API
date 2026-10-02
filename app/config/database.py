@@ -24,6 +24,7 @@ tasks_collection = db["tasks"]
 bugs_collection = db["bugs"]
 contact_messages_collection = db["contact_messages"]  # the public contact form (SITE-006)
 waitlist_collection = db["waitlist"]  # the beta waitlist, one row per email (ADR-038)
+copyright_notices_collection = db["copyright_notices"]  # takedown notices (GTM-008)
 
 # --- Annual Planning Collections ---
 annual_plans_collection = db["annual_plans"]

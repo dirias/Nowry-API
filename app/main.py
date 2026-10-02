@@ -69,6 +69,7 @@ from app.routers import (
     comments,
     contact,
     beta,
+    copyright,
 )
 
 
@@ -179,6 +180,7 @@ app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (P
 app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  # Text-anchored annotations
 app.include_router(contact.router)        # The public contact form — POST /contact (SITE-006)
 app.include_router(beta.router)           # The beta gate — GET /beta/config, invites, waitlist (ADR-038)
+app.include_router(copyright.router)      # Takedown notices — POST /copyright-notices (GTM-008)
 
 
 @app.get("/")
