@@ -30,6 +30,8 @@ class DeckWithStats(BaseModel):
     is_due_soon: bool = False
     hours_until_due: Optional[int] = None
     voice_settings: Optional[dict] = None
+    # Provenance (ADR-037): "created" in Nowry, or "imported" from a file.
+    source: Literal["created", "imported"] = "created"
 
     class Config:
         populate_by_name = True
@@ -56,6 +58,10 @@ class Deck(BaseModel, SoftDeleteMixin):
         "back": {"voice_name": None, "rate": 1.0, "pitch": 1.0}
     }
     
+    # Provenance (ADR-037). A deck that arrived from a file cannot be published;
+    # every deck written before this field existed reads as "created".
+    source: Literal["created", "imported"] = "created"
+
     # Public Sharing
     is_public: bool = False
     published_at: Optional[datetime] = None

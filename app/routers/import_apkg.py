@@ -290,6 +290,7 @@ async def confirm_import(
         "status": "new",
         "tags": [],
         "cards": [],
+        "source": "imported",  # ADR-037: a file origin cannot be published
         "is_public": False,
         "voice_settings": {
             "front": {"voice_name": None, "rate": 1.0, "pitch": 1.0},

@@ -82,7 +82,9 @@ def mock_decks_collection(docs=None, total=None):
 def make_service(collection):
     from app.services.public_content_service import PublicContentService
 
-    return PublicContentService({"decks": collection, "books": collection})
+    # Publishing reads the deck's cards for provenance since ADR-037; the mock
+    # cursor's empty to_list() stands in for a deck with no source-linked cards.
+    return PublicContentService({"decks": collection, "books": collection, "cards": collection})
 
 
 def load_database_module():

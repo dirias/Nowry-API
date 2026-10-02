@@ -62,6 +62,30 @@ def _fork_conflict(code: str, **extra: Any) -> HTTPException:
     return HTTPException(status_code=409, detail={"code": code, **extra})
 
 
+#: Upper bound on the provenance reads a publish performs (ADR-037). A deck is
+#: judged on at most this many of its live cards; no read here is unbounded.
+PROVENANCE_READ_LIMIT: int = 10_000
+
+#: The stable code the clients switch on when publishing is refused for origin.
+SOURCE_NOT_PUBLISHABLE: str = "source_not_publishable"
+
+
+def _source_not_publishable(reason: str) -> HTTPException:
+    """Build the 409 that refuses to publish content with a file origin (ADR-037)."""
+    return HTTPException(status_code=409, detail={"code": SOURCE_NOT_PUBLISHABLE, "reason": reason})
+
+
+def direct_publish_block_reason(content_type: str, content: Dict[str, Any]) -> Optional[str]:
+    """The refusal a document earns on its own fields, or None.
+
+    Books have carried `source` ("written" | "imported") since file import
+    existed; decks gained it with ADR-037 and read "created" when absent.
+    """
+    if content.get("source") != "imported":
+        return None
+    return "imported_book" if content_type == "book" else "imported_deck"
+
+
 def _activation_failed() -> HTTPException:
     """Build the recoverable activation error from the fork contract.
 
@@ -232,6 +256,42 @@ class PublicContentService:
     
     # ========== Publishing ==========
     
+    async def _publish_block_reason(self, content_type: str, content_id: str, content: Dict[str, Any]) -> Optional[str]:
+        """Why this content may not be published, or None (ADR-037).
+
+        The deck's own `source` and the book's own `source` decide first. A deck
+        that passes is then judged on its live cards: any card whose
+        `source_book_id` names a book that was imported makes the deck a
+        derivative of a file, whoever generated the cards. Derived here, at
+        publish time, so a card added after the deck was created is caught too.
+        """
+        direct = direct_publish_block_reason(content_type, content)
+        if direct or content_type != "deck":
+            return direct
+
+        deck_oid = ObjectId(content_id)
+        cards = await self.db["cards"].find(
+            {
+                "deck_id": {"$in": [deck_oid, content_id]},
+                "deleted_at": None,
+                "source_book_id": {"$nin": [None, ""]},
+            },
+            {"source_book_id": 1},
+        ).to_list(length=PROVENANCE_READ_LIMIT)
+        book_ids: List[ObjectId] = []
+        for card in cards:
+            raw = card.get("source_book_id")
+            if isinstance(raw, str) and ObjectId.is_valid(raw):
+                book_ids.append(ObjectId(raw))
+        if not book_ids:
+            return None
+
+        imported = await self.db["books"].find(
+            {"_id": {"$in": list(set(book_ids))}, "source": "imported"},
+            {"_id": 1},
+        ).to_list(length=1)
+        return "cards_from_imported_book" if imported else None
+
     async def publish_content(
         self,
         content_type: str,  # "book" or "deck"
@@ -265,7 +325,13 @@ class PublicContentService:
         
         if content.get("is_public"):
             raise HTTPException(status_code=400, detail="Content is already public")
-        
+
+        # ADR-037: a file origin is never distributed under Nowry's name. After
+        # ownership, before any write.
+        block_reason = await self._publish_block_reason(content_type, content_id, content)
+        if block_reason:
+            raise _source_not_publishable(block_reason)
+
         # Create public metadata.
         # `curation` is trusted editorial state (ADR-004) and is stripped here
         # before validation: publishing must never be able to grant approval,
