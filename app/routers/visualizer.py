@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
+from app.core.limiter import limiter
 from pydantic import BaseModel
 from app.ai_orchestrator.orchestrator import orchestrator
 from app.auth.dependencies import track_ai_usage
@@ -20,7 +21,9 @@ class VisualRequest(BaseModel):
 
 
 @router.post("/generate")
+@limiter.limit("10/minute")
 async def generate_visual(
+    request: Request,
     request: VisualRequest,
     current_user: dict = Depends(track_ai_usage),
 ) -> dict:

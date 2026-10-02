@@ -3115,9 +3115,12 @@ async def generate_avatar(
     # Tier check — use _resolve_tier() to safely handle missing/corrupt tier values
     tier = _resolve_tier(user_doc)
     if tier == SubscriptionTier.FREE:
-        raise HTTPException(status_code=403, detail="avatar_generation_requires_plus")
+        # ADR-041: one portrait, at first reveal, for life. A second one is Plus.
+        pet_now: dict = user_doc.get("preferences", {}).get("pet", {})
+        if pet_now.get("avatar_url") or pet_now.get("stage_avatars"):
+            raise HTTPException(status_code=403, detail="avatar_generation_requires_plus")
 
-    tier_limits: dict[SubscriptionTier, int] = {SubscriptionTier.PLUS: 1, SubscriptionTier.PRO: 3}
+    tier_limits: dict[SubscriptionTier, int] = {SubscriptionTier.FREE: 1, SubscriptionTier.PLUS: 1, SubscriptionTier.PRO: 3}
     limit: int = tier_limits.get(tier, 1)
 
     # Species check

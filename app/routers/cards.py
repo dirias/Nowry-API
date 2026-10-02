@@ -6,7 +6,9 @@ import random
 import time
 from typing import AsyncGenerator, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from app.core.limiter import limiter
+from app.config.subscription_plans import FREE_PER_CALL
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from pymongo.collection import Collection
@@ -95,7 +97,9 @@ def get_cards_collection() -> Collection:
     summary="Generate a new card using AI",
     response_model=list[GeneratedCard],
 )
+@limiter.limit("10/minute")
 async def generate_card(
+    request: Request,
     payload: CardGenerationRequest,
     current_user: dict = Depends(track_ai_usage),
 ) -> list[GeneratedCard]:
@@ -107,6 +111,9 @@ async def generate_card(
     tier: str = current_user.get("subscription", {}).get("tier", "free")
     # None sampleNumber => adaptive mode: deterministic content-derived cap.
     effective_cap: int = compute_effective_cap(payload.sampleText, payload.sampleNumber)
+    if tier == "free":
+        # ADR-041 / v1.0 CARD-01: the free taste is two cards a call.
+        effective_cap = min(effective_cap, FREE_PER_CALL["cards"])
     adaptive: bool = payload.sampleNumber is None
     logger.info(f"[cards] tier={tier} adaptive={adaptive} cap={effective_cap}")
     try:
@@ -145,7 +152,9 @@ async def generate_card(
     "/generate/stream",
     summary="Generate cards using AI, streamed as Server-Sent Events",
 )
+@limiter.limit("10/minute")
 async def generate_card_stream(
+    request: Request,
     payload: CardGenerationRequest,
     current_user: dict = Depends(track_ai_usage),
 ) -> StreamingResponse:
@@ -162,6 +171,8 @@ async def generate_card_stream(
     # None sampleNumber => adaptive mode: deterministic content-derived cap,
     # computed here BEFORE the orchestrator is invoked.
     effective_cap: int = compute_effective_cap(payload.sampleText, payload.sampleNumber)
+    if tier == "free":
+        effective_cap = min(effective_cap, FREE_PER_CALL["cards"])  # ADR-041
     adaptive: bool = payload.sampleNumber is None
     logger.info(
         f"[generate_card_stream] tier={tier} adaptive={adaptive} cap={effective_cap}"

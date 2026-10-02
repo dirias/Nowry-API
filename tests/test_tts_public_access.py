@@ -135,6 +135,13 @@ def fake_tts_client() -> MagicMock:
     return client
 
 
+@pytest.fixture(autouse=True)
+def _no_tts_fair_use():
+    """ADR-041's character ceiling has its own tests; here it is stubbed out."""
+    with patch.object(tts_module, "reserve_tts_characters", new=AsyncMock(return_value=None)):
+        yield
+
+
 def _patched_router(fake_books: FakeBooksCollection, fake_tts_client: MagicMock,
                     rate_limit=None):
     """Patch tts.py's module-level collaborators.

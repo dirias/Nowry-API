@@ -12,10 +12,18 @@ Covers:
 from __future__ import annotations
 
 import sys
-from tests._stubs import stub_if_missing, use_stub_if_missing
+from tests._stubs import fake_request, stub_if_missing, use_stub_if_missing
 from unittest.mock import MagicMock
 
 import pytest
+from unittest.mock import AsyncMock as _AsyncMock, patch as _patch
+
+
+@pytest.fixture(autouse=True)
+def _no_tts_fair_use():
+    """ADR-041's read-aloud character ceiling has its own tests; stubbed out here."""
+    with _patch("app.routers.tts.reserve_tts_characters", new=_AsyncMock(return_value=None)):
+        yield
 
 
 def _ensure_advanced_ai_importable() -> None:
@@ -99,6 +107,7 @@ async def test_diagram_free_tier_cap(mock_book_doc_with_counter):
         mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
         with pytest.raises(HTTPException) as exc_info:
             await generate_diagram(
+                request=fake_request(),
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
                 current_user=user,
@@ -131,6 +140,7 @@ async def test_diagram_does_not_increment_counter_on_generate(mock_book_doc_with
             return_value={"mermaid_code": "graph TD; A-->B", "explanation": "test"},
         ):
             await generate_diagram(
+                request=fake_request(),
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
                 current_user=user,
@@ -228,6 +238,7 @@ async def test_diagram_plus_no_cap(mock_book_doc_with_counter, mock_user_doc_plu
             return_value={"mermaid_code": "graph TD; A-->B", "explanation": "Krebs cycle"},
         ):
             result = await generate_diagram(
+                request=fake_request(),
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
                 current_user=user,
@@ -266,6 +277,7 @@ async def test_diagram_pro_no_cap(mock_book_doc_with_counter, mock_user_doc_pro)
             return_value={"mermaid_code": "graph TD; A-->B", "explanation": "Big Bang"},
         ):
             result = await generate_diagram(
+                request=fake_request(),
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
                 current_user=user,

@@ -59,3 +59,16 @@ def use_stub_if_missing(module_name: str, stub) -> None:
         importlib.import_module(module_name)
     except Exception:
         sys.modules.setdefault(module_name, stub)
+
+
+def fake_request():
+    """A real starlette Request for handlers that carry a slowapi decorator.
+
+    The decorator insists on a Request instance even when the limiter is
+    disabled (conftest turns it off), so a directly-called handler is given
+    this minimal one.
+    """
+    from starlette.requests import Request
+
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 0), "query_string": b""}
+    return Request(scope)

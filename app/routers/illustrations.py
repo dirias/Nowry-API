@@ -6,7 +6,8 @@ illustration counter for Free-tier gating (D-10). Plus and Pro have no cap.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from app.core.limiter import limiter
 
 from app.ai_orchestrator.orchestrator import orchestrator
 from app.auth.dependencies import track_ai_usage
@@ -28,7 +29,9 @@ _FREE_TIER_CAP = 2  # Max diagrams per book for Free tier (D-10)
 
 
 @router.post("/{book_id}/diagram", response_model=DiagramResponse)
+@limiter.limit("10/minute")
 async def generate_diagram(
+    request: Request,
     book_id: str,
     body: DiagramRequest,
     current_user: dict = Depends(track_ai_usage),

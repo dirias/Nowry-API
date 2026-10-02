@@ -69,17 +69,66 @@ async def require_admin(
     return current_user
 
 
+AI_LIMIT_REACHED_CODE = "ai_limit_reached"
+
+
+def first_of_next_month(dt: datetime) -> datetime:
+    """The first day of the next calendar month at 00:00 UTC (the usage window's end)."""
+    if dt.month == 12:
+        return dt.replace(year=dt.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    return dt.replace(month=dt.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+
+
+async def _roll_usage_window(user_id: str, subscription: dict, now: datetime) -> datetime:
+    """Reset the monthly counter when its window has passed; return the window's end."""
+    reset_at = subscription.get("ai_usage_reset_date")
+    if isinstance(reset_at, datetime) and reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=timezone.utc)
+    if isinstance(reset_at, datetime) and now < reset_at:
+        return reset_at
+    next_reset = first_of_next_month(now)
+    await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"subscription.ai_usage_count": 0, "subscription.ai_usage_reset_date": next_reset}},
+    )
+    return next_reset
+
+
 async def track_ai_usage(
     current_user: dict = Depends(get_firebase_user),
 ) -> dict:
     """
-    Increment the user's monthly AI usage counter by +1 per API call (D-09).
-    Returns the updated user document. Does NOT enforce limits — enforcement is Phase 4.
+    Count one AI generation call against the user's monthly ceiling (GTM-003, ADR-041).
+
+    The ceiling is the plan's `ai_calls_per_month` (-1 for none). The window is
+    the calendar month, kept in `subscription.ai_usage_reset_date` and rolled
+    here when it has passed. The increment is conditional on being under the
+    ceiling, so a refused call is never counted, and the refusal is
+    `429 {"code": "ai_limit_reached", "limit", "resets_at"}`.
     """
+    from app.config.subscription_plans import AI_USAGE_LIMITS, SubscriptionTier
+
     user_id = current_user.get("user_id")
     now = datetime.now(timezone.utc)
+    current = await users_collection.find_one({"_id": ObjectId(user_id)}, {"subscription": 1})
+    if not current:
+        raise HTTPException(status_code=404, detail="User not found")
+    subscription: dict = current.get("subscription") or {}
+    try:
+        tier = SubscriptionTier(subscription.get("tier", "free"))
+    except ValueError:
+        tier = SubscriptionTier.FREE
+    limit: int = int(AI_USAGE_LIMITS.get(tier, AI_USAGE_LIMITS[SubscriptionTier.FREE]))
+    resets_at = await _roll_usage_window(user_id, subscription, now)
+
+    query: dict = {"_id": ObjectId(user_id)}
+    if limit != -1:
+        query["$or"] = [
+            {"subscription.ai_usage_count": {"$lt": limit}},
+            {"subscription.ai_usage_count": {"$exists": False}},
+        ]
     user = await users_collection.find_one_and_update(
-        {"_id": ObjectId(user_id)},
+        query,
         {
             "$inc": {"subscription.ai_usage_count": 1},
             "$set": {"subscription.last_ai_usage_at": now},
@@ -88,7 +137,10 @@ async def track_ai_usage(
         upsert=False,
     )
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(
+            status_code=429,
+            detail={"code": AI_LIMIT_REACHED_CODE, "limit": limit, "resets_at": resets_at.isoformat()},
+        )
     # Re-inject user_id (Firebase UID string) — MongoDB doc has _id/firebase_uid
     # but not user_id. Endpoints call current_user.get("user_id") for ownership checks.
     user["user_id"] = current_user.get("user_id")

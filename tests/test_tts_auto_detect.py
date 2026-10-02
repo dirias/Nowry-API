@@ -36,6 +36,13 @@ import app.routers.tts as tts_module  # noqa: E402
 from app.models.tts import TTSRequest  # noqa: E402
 from app.services.tts.segmentation import segment_text as real_segment_text  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _no_tts_fair_use():
+    """ADR-041's character ceiling has its own tests; here it is stubbed out."""
+    with patch.object(tts_module, "reserve_tts_characters", new=AsyncMock(return_value=None)):
+        yield
+
 OWNER_ID = "507f1f77bcf86cd799439011"
 BOOK_ID = ObjectId("60b8d295f1d2c17f4e4b1111")
 

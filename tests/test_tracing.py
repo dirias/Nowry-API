@@ -1027,6 +1027,7 @@ async def test_generate_tts_happy_path_traces_tts_amagic(mock_langfuse_client):
     current_user = {"user_id": "u1"}
 
     with patch.object(tts_module, "books_collection") as mock_books_collection, \
+         patch.object(tts_module, "reserve_tts_characters", new=AsyncMock(return_value=None)), \
          patch.object(tts_module, "get_tts_client", return_value=fake_tts_client), \
          patch.object(tts_module, "get_langfuse_client", return_value=mock_langfuse_client), \
          patch.object(tts_module, "enforce_user_rate_limit", new=AsyncMock(return_value=1)), \
@@ -1070,6 +1071,7 @@ async def test_generate_tts_langfuse_unreachable(broken_langfuse_client, caplog)
     current_user = {"user_id": "u1"}
 
     with patch.object(tts_module, "books_collection") as mock_books_collection, \
+         patch.object(tts_module, "reserve_tts_characters", new=AsyncMock(return_value=None)), \
          patch.object(tts_module, "get_tts_client", return_value=fake_tts_client), \
          patch.object(tts_module, "get_langfuse_client", return_value=broken_langfuse_client), \
          patch.object(tts_module, "enforce_user_rate_limit", new=AsyncMock(return_value=1)), \

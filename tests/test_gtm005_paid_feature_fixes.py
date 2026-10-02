@@ -62,8 +62,8 @@ async def test_quota_counts_only_live_cards():
     cards.count_documents = AsyncMock(return_value=30)
     with patch.object(import_apkg, "users_collection", users), patch.object(import_apkg, "cards_collection", cards):
         remaining = await import_apkg._get_remaining_quota(OWNER)
-    assert remaining == 20  # free plan: 50 flashcards
-    assert cards.count_documents.call_args[0][0] == {"user_id": OWNER, "deleted_at": None}
+    assert remaining == 1970  # ADR-041: free may import 2,000 cards
+    assert cards.count_documents.call_args[0][0] == {"user_id": OWNER, "deleted_at": None, "source": "imported"}
 
 
 @pytest.mark.asyncio

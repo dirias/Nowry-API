@@ -9,6 +9,16 @@ from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection
 from app.models.CardGenerationRequest import compute_effective_cap
 from app.services.book_sections import PLUS_CARDS_PER_SECTION, annotate_with_cards, document_stats, parse_lexical, split_sections
+from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
+
+DOCUMENT_TOO_LONG_CODE = "document_too_long"
+
+
+def ensure_document_within_ceiling(word_count: int) -> None:
+    """ADR-041: one size ceiling per document, the same on every tier (413 with a code)."""
+    limit = int(SUBSCRIPTION_PLANS[SubscriptionTier.FREE]["limits"]["document_words"])
+    if limit != -1 and word_count > limit:
+        raise HTTPException(status_code=413, detail={"code": DOCUMENT_TOO_LONG_CODE, "limit": limit, "words": word_count})
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils.logger import get_logger
@@ -48,37 +58,14 @@ async def create_book(
     user_id = current_user.get("user_id")
     book.user_id = user_id
 
-    # --- Subscription Limit Check ---
-    from app.config.database import users_collection
-    from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
-
-    # Get user subscription
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    subscription_data = user.get("subscription", {"tier": "free"})
-    tier_key = subscription_data.get("tier", "free")
-    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
-
-    book_limit = plan["limits"]["books"]
-
-    # Check limit if not unlimited (-1)
-    if book_limit != -1:
-        current_book_count = await books_collection.count_documents({
-            "user_id": user_id,
-            "deleted_at": None  # Only count non-deleted books
-        })
-        if current_book_count >= book_limit:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Book limit reached for {plan['name']} plan. Upgrade to create more books.",
-            )
-    # --------------------------------
-    
+    # ADR-041: books are unlimited on every tier. The one ceiling is per document.
     logger.info(f"Creating book: {book.title}")
     # Exclude _id to let MongoDB generate it as ObjectId
     book_dict = book.model_dump(by_alias=True, exclude={'id'})
+    if book_dict.get("full_content"):
+        stats = document_stats(parse_lexical(book_dict["full_content"]), book_dict["full_content"])
+        ensure_document_within_ceiling(stats["word_count"])
+        book_dict.update(stats)
 
     new_book = await books_collection.insert_one(book_dict)
     book_id = str(new_book.inserted_id)
@@ -122,7 +109,9 @@ async def edit_book(
     # save, so the library never parses content to draw a row.
     if update_data.get("full_content"):
         content = update_data["full_content"]
-        update_data.update(document_stats(parse_lexical(content), content))
+        stats = document_stats(parse_lexical(content), content)
+        ensure_document_within_ceiling(stats["word_count"])
+        update_data.update(stats)
     
     if not update_data:
         raise HTTPException(status_code=400, detail="No data provided for update")

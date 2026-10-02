@@ -13,6 +13,8 @@ silently ignored (never errored, never partially applied) for Plus/Free.
 from __future__ import annotations
 
 from bson import ObjectId
+from datetime import datetime, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from google.api_core import exceptions as google_api_exceptions
@@ -22,7 +24,8 @@ from google.cloud import texttospeech
 from app.ai_orchestrator.llm_clients.tts_client import get_tts_client
 from app.auth.dependencies import get_subscription_tier
 from app.auth.firebase_auth import get_firebase_user
-from app.config.database import books_collection
+from app.config.database import books_collection, users_collection
+from app.config.subscription_plans import plan_limit
 from app.models.tts import TextSegment, TTSRequest
 from app.services.tts.audio_stitching import concatenate_mp3_segments
 from app.services.tts.segmentation import segment_text
@@ -90,6 +93,48 @@ def _truncate_to_byte_limit(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+TTS_LIMIT_REACHED_CODE = "tts_limit_reached"
+
+
+async def reserve_tts_characters(user_id: str, chars: int, limit: int, now: Optional[datetime] = None) -> None:
+    """ADR-041 fair use: count this request's characters against the month, refusing past the ceiling.
+
+    The counter lives on the user as `subscription.tts_chars_month` with its
+    month in `subscription.tts_chars_reset`; a new month starts the count over.
+    The reservation is one conditional update, so concurrent requests cannot
+    both squeeze under the line.
+    """
+    if limit == -1 or chars <= 0:
+        return
+    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    result = await users_collection.update_one(
+        {
+            "_id": ObjectId(user_id),
+            "$or": [
+                {"subscription.tts_chars_reset": {"$ne": month}},
+                {"subscription.tts_chars_month": {"$lte": limit - chars}},
+                {"subscription.tts_chars_month": {"$exists": False}},
+            ],
+        },
+        [
+            {
+                "$set": {
+                    "subscription.tts_chars_month": {
+                        "$cond": [
+                            {"$ne": [{"$ifNull": ["$subscription.tts_chars_reset", ""]}, month]},
+                            chars,
+                            {"$add": [{"$ifNull": ["$subscription.tts_chars_month", 0]}, chars]},
+                        ]
+                    },
+                    "subscription.tts_chars_reset": month,
+                }
+            }
+        ],
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=429, detail={"code": TTS_LIMIT_REACHED_CODE, "limit": limit})
 
 
 @router.post("/{book_id}/tts")
@@ -167,6 +212,8 @@ async def generate_tts(
         window_seconds=_TTS_RATE_LIMIT_WINDOW_SECONDS,
         detail=_TTS_RATE_LIMIT_DETAIL,
     )
+    # ADR-041 fair use, after the access checks so a bad id or a stranger's book keeps its 400/404.
+    await reserve_tts_characters(user_id, len(body.text or ""), plan_limit(tier, "tts_chars_per_month"))
 
     # Pro-only language override; Plus always uses en-US (T-6-02 mitigation)
     language_code: str = body.language_code if tier == "pro" else "en-US"

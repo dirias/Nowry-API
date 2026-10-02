@@ -194,12 +194,14 @@ async def _get_remaining_quota(user_id: str) -> int:
         subscription_data = user_data.get("subscription", {"tier": "free"})
         tier_key = subscription_data.get("tier", "free")
         plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
-        limit = plan["limits"].get("flashcards", 0)
+        # ADR-041: the import has its own ceiling, counted on imported cards only;
+        # manual cards are unlimited on every tier.
+        limit = plan["limits"].get("import_cards", -1)
 
         if limit == -1:
             return -1
 
-        current_count = await cards_collection.count_documents({"user_id": user_id, "deleted_at": None})
+        current_count = await cards_collection.count_documents({"user_id": user_id, "deleted_at": None, "source": "imported"})
         return max(0, limit - current_count)
     except HTTPException:
         raise
@@ -323,6 +325,7 @@ async def confirm_import(
             "title": card.front,
             "content": card.back,
             "card_type": "flashcard",
+            "source": "imported",  # ADR-041: counted against the import ceiling
             "tags": card.tags,
             "ease_factor": 2.5,
             "interval": 1,

@@ -2,10 +2,14 @@
 Subscription Plans and Limits Configuration
 Defines the features and limitations for each subscription tier.
 
-Tiers:
-  - free:  Basic access, limited resources, Study Buddy with knowledge spark cap.
-  - plus:  $8.99/month — Enhanced limits, persistent pet memory, better AI model.
-  - pro:   $19.99/month — Full access, vision/scan, unlimited agent messages, top model.
+Tiers (ADR-041, the tier contract):
+  - free:  everything by hand unlimited; AI as a taste in per-call sizes under a
+           monthly ceiling; 50 companion messages; one portrait at first reveal.
+  - plus:  $8.99/month — book-level AI, read-aloud, companion memory and personality.
+  - pro:   $19.99/month — deck-level AI, any language read-aloud, top model.
+Limits are -1 for unlimited. The two "fair use" ceilings (ai_calls_per_month on
+paid tiers, tts_chars_per_month) sit well above normal use and exist so a single
+heavy account cannot cost more than it pays.
 """
 
 from enum import Enum
@@ -38,13 +42,15 @@ SUBSCRIPTION_PLANS = {
             "agent_custom_personality": False, # Default personality only
         },
         "limits": {
-            "books": 3,
-            "pages_per_book": 50,
-            "flashcards": 50,
-            "quiz_questions": 10,
-            "visual_diagrams": 5,
-            "ai_generations_per_month": 0,
+            "books": -1,
+            "flashcards": -1,
+            "quiz_questions": -1,
+            "visual_diagrams": -1,
+            "import_cards": 2000,             # Anki cards a free account may bring in
+            "ai_calls_per_month": 50,         # the monthly safety ceiling on AI generation calls
             "agent_messages_per_month": 50,   # 50 "Knowledge Sparks"
+            "document_words": 200_000,        # one ceiling per document, every tier
+            "tts_chars_per_month": 0,         # read-aloud is Plus and Pro
         },
     },
     SubscriptionTier.PLUS: {
@@ -57,13 +63,15 @@ SUBSCRIPTION_PLANS = {
             "agent_custom_personality": True,  # Custom vibe/name
         },
         "limits": {
-            "books": 15,
-            "pages_per_book": 200,
-            "flashcards": 500,
-            "quiz_questions": 100,
-            "visual_diagrams": 50,
-            "ai_generations_per_month": 100,
+            "books": -1,
+            "flashcards": -1,
+            "quiz_questions": -1,
+            "visual_diagrams": -1,
+            "import_cards": -1,
+            "ai_calls_per_month": 1000,       # fair use
             "agent_messages_per_month": -1,   # Unlimited
+            "document_words": 200_000,
+            "tts_chars_per_month": 1_000_000, # fair use
         },
     },
     SubscriptionTier.PRO: {
@@ -76,13 +84,15 @@ SUBSCRIPTION_PLANS = {
             "agent_custom_personality": True,
         },
         "limits": {
-            "books": -1,  # Unlimited
-            "pages_per_book": 500,
+            "books": -1,
             "flashcards": -1,
             "quiz_questions": -1,
             "visual_diagrams": -1,
-            "ai_generations_per_month": -1,
+            "import_cards": -1,
+            "ai_calls_per_month": 1000,       # fair use
             "agent_messages_per_month": -1,   # Unlimited
+            "document_words": 200_000,
+            "tts_chars_per_month": 1_000_000, # fair use
         },
     },
 }
@@ -96,10 +106,22 @@ STRIPE_PRICE_IDS = {
     "pro_annual":   os.getenv("STRIPE_PRO_ANNUAL_PRICE_ID"),
 }
 
-# Monthly AI generation limits per tier (used by track_ai_usage in Phase 4 enforcement)
-# -1 means unlimited; 0 means Free tier has no AI card/quiz/visualizer generation
+# Monthly ceiling on AI generation calls per tier, enforced by track_ai_usage
+# (GTM-003). Derived from the plan table so there is one place to change it;
+# the web reads the free value from FREE_AI_CALLS_PER_MONTH in @nowry/core.
 AI_USAGE_LIMITS: dict = {
-    SubscriptionTier.FREE: 0,
-    SubscriptionTier.PLUS: 100,
-    SubscriptionTier.PRO: -1,
+    tier: plan["limits"]["ai_calls_per_month"] for tier, plan in SUBSCRIPTION_PLANS.items()
 }
+
+# The free taste, per call (v1.0 CARD-01 / QUIZ-01 / ILLUS-01): small outputs,
+# unlimited calls under the monthly ceiling above.
+FREE_PER_CALL: dict = {"cards": 2, "quiz_questions": 5, "illustrations": 2}
+
+
+def plan_limit(tier: str, key: str) -> int:
+    """A plan's limit by key, reading an unknown tier as free. -1 means unlimited."""
+    try:
+        plan = SUBSCRIPTION_PLANS[SubscriptionTier(tier)]
+    except (ValueError, KeyError):
+        plan = SUBSCRIPTION_PLANS[SubscriptionTier.FREE]
+    return int(plan["limits"].get(key, -1))

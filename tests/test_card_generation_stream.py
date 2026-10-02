@@ -99,7 +99,7 @@ async def _mock_track_ai_usage() -> dict:
         "user_id": USER_ID,
         "firebase_uid": "test-firebase-uid-123",
         "email": "test@example.com",
-        "subscription": {"tier": "free", "status": "active", "ai_usage_count": 1},
+        "subscription": {"tier": "plus", "status": "active", "ai_usage_count": 1},  # ADR-041: free is capped at two a call; these test the stream
     }
 
 
