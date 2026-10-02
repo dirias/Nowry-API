@@ -10,6 +10,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pymongo.errors import DuplicateKeyError
 from app.config.firebase_config import verify_firebase_token
 from app.config.subscription_plans import SubscriptionTier
+from app.config.beta import INVITE_HEADER, gate_new_account
 from app.models.User import USERNAME_MAX_LENGTH, sanitize_username
 from functools import lru_cache
 from typing import Optional
@@ -162,6 +163,12 @@ async def get_firebase_user(request: Request) -> dict:
             # via Google before /auth/register is called.
             # Auto-create a minimal user document so the request succeeds and
             # the frontend can drive onboarding (wizard) normally.
+            #
+            # ADR-038: this is the one place a brand-new account comes into
+            # being, for the email flow and the Google flow alike, so the beta
+            # invite is enforced here. A refusal is raised before anything is
+            # written; an existing account never reaches this branch.
+            beta_stamp: Optional[dict] = gate_new_account(request.headers.get(INVITE_HEADER))
             display_name: str = token_data.get("name") or ""
             email: str = token_data.get("email") or ""
             raw_username: str = display_name or (email.split("@")[0] if email else "user")
@@ -204,6 +211,7 @@ async def get_firebase_user(request: Request) -> dict:
                     "subscription_status_updated_at": now,
                 },
                 "wizard_completed": False,
+                "beta": beta_stamp,  # ADR-038: cohort and code when the gate let them in
                 "preferences": {
                     "pet": {
                         # Mirror register_user's new-account defaults (auth.py):

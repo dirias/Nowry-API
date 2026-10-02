@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, ConfigDict
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import users_collection
+from app.config.beta import require_upgrades_open
 from bson import ObjectId
 
 # Configure Stripe at module level (RESEARCH.md Pattern 1 — never inside a request handler)
@@ -84,6 +85,9 @@ async def create_checkout_session(
     Stripe customer is created on-demand if the user has no stripe_customer_id
     (existing-user fallback — RESEARCH.md Pitfall 5).
     """
+    # ADR-038: while the beta keeps upgrades closed, no checkout is created.
+    require_upgrades_open()
+
     # Price ID whitelist validation — BEFORE any MongoDB or Stripe call (security D-03)
     if body.price_id not in VALID_PRICE_IDS:
         raise HTTPException(status_code=400, detail="Invalid price ID")

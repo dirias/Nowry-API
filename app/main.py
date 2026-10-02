@@ -68,6 +68,7 @@ from app.routers import (
     goal_ai,
     comments,
     contact,
+    beta,
 )
 
 
@@ -177,6 +178,7 @@ app.include_router(sheets.router)         # Micro Sheets — CRUD /sheets
 app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (Pro-only)
 app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  # Text-anchored annotations
 app.include_router(contact.router)        # The public contact form — POST /contact (SITE-006)
+app.include_router(beta.router)           # The beta gate — GET /beta/config, invites, waitlist (ADR-038)
 
 
 @app.get("/")

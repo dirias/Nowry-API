@@ -23,6 +23,7 @@ study_cards_collection = db["cards"]  # Alias for cards collection
 tasks_collection = db["tasks"]
 bugs_collection = db["bugs"]
 contact_messages_collection = db["contact_messages"]  # the public contact form (SITE-006)
+waitlist_collection = db["waitlist"]  # the beta waitlist, one row per email (ADR-038)
 
 # --- Annual Planning Collections ---
 annual_plans_collection = db["annual_plans"]
@@ -339,5 +340,8 @@ async def create_indexes():
     await rate_limits_collection.create_index(
         "expires_at", expireAfterSeconds=0, name="rate_limit_ttl"
     )
+
+    # The beta waitlist upserts by email (ADR-038); the index makes that the key.
+    await waitlist_collection.create_index("email", unique=True, name="waitlist_email")
 
     logger.info("Database indexes created successfully.")
