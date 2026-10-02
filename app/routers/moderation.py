@@ -2,7 +2,7 @@
 Content Moderation API Router
 Handles reporting inappropriate/problematic public content
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from typing import Optional, Literal
 from pydantic import BaseModel
 from bson import ObjectId
@@ -12,6 +12,7 @@ from app.config.database import db
 from app.models.PublicContent import ContentReport
 from app.auth.firebase_auth import get_current_user
 from app.auth.dependencies import require_admin
+from app.services.notifications import notify, report_notification
 
 router = APIRouter(prefix="/moderation", tags=["Content Moderation"])
 
@@ -35,6 +36,7 @@ async def report_content(
     content_type: Literal["book", "deck", "card"],
     content_id: str,
     report_data: ReportContentRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -90,8 +92,8 @@ async def report_content(
     
     result = await db["content_reports"].insert_one(report.model_dump(by_alias=True))
     
-    # TODO: Send notification to moderators/admin
-    # await notify_moderators(report_id=str(result.inserted_id))
+    # GTM-007: the mailbox hears about every report, after the report is stored.
+    background_tasks.add_task(notify, *report_notification(report.model_dump(), str(result.inserted_id)))
     
     return {
         "message": "Report submitted successfully. Our team will review it shortly.",

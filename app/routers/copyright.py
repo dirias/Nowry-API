@@ -9,11 +9,12 @@ it is tested without the limiter or a request.
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, BackgroundTasks, Request, status
 
 from app.config.database import copyright_notices_collection
 from app.core.limiter import limiter
 from app.models.CopyrightNotice import CopyrightNoticeCreate, CopyrightNoticeResponse
+from app.services.notifications import copyright_notification, notify
 
 router = APIRouter(prefix="/copyright-notices", tags=["copyright"])
 
@@ -42,6 +43,8 @@ async def store_copyright_notice(payload: CopyrightNoticeCreate, collection) -> 
 
 @router.post("", response_model=CopyrightNoticeResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
-async def submit_copyright_notice(request: Request, payload: CopyrightNoticeCreate) -> CopyrightNoticeResponse:
-    """Store a notice from the takedown page. No auth; 5 per minute per address."""
-    return await store_copyright_notice(payload, copyright_notices_collection)
+async def submit_copyright_notice(request: Request, payload: CopyrightNoticeCreate, background_tasks: BackgroundTasks) -> CopyrightNoticeResponse:
+    """Store a notice from the takedown page, then tell the mailbox (GTM-007). No auth; 5 per minute per address."""
+    response = await store_copyright_notice(payload, copyright_notices_collection)
+    background_tasks.add_task(notify, *copyright_notification(notice_document(payload)))
+    return response

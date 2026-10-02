@@ -9,11 +9,12 @@ so it can be tested without the limiter or a request.
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, BackgroundTasks, Request, status
 
 from app.config.database import contact_messages_collection
 from app.core.limiter import limiter
 from app.models.Contact import ContactMessageCreate, ContactMessageResponse
+from app.services.notifications import contact_notification, notify
 
 router = APIRouter(prefix="/contact", tags=["contact"])
 
@@ -41,6 +42,8 @@ async def store_contact_message(payload: ContactMessageCreate, collection) -> Co
 
 @router.post("", response_model=ContactMessageResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
-async def submit_contact_message(request: Request, payload: ContactMessageCreate) -> ContactMessageResponse:
-    """Store a message from the public contact form. No auth; 5 per minute per address."""
-    return await store_contact_message(payload, contact_messages_collection)
+async def submit_contact_message(request: Request, payload: ContactMessageCreate, background_tasks: BackgroundTasks) -> ContactMessageResponse:
+    """Store a message from the public contact form, then tell the mailbox (GTM-007). No auth; 5 per minute per address."""
+    response = await store_contact_message(payload, contact_messages_collection)
+    background_tasks.add_task(notify, *contact_notification(contact_document(payload)))
+    return response
