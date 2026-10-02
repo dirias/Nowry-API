@@ -33,13 +33,7 @@ SUBSCRIPTION_PLANS = {
         "price_cents": 0,
         "features": {
             "ai_content_generation": False,
-            "export": False,
-            "advanced_analytics": False,
-            "custom_themes": False,
-            "collaboration": False,
-            # Study Buddy / Agent feature flags
-            "agent_enabled": True,           # All tiers get the buddy
-            "agent_vision": False,            # No image/book scanning
+            # Study Buddy / Agent feature flags (GTM-004: only flags a gate reads live here)
             "agent_persistent_memory": False, # Session-only memory
             "agent_custom_personality": False, # Default personality only
         },
@@ -58,13 +52,7 @@ SUBSCRIPTION_PLANS = {
         "price_cents": 899,  # $8.99
         "features": {
             "ai_content_generation": True,
-            "export": True,
-            "advanced_analytics": False,
-            "custom_themes": True,
-            "collaboration": False,
             # Study Buddy / Agent feature flags
-            "agent_enabled": True,
-            "agent_vision": False,            # Vision is Pro-only
             "agent_persistent_memory": True,  # Remembers across sessions
             "agent_custom_personality": True,  # Custom vibe/name
         },
@@ -83,13 +71,7 @@ SUBSCRIPTION_PLANS = {
         "price_cents": 1999,  # $19.99
         "features": {
             "ai_content_generation": True,
-            "export": True,
-            "advanced_analytics": True,
-            "custom_themes": True,
-            "collaboration": True,
             # Study Buddy / Agent feature flags
-            "agent_enabled": True,
-            "agent_vision": True,             # Full PDF/book scanning
             "agent_persistent_memory": True,
             "agent_custom_personality": True,
         },

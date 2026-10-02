@@ -43,9 +43,22 @@ class AgentLLM:
             
         self.groq_client = Groq(api_key=self.groq_api_key) if self.groq_api_key else None
 
-    def _get_provider(self) -> str:
-        """Prioritize Groq if available to save Gemini quota, fallback to Gemini."""
+    def _get_provider(self, tier: Optional[str] = None) -> str:
+        """The provider a tier is sold: Free on Groq, Plus and Pro on Gemini (v1.0 Phase 4, GTM-004).
+
+        This used to prefer Groq whenever its key was set, so a Pro subscriber's
+        chat never reached the model the plan names. The tier decides now; a
+        missing key falls back to whatever is configured, with a warning, rather
+        than failing the chat.
+        """
+        wants_gemini = tier in ("plus", "pro")
+        if wants_gemini and self.gemini_api_key:
+            return "gemini"
+        if not wants_gemini and self.groq_api_key:
+            return "groq"
         if self.groq_api_key:
+            if wants_gemini:
+                logger.warning("agent_llm: GEMINI_API_KEY missing; %s-tier chat falling back to Groq", tier)
             return "groq"
         if self.gemini_api_key:
             return "gemini"
@@ -129,7 +142,7 @@ class AgentLLM:
         user_id: str = None,
         tier: str = None,
     ) -> str:
-        provider = self._get_provider()
+        provider = self._get_provider(tier)
 
         if provider == "gemini":
             return await self._chat_gemini(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
