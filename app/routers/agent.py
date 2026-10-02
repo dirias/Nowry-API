@@ -1075,6 +1075,12 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
 MAX_PORTRAITS_PER_STAGE = 5
 
 
+def companion_animation_enabled() -> bool:
+    """ADR-040: the AI animation is held. Off unless the operator switches it on."""
+    return os.getenv("COMPANION_ANIMATION_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+
 def _portraits_for(pet_prefs: dict, stage: int) -> list[str]:
     """Every portrait generated for a stage, oldest first.
 
@@ -1576,7 +1582,9 @@ async def grant_xp(user_id: str, amount: int) -> dict:
                     {"_id": ObjectId(user_id)},
                     {"$set": {
                         "preferences.pet.avatar_regen_pending": True,
-                        "preferences.pet.animation_regen_pending": True,
+                        # ADR-040: the animation no longer follows an evolution;
+                        # the flag is only raised while motion is switched on.
+                        **({"preferences.pet.animation_regen_pending": True} if companion_animation_enabled() else {}),
                     }}
                 )
                 avatar_regen_pending_flag = True
@@ -3252,7 +3260,13 @@ async def generate_animation(
     body: GenerateAnimationRequest = Body(default_factory=GenerateAnimationRequest),
     current_user: dict = Depends(get_firebase_user),
 ) -> GenerateAnimationResponse:
-    """Generate a looping animation for the user's Study Pet using Luma Ray 2 Flash via fal.ai."""
+    """Generate a looping animation for the user's Study Pet using Luma Ray 2 Flash via fal.ai.
+
+    ADR-040: motion is held. The endpoint stays, switched off behind
+    `COMPANION_ANIMATION_ENABLED`, so the revisit is a variable and not a rewrite.
+    """
+    if not companion_animation_enabled():
+        raise HTTPException(status_code=403, detail="animation_disabled")
     user_id: str = current_user.get("user_id")
 
     user_doc = await users_collection.find_one({"_id": ObjectId(user_id)}) if user_id else None
