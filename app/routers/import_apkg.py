@@ -175,8 +175,16 @@ def _parse_apkg(file_bytes: bytes, filename: str) -> tuple[str, List[ParsedCard]
         return suggested_name, cards
 
 
+QUOTA_UNAVAILABLE_CODE = "quota_unavailable"
+
+
 async def _get_remaining_quota(user_id: str) -> int:
-    """Return remaining flashcard quota. -1 means unlimited."""
+    """Return remaining flashcard quota. -1 means unlimited.
+
+    GTM-005: this used to return -1 (unlimited) on any exception, so a Mongo
+    hiccup lifted the plan limit. It now fails closed with a 503 the client can
+    retry, and it counts only live cards, the way the card-create path does.
+    """
     try:
         from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
         user_data = await users_collection.find_one({"_id": ObjectId(user_id)})
@@ -191,10 +199,13 @@ async def _get_remaining_quota(user_id: str) -> int:
         if limit == -1:
             return -1
 
-        current_count = await cards_collection.count_documents({"user_id": user_id})
+        current_count = await cards_collection.count_documents({"user_id": user_id, "deleted_at": None})
         return max(0, limit - current_count)
-    except Exception:
-        return -1  # Default to unlimited on error
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Import quota check failed for user %s: %s", user_id, exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": QUOTA_UNAVAILABLE_CODE})
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

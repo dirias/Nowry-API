@@ -148,7 +148,10 @@ async def edit_book(
         # Trigger background RAG indexing if content changed
         if "full_content" in update_data and update_data["full_content"]:
             from app.utils.book_rag import index_book
-            user_id: str = current_user["uid"]
+            # GTM-005: chat retrieval filters chunks on the Mongo user id
+            # (`agent.py` passes current_user["user_id"]); indexing used to store
+            # the Firebase uid, so no chunk ever matched. Same id on both sides.
+            user_id: str = current_user["user_id"]
             background_tasks.add_task(
                 index_book,
                 book_id=str(existing_book["_id"]),
