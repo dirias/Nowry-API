@@ -24,14 +24,15 @@ class VisualRequest(BaseModel):
 @limiter.limit("10/minute")
 async def generate_visual(
     request: Request,
-    request: VisualRequest,
+    body: VisualRequest,
     current_user: dict = Depends(track_ai_usage),
 ) -> dict:
-    # TODO: AI usage limit enforcement is pending (Phase 4 deferred — WR-01)
+    # The monthly ceiling is enforced by track_ai_usage (GTM-003); `request` is
+    # the HTTP request the rate limiter reads, `body` the visual to make.
     tier: str = current_user.get("subscription", {}).get("tier", "free")
     logger.info(f"[visualizer] tier={tier}")
     try:
-        inputs = {"text": request.text, "viz_type": request.viz_type, "tier": tier}
+        inputs = {"text": body.text, "viz_type": body.viz_type, "tier": tier}
         # Invoke via orchestrator
         result = orchestrator.invoke("visualizer", inputs)
 
