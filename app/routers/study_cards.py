@@ -323,6 +323,34 @@ def _summary_row(row: dict) -> dict:
 EMPTY_SUMMARY = {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0, "resting": 0}
 
 
+POOL_TAGS_LIMIT = 500
+
+
+async def _pool_tags(collection: Collection, match: dict, now_dt: datetime) -> list:
+    """The pool's tags, each with its new and due counts (TAG-001, ADR-044 point 1).
+
+    A study session's Tags list used to be the served queue's tags, so a tag
+    whose cards the day's budget did not pick was simply absent. This counts
+    over the whole pool the session draws from — `match` is the deck's cards,
+    or every active deck's — so the list reads as "what is waiting, by tag".
+    Only tags with something waiting are listed; a resting card is neither new
+    nor due (`_group_stage`), so a resting tag drops out on its own.
+    """
+    rows = await collection.aggregate([
+        {"$match": {**match, "tags": {"$exists": True, "$ne": []}}},
+        {"$unwind": "$tags"},
+        _group_stage(now_dt, "$tags"),
+        {"$match": {"$expr": {"$gt": [{"$add": ["$due", "$new"]}, 0]}}},
+        {"$sort": {"_id": 1}},
+        {"$limit": POOL_TAGS_LIMIT},
+    ]).to_list(length=POOL_TAGS_LIMIT)
+    return [
+        {"tag": row["_id"], "new": row.get("new", 0), "due": row.get("due", 0)}
+        for row in rows
+        if isinstance(row.get("_id"), str) and row["_id"].strip()
+    ]
+
+
 def _local_zone(tz_name: str) -> ZoneInfo:
     """The learner's zone, or a 400 naming the one we were given.
 
@@ -893,6 +921,11 @@ async def get_daily_review_cards(
         "user_id": user_id, "deleted_at": None, **resting_clause(now_dt),
         "$or": [{"deck_id": None}, {"deck_id": {"$exists": False}}, {"deck_id": {"$in": active_ids}}],
     })
+    # The pool's tags, unnarrowed, so the learner can move between tags
+    # (TAG-001, ADR-044 point 3). Over the decks the loop above served.
+    pool_tags = await _pool_tags(
+        collection, {"user_id": user_id, "deleted_at": None, "deck_id": {"$in": active_ids}}, now_dt
+    )
 
     return {
         "cards": cards,
@@ -900,6 +933,7 @@ async def get_daily_review_cards(
         "page": 1,
         "has_more": False,
         "resting": resting,
+        "tags": pool_tags,
         # Said in one sentence on the Today object when it ran (SR-002).
         "spread": landed if landed["decks"] > 0 else None,
     }
@@ -1351,6 +1385,9 @@ async def list_study_cards(
         deck_or = [{"deck_id": deck_obj_id}]
         if deck_id:
             deck_or.append({"deck_id": deck_id})
+        # Tags narrow the POOL the budgets draw from, as the daily review's
+        # have since STUDY-001 (TAG-001, ADR-044 point 2): the session is then
+        # SM-2's own selection for that tag's cards, not a view over the day's.
         new_cards_raw, review_cards_raw = await _select_session_cards(
             collection=collection,
             user_id=user_id,
@@ -1359,6 +1396,7 @@ async def list_study_cards(
             review_cap=review_cap,
             now_dt=now_dt,
             today_start=today_start,
+            narrow={"tags": {"$in": tags}} if tags else None,
         )
 
         cards = new_cards_raw + review_cards_raw
@@ -1369,12 +1407,16 @@ async def list_study_cards(
             if c.get("user_id"):
                 c["user_id"] = str(c["user_id"])
         await _annotate_source_books(cards)
+        # The deck's tags with something waiting, over the UNNARROWED pool
+        # (ADR-044 point 3), so a chosen tag never hides the others.
+        pool_tags = await _pool_tags(collection, {"user_id": user_id, "deleted_at": None, "$or": deck_or}, now_dt)
 
         return {
             "cards": cards,
             "total": len(cards),
             "page": 1,
             "has_more": False,
+            "tags": pool_tags,
         }
 
     # Generic path — paginated, no daily budget applied
