@@ -33,6 +33,33 @@ sys.modules.setdefault("app.routers.agent", _mock_agent_module)
 
 from app.routers import study_cards  # noqa: E402
 
+
+class _NoTagSettings:
+    """SR-001: the router grew a tag-settings collaborator. These tests have no
+    resting tags, so it answers nothing and writes nothing."""
+
+    def find(self, query, projection=None):
+        from unittest.mock import AsyncMock, MagicMock
+        cursor = MagicMock()
+        cursor.to_list = AsyncMock(return_value=[])
+        return cursor
+
+    async def find_one(self, query, **kwargs):
+        return None
+
+    async def update_one(self, *args, **kwargs):
+        from unittest.mock import MagicMock
+        return MagicMock(matched_count=0)
+
+    async def delete_one(self, *args, **kwargs):
+        from unittest.mock import MagicMock
+        return MagicMock(deleted_count=0)
+
+
+@pytest.fixture(autouse=True)
+def _no_tag_settings(monkeypatch):
+    monkeypatch.setattr(study_cards, "tag_settings_collection", _NoTagSettings())
+
 OWNER = "507f1f77bcf86cd799439011"
 DECK_A = ObjectId("507f1f77bcf86cd799439077")
 DECK_B = ObjectId("507f1f77bcf86cd799439078")
@@ -173,9 +200,9 @@ async def test_groups_returns_tags_sorted_and_the_two_system_groups(monkeypatch)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["tags"][0] == {"tag": "verbs", "cards": 46, "decks": 2, "deck_ids": sorted([str(DECK_A), str(DECK_B)]), "due": 9, "new": 2}, "deck ids dedupe across ObjectId and string forms"
-    assert body["system"][0] == {"key": "marked", "cards": 6, "decks": 2, "deck_ids": sorted([str(DECK_A), str(DECK_B)]), "due": 2, "new": 1}
-    assert body["system"][1] == {"key": "struggling", "cards": 7, "decks": 1, "deck_ids": [str(DECK_A)], "due": 7, "new": 0, "window_days": 14}
+    assert body["tags"][0] == {"tag": "verbs", "cards": 46, "decks": 2, "deck_ids": sorted([str(DECK_A), str(DECK_B)]), "due": 9, "new": 2, "resting": 0, "rest_until": None}, "deck ids dedupe across ObjectId and string forms"
+    assert body["system"][0] == {"key": "marked", "cards": 6, "decks": 2, "deck_ids": sorted([str(DECK_A), str(DECK_B)]), "due": 2, "new": 1, "resting": 0}
+    assert body["system"][1] == {"key": "struggling", "cards": 7, "decks": 1, "deck_ids": [str(DECK_A)], "due": 7, "new": 0, "resting": 0, "window_days": 14}
     tag_pipeline = next(p for p in cards.pipelines if any("$unwind" in s for s in p))
     assert {"$sort": {"due": -1, "cards": -1, "_id": 1}} in tag_pipeline
 
@@ -184,7 +211,7 @@ async def test_groups_returns_tags_sorted_and_the_two_system_groups(monkeypatch)
 async def test_groups_struggling_is_empty_without_a_query_when_no_card_qualifies(monkeypatch):
     cards = FakeCollection(aggregate=lambda p: [])
     response = await _get("/study-cards/groups", cards, monkeypatch)
-    assert response.json()["system"][1] == {"key": "struggling", "cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0, "window_days": 14}
+    assert response.json()["system"][1] == {"key": "struggling", "cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0, "resting": 0, "window_days": 14}
     assert not any("_id" in p[0]["$match"] for p in cards.pipelines), "no $in over an empty id list"
 
 

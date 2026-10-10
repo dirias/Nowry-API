@@ -37,6 +37,33 @@ sys.modules.setdefault("app.routers.agent", _mock_agent_module)
 
 from app.routers import decks, study_cards  # noqa: E402
 
+
+class _NoTagSettings:
+    """SR-001: the router grew a tag-settings collaborator. These tests have no
+    resting tags, so it answers nothing and writes nothing."""
+
+    def find(self, query, projection=None):
+        from unittest.mock import AsyncMock, MagicMock
+        cursor = MagicMock()
+        cursor.to_list = AsyncMock(return_value=[])
+        return cursor
+
+    async def find_one(self, query, **kwargs):
+        return None
+
+    async def update_one(self, *args, **kwargs):
+        from unittest.mock import MagicMock
+        return MagicMock(matched_count=0)
+
+    async def delete_one(self, *args, **kwargs):
+        from unittest.mock import MagicMock
+        return MagicMock(deleted_count=0)
+
+
+@pytest.fixture(autouse=True)
+def _no_tag_settings(monkeypatch):
+    monkeypatch.setattr(study_cards, "tag_settings_collection", _NoTagSettings())
+
 OWNER = "507f1f77bcf86cd799439011"
 OTHER = "507f1f77bcf86cd799439022"
 DECK_A = ObjectId("507f1f77bcf86cd799439077")

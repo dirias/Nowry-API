@@ -13,6 +13,8 @@ from app.auth.firebase_auth import get_firebase_user, optional_auth
 from app.auth.dependencies import require_ownership, require_public_or_ownership
 from app.config.database import cards_collection, decks_collection
 from app.models.Deck import Deck, DeckWithStats
+from app.models.StudyCard import RestBody
+from app.services.rest import SOURCE_DECK, awake_clause, now_naive as _rest_now, rest_many, resting_clause, until_or_indefinite, wake_many
 from app.models.deck_settings import (
     DeckSettingsUpdate,
     DeckSettingsResponse,
@@ -134,6 +136,7 @@ async def list_decks(
         total_count = d.get("total_cards", 0)
         due_count = 0
         new_count = 0
+        resting_count = 0
         mastery = 0
         last_studied = None
         is_due_soon = False
@@ -150,14 +153,19 @@ async def list_decks(
             # due_count = only cards that have been reviewed before AND whose
             # next_review is now past due.  New cards (last_reviewed is None)
             # are intentionally excluded here — they are counted in new_count.
+            # A resting card is neither due nor new, and is named (SR-001, ADR-043).
             due_count = await cards_collection.count_documents({
                 **deck_filter,
                 "deleted_at": None,
+                **awake_clause(now_dt),
                 "last_reviewed": {"$ne": None},
                 "next_review": {"$lte": now_dt}
             })
             new_count = await cards_collection.count_documents(
-                {**deck_filter, "last_reviewed": None, "deleted_at": None}
+                {**deck_filter, "last_reviewed": None, "deleted_at": None, **awake_clause(now_dt)}
+            )
+            resting_count = await cards_collection.count_documents(
+                {**deck_filter, "deleted_at": None, **resting_clause(now_dt)}
             )
 
             last_card = await cards_collection.find_one(
@@ -168,7 +176,7 @@ async def list_decks(
 
             # Find the next card due in the future to compute exact hours remaining
             next_card = await cards_collection.find_one(
-                {**deck_filter, "deleted_at": None, "next_review": {"$gt": now_dt}},
+                {**deck_filter, "deleted_at": None, **awake_clause(now_dt), "next_review": {"$gt": now_dt}},
                 sort=[("next_review", 1)]
             )
             if next_card and next_card.get("next_review"):
@@ -227,6 +235,7 @@ async def list_decks(
         d["total_cards"] = total_count
         d["due_cards"] = due_count
         d["new_cards"] = new_count
+        d["resting_cards"] = resting_count
         d["mastery"] = mastery
         d["last_studied"] = last_studied
         d["is_due_soon"] = is_due_soon
@@ -414,6 +423,47 @@ async def restore_deck(
     logger.info(f"Restoring deck {deck['_id']}")
     reviewed = await _deck_has_reviewed_cards(ObjectId(deck["_id"]))
     return await _set_archived(collection, deck, None, "review" if reviewed else "new")
+
+
+# ---------------------------------------------------------------------------
+# SR-001 — rest is a state a deck can be in, and every card in it carries it
+# (ADR-043 points 2 and 4). Unlike archive, a resting deck stays in the
+# library; its cards leave the counts and the selection and keep their schedule.
+# ---------------------------------------------------------------------------
+
+async def _set_deck_rest(collection: Collection, deck: dict, rest_until: Optional[datetime]) -> dict:
+    deck_oid = ObjectId(deck["_id"])
+    now = _rest_now()
+    await collection.update_one(
+        {"_id": deck_oid},
+        {"$set": {"rest_until": rest_until, "updated_at": datetime.now(timezone.utc)}},
+    )
+    card_match = {"deck_id": {"$in": [deck_oid, str(deck_oid)]}, "deleted_at": None}
+    if rest_until is not None:
+        await rest_many(cards_collection, card_match, SOURCE_DECK, rest_until, now)
+    else:
+        await wake_many(cards_collection, card_match, now, source=SOURCE_DECK)
+    updated = await collection.find_one({"_id": deck_oid})
+    return _serialise_deck(updated)
+
+
+@router.post("/{id}/rest", summary="Rest a deck: its cards leave play, schedule kept, library unchanged (SR-001)", response_model=Deck)
+async def rest_deck(
+    body: RestBody,
+    collection: Collection = Depends(get_decks_collection),
+    deck: dict = Depends(require_ownership(get_decks_collection, "id")),
+) -> dict:
+    logger.info(f"Resting deck {deck['_id']}")
+    return await _set_deck_rest(collection, deck, until_or_indefinite(body.until))
+
+
+@router.post("/{id}/wake", summary="Wake a deck: its hold goes from its cards; a card's or tag's own stays (SR-001)", response_model=Deck)
+async def wake_deck(
+    collection: Collection = Depends(get_decks_collection),
+    deck: dict = Depends(require_ownership(get_decks_collection, "id")),
+) -> dict:
+    logger.info(f"Waking deck {deck['_id']}")
+    return await _set_deck_rest(collection, deck, None)
 
 
 # ---------------------------------------------------------------------------

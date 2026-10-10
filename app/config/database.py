@@ -20,6 +20,7 @@ books_collection = db["books"]
 decks_collection = db["decks"]
 cards_collection = db["cards"]
 study_cards_collection = db["cards"]  # Alias for cards collection
+tag_settings_collection = db["tag_settings"]  # a tag's own record: its rest (SR-001, ADR-043)
 tasks_collection = db["tasks"]
 bugs_collection = db["bugs"]
 contact_messages_collection = db["contact_messages"]  # the public contact form (SITE-006)

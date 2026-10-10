@@ -21,6 +21,9 @@ class DeckWithStats(BaseModel):
     updated_at: Optional[datetime] = None
     # ADR-023 point 4: archive is a state the deck is in, read by one clause.
     archived_at: Optional[datetime] = None
+    # Rest (SR-001): the deck's own hold on its cards; the far date means until woken.
+    rest_until: Optional[datetime] = None
+    resting_cards: int = 0
     # Computed at request time
     total_cards: int = 0
     due_cards: int = 0
@@ -53,6 +56,8 @@ class Deck(BaseModel, SoftDeleteMixin):
     deck_type: Literal["flashcard", "quiz", "visual"] = "flashcard"
     # Set by POST /decks/{id}/archive, cleared by /restore; never through PATCH.
     archived_at: Optional[datetime] = None
+    # Set by POST /decks/{id}/rest, cleared by /wake; never through PATCH (SR-001, ADR-043).
+    rest_until: Optional[datetime] = None
     voice_settings: Optional[dict] = {
         "front": {"voice_name": None, "rate": 1.0, "pitch": 1.0},
         "back": {"voice_name": None, "rate": 1.0, "pitch": 1.0}

@@ -7,14 +7,31 @@ from app.models.StudyCard import (
     MAX_BULK_IDS,
     BulkCardAction,
     BulkCardResult,
+    RestBody,
     StudyCard,
     StudyCardUpdate,
     TagRemove,
     TagRename,
+    TagRestResult,
     TagVerbResult,
 )
 from app.models.deck_config import resolve_deck_budget
-from app.config.database import cards_collection, decks_collection, books_collection, study_sessions_collection
+from app.config.database import cards_collection, decks_collection, books_collection, study_sessions_collection, tag_settings_collection
+from app.services.rest import (
+    SOURCE_CARD,
+    awake_clause,
+    deck_is_resting,
+    now_naive as _rest_now,
+    rest_many,
+    resting_clause,
+    resting_expr,
+    resting_tag_settings,
+    sync_deck_rest,
+    sync_tag_rests,
+    tag_source,
+    until_or_indefinite,
+    wake_many,
+)
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
@@ -37,6 +54,10 @@ def get_cards_collection() -> Collection:
 
 def get_decks_collection() -> Collection:
     return decks_collection
+
+
+def get_tag_settings_collection() -> Collection:
+    return tag_settings_collection
 
 
 async def _verify_deck_ownership(deck_id: str, user_id: str):
@@ -87,7 +108,10 @@ async def _select_session_cards(
     Review cards keep the simple "due now, capped by remaining daily budget"
     behaviour — they are intrinsically deterministic by `next_review`.
     """
-    base_match = {"user_id": user_id, "deleted_at": None, "$or": deck_or, **(narrow or {})}
+    # Resting cards are out of play (SR-001, ADR-043 point 4): one clause on
+    # the base match and on the fresh top-up alike, so a rested card is neither
+    # served nor stamped as introduced.
+    base_match = {"user_id": user_id, "deleted_at": None, "$or": deck_or, **awake_clause(now_dt), **(narrow or {})}
 
     # 1. Calculate how many NEW cards were studied today to adjust the remaining budget
     new_studied_today = await collection.count_documents({
@@ -117,6 +141,7 @@ async def _select_session_cards(
             "user_id": user_id,
             "deleted_at": None,
             "last_reviewed": None,
+            **awake_clause(now_dt),
             **(narrow or {}),
             "$and": [
                 {"$or": deck_or},
@@ -267,13 +292,17 @@ def _group_stage(now_dt: datetime, key_expr) -> dict:
     """One $group that yields cards / decks / due / new for a set of cards.
     due = reviewed before and next_review ≤ now; new = never reviewed. The two
     never overlap, so the study centre can add them for "Study · N"."""
+    # A resting card is counted, and named, and is neither due nor new
+    # (SR-001, ADR-043 point 7).
+    awake = {"$not": [resting_expr(now_dt)]}
     return {"$group": {
         "_id": key_expr,
         "cards": {"$sum": 1},
         "deck_ids": {"$addToSet": "$deck_id"},
         "due": {"$sum": {"$cond": [
-            {"$and": [{"$ne": ["$last_reviewed", None]}, {"$lte": ["$next_review", now_dt]}]}, 1, 0]}},
-        "new": {"$sum": {"$cond": [{"$eq": [{"$ifNull": ["$last_reviewed", None]}, None]}, 1, 0]}},
+            {"$and": [awake, {"$ne": ["$last_reviewed", None]}, {"$lte": ["$next_review", now_dt]}]}, 1, 0]}},
+        "new": {"$sum": {"$cond": [{"$and": [awake, {"$eq": [{"$ifNull": ["$last_reviewed", None]}, None]}]}, 1, 0]}},
+        "resting": {"$sum": {"$cond": [resting_expr(now_dt), 1, 0]}},
     }}
 
 
@@ -281,7 +310,10 @@ def _summary_row(row: dict) -> dict:
     decks = sorted({str(d) for d in row.get("deck_ids", []) if d is not None})
     # `deck_ids` lets the study centre list a group's decks as rows without a
     # second query; capped so a group over many decks stays a small payload.
-    return {"cards": row.get("cards", 0), "decks": len(decks), "deck_ids": decks[:50], "due": row.get("due", 0), "new": row.get("new", 0)}
+    return {"cards": row.get("cards", 0), "decks": len(decks), "deck_ids": decks[:50], "due": row.get("due", 0), "new": row.get("new", 0), "resting": row.get("resting", 0)}
+
+
+EMPTY_SUMMARY = {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0, "resting": 0}
 
 
 def _local_zone(tz_name: str) -> ZoneInfo:
@@ -328,6 +360,7 @@ async def get_forecast(
             "deleted_at": None,
             "last_reviewed": {"$ne": None},
             "next_review": {"$gte": bounds[0], "$lt": bounds[-1]},
+            **awake_clause(datetime.now(timezone.utc).replace(tzinfo=None)),
             "$or": await _active_deck_or(user_id),
         }},
         {"$bucket": {"groupBy": "$next_review", "boundaries": bounds, "default": "other", "output": {"due": {"$sum": 1}}}},
@@ -358,7 +391,12 @@ async def get_groups(
         {"$sort": {"due": -1, "cards": -1, "_id": 1}},
         {"$limit": 500},
     ]).to_list(length=500)
-    tags = [{"tag": row["_id"], **_summary_row(row)} for row in tag_rows]
+    # A tag's own record, when it has one: its rest (SR-001, ADR-043 point 6).
+    tag_rest = {
+        row["tag"]: row.get("rest_until")
+        for row in await tag_settings_collection.find({"user_id": user_id}, {"tag": 1, "rest_until": 1}).to_list(length=500)
+    }
+    tags = [{"tag": row["_id"], **_summary_row(row), "rest_until": tag_rest.get(row["_id"])} for row in tag_rows]
 
     async def summarise(narrow: dict) -> dict:
         match = {**scope, **narrow}
@@ -368,11 +406,12 @@ async def get_groups(
             {"$match": match},
             _group_stage(now_dt, None),
         ]).to_list(length=1)
-        return _summary_row(rows[0]) if rows else {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0}
+        return _summary_row(rows[0]) if rows else dict(EMPTY_SUMMARY)
 
+    everything = await summarise({})
     marked = await summarise({"marked_at": {"$ne": None}})
     struggling_ids = _object_ids((await _struggling_cards(user_id, now_dt)).keys())
-    struggling = await summarise({"_id": {"$in": struggling_ids}}) if struggling_ids else {"cards": 0, "decks": 0, "deck_ids": [], "due": 0, "new": 0}
+    struggling = await summarise({"_id": {"$in": struggling_ids}}) if struggling_ids else dict(EMPTY_SUMMARY)
     # D15: untagged is a filter, not a group — a readout, so no deck list. Its
     # `$or` must not collide with the scope's deck `$or`, hence `$and`.
     untagged = await summarise({"$and": [{"$or": scope["$or"]}, {"$or": _untagged_or()}]})
@@ -384,6 +423,8 @@ async def get_groups(
         ],
         "tags": tags,
         "untagged": {"cards": untagged["cards"], "due": untagged["due"], "new": untagged["new"]},
+        # Named beside due, never folded into it (ADR-043 point 7).
+        "resting": {"cards": everything["resting"]},
     }
 
 
@@ -457,6 +498,12 @@ async def create_study_card(
             {"_id": ObjectId(card.deck_id)},
             {"$inc": {"total_cards": 1}, "$push": {"cards": card_id}},
         )
+
+    # A card born into a resting tag or deck rests with it (SR-001, D9).
+    rest_now = _rest_now()
+    await sync_tag_rests(collection, tag_settings_collection, user_id, {"_id": card_id}, rest_now)
+    if card.deck_id:
+        await sync_deck_rest(collection, await d_collection.find_one({"_id": ObjectId(card.deck_id)}), {"_id": card_id}, rest_now)
 
     created_card = await collection.find_one({"_id": card_id})
     created_card["_id"] = str(created_card["_id"])
@@ -813,11 +860,22 @@ async def get_daily_review_cards(
             c["user_id"] = str(c["user_id"])
     await _annotate_source_books(cards)
 
+    # What is out of play today, named beside what is in (ADR-043 point 7).
+    # Over the deck list already fetched above, not a second deck query.
+    active_ids: list = []
+    for deck in active_decks:
+        active_ids.extend([deck["_id"], str(deck["_id"])])
+    resting = await collection.count_documents({
+        "user_id": user_id, "deleted_at": None, **resting_clause(now_dt),
+        "$or": [{"deck_id": None}, {"deck_id": {"$exists": False}}, {"deck_id": {"$in": active_ids}}],
+    })
+
     return {
         "cards": cards,
         "total": len(cards),
         "page": 1,
         "has_more": False,
+        "resting": resting,
     }
 
 
@@ -875,7 +933,8 @@ async def _bulk_move(
     collection: Collection, d_collection: Collection,
 ) -> int:
     """Move the cards to `deck_id` (None: out of any deck). Cards already in
-    the target are not moving and are not counted."""
+    the target are not moving and are not counted. A card carries its new
+    deck's rest, or none (SR-001, D9)."""
     if deck_id:
         await _verify_deck_ownership(deck_id, user_id)
     moving = [d for d in docs if str(d.get("deck_id") or "") != str(deck_id or "")]
@@ -893,6 +952,14 @@ async def _bulk_move(
         {"_id": {"$in": moving_ids}},
         {"$set": {"deck_id": target, "updated_at": _now_naive()}},
     )
+    rest_now = _rest_now()
+    old_deck_ids = [ObjectId(key) for key in _ids_by_deck(moving) if ObjectId.is_valid(key)]
+    left_resting = False
+    if old_deck_ids:
+        old_decks = await d_collection.find({"_id": {"$in": old_deck_ids}}, {"_id": 1, "rest_until": 1}).to_list(length=len(old_deck_ids))
+        left_resting = any(deck_is_resting(deck, rest_now) for deck in old_decks)
+    target_deck = await d_collection.find_one({"_id": target}) if target is not None else None
+    await sync_deck_rest(collection, target_deck, {"_id": {"$in": moving_ids}}, rest_now, left_resting_deck=left_resting)
     return len(moving_ids)
 
 
@@ -909,9 +976,10 @@ async def _bulk_delete(docs: list, user_id: str, collection: Collection, d_colle
     return len(docs)
 
 
-async def _bulk_tag(ids: List[ObjectId], tags: List[str], collection: Collection) -> int:
+async def _bulk_tag(ids: List[ObjectId], tags: List[str], collection: Collection, user_id: Optional[str] = None) -> int:
     """`$addToSet` the tags. A card stored with `tags: null` cannot take
-    `$addToSet`, so those are given an empty list first."""
+    `$addToSet`, so those are given an empty list first. A card that joins a
+    resting tag rests with it (SR-001, D9)."""
     if not ids:
         return 0
     await collection.update_many(
@@ -921,18 +989,26 @@ async def _bulk_tag(ids: List[ObjectId], tags: List[str], collection: Collection
         {"_id": {"$in": ids}},
         {"$addToSet": {"tags": {"$each": tags}}, "$set": {"updated_at": _now_naive()}},
     )
+    if user_id is not None:
+        await sync_tag_rests(collection, tag_settings_collection, user_id, {"_id": {"$in": ids}}, _rest_now())
     return int(result.matched_count)
 
 
-async def _bulk_untag(ids: List[ObjectId], tags: List[str], collection: Collection) -> int:
+async def _bulk_untag(ids: List[ObjectId], tags: List[str], collection: Collection, user_id: Optional[str] = None) -> int:
     """`$pull` the tags from the cards that carry any of them (a null `tags`
-    cannot take `$pull` and has nothing to lose anyway)."""
+    cannot take `$pull` and has nothing to lose anyway). A card that leaves a
+    resting tag drops that tag's hold (SR-001, D9); an awake tag held nothing."""
     if not ids:
         return 0
     result = await collection.update_many(
         {"_id": {"$in": ids}, "tags": {"$in": tags}},
         {"$pull": {"tags": {"$in": tags}}, "$set": {"updated_at": _now_naive()}},
     )
+    if user_id is not None:
+        now = _rest_now()
+        resting = {row["tag"] for row in await resting_tag_settings(tag_settings_collection, user_id, now)}
+        for tag in resting.intersection(tags):
+            await wake_many(collection, {"_id": {"$in": ids}, "tags": {"$ne": tag}}, now, source=tag_source(tag))
     return int(result.matched_count)
 
 
@@ -956,13 +1032,18 @@ async def bulk_update_study_cards(
     elif body.action == "delete":
         updated = await _bulk_delete(docs, user_id, collection, d_collection)
     elif body.action == "tag":
-        updated = await _bulk_tag(ids, body.tags or [], collection)
+        updated = await _bulk_tag(ids, body.tags or [], collection, user_id)
     elif body.action == "untag":
-        updated = await _bulk_untag(ids, body.tags or [], collection)
+        updated = await _bulk_untag(ids, body.tags or [], collection, user_id)
     elif body.action == "mark":
         updated = await _write_mark_many(ids, collection, _now_naive())
-    else:
+    elif body.action == "unmark":
         updated = await _write_mark_many(ids, collection, None)
+    elif body.action == "rest":
+        # The card's own hold, on each of them (SR-001). Writes rest fields only.
+        updated = await rest_many(collection, {"_id": {"$in": ids}}, SOURCE_CARD, body.until, _rest_now()) if ids else 0
+    else:
+        updated = await wake_many(collection, {"_id": {"$in": ids}}, _rest_now(), source=SOURCE_CARD) if ids else 0
     return BulkCardResult(updated=updated)
 
 
@@ -974,7 +1055,8 @@ async def rename_tag(
 ) -> TagVerbResult:
     """Cards already carrying `to` get `from` pulled, so no card ends with the
     tag twice; the rest have the element rewritten in place (FR-011)."""
-    scope = _active_cards_scope(user.get("user_id"))
+    user_id = user.get("user_id")
+    scope = _active_cards_scope(user_id)
     now = _now_naive()
     merged = await collection.update_many(
         {**scope, "tags": {"$all": [body.from_tag, body.to]}},
@@ -985,6 +1067,24 @@ async def rename_tag(
         {"$set": {"tags.$[el]": body.to, "updated_at": now}},
         array_filters=[{"el": body.from_tag}],
     )
+    # The tag's rest follows the rename; a merge keeps the target's own
+    # (SR-001, D9). The old source goes from every card, the new tag's rest is
+    # re-applied to every card now carrying it.
+    from_setting = await tag_settings_collection.find_one({"user_id": user_id, "tag": body.from_tag})
+    if from_setting is not None:
+        await tag_settings_collection.delete_one({"_id": from_setting["_id"]})
+        to_setting = await tag_settings_collection.find_one({"user_id": user_id, "tag": body.to})
+        if to_setting is None and from_setting.get("rest_until") is not None:
+            await tag_settings_collection.update_one(
+                {"user_id": user_id, "tag": body.to},
+                {"$set": {"rest_until": from_setting["rest_until"], "updated_at": now}, "$setOnInsert": {"user_id": user_id, "tag": body.to}},
+                upsert=True,
+            )
+        if from_setting.get("rest_until") is not None and from_setting["rest_until"] > now:
+            # The old tag held cards; its hold goes, and the new tag's (now the
+            # same, or the target's own) is applied to every card carrying it.
+            await wake_many(collection, scope, now, source=tag_source(body.from_tag))
+            await sync_tag_rests(collection, tag_settings_collection, user_id, scope, now)
     return TagVerbResult(cards=int(merged.matched_count) + int(renamed.matched_count))
 
 
@@ -994,11 +1094,64 @@ async def remove_tag(
     collection: Collection = Depends(get_cards_collection),
     user: dict = Depends(get_firebase_user),
 ) -> TagVerbResult:
+    user_id = user.get("user_id")
+    scope = _active_cards_scope(user_id)
     result = await collection.update_many(
-        {**_active_cards_scope(user.get("user_id")), "tags": body.tag},
+        {**scope, "tags": body.tag},
         {"$pull": {"tags": body.tag}, "$set": {"updated_at": _now_naive()}},
     )
+    # A removed tag holds nothing any more (SR-001, D9): its record goes, and
+    # if it was resting, its hold goes from every card it held.
+    now = _rest_now()
+    setting = await tag_settings_collection.find_one({"user_id": user_id, "tag": body.tag})
+    if setting is not None:
+        await tag_settings_collection.delete_one({"_id": setting["_id"]})
+        if setting.get("rest_until") is not None and setting["rest_until"] > now:
+            await wake_many(collection, scope, now, source=tag_source(body.tag))
     return TagVerbResult(cards=int(result.matched_count))
+
+
+# ---------------------------------------------------------------------------
+# SR-001 — a tag's rest (ADR-043). Declared beside the tag verbs, before any
+# `/{id}`-shaped route, so `/tags/<name>/rest` is never read as a card id.
+# ---------------------------------------------------------------------------
+
+@router.put("/tags/{tag}/rest", summary="Rest a tag: every card carrying it leaves play, schedule kept (SR-001)", response_model=TagRestResult)
+async def rest_tag(
+    tag: str,
+    body: RestBody,
+    collection: Collection = Depends(get_cards_collection),
+    settings: Collection = Depends(get_tag_settings_collection),
+    user: dict = Depends(get_firebase_user),
+) -> TagRestResult:
+    """The tag gets a record of its own, and every card carrying it gets the
+    tag's source. Idempotent: resting again refreshes the until."""
+    user_id = user.get("user_id")
+    now = _rest_now()
+    until = until_or_indefinite(body.until)
+    await settings.update_one(
+        {"user_id": user_id, "tag": tag},
+        {"$set": {"rest_until": until, "updated_at": now}, "$setOnInsert": {"user_id": user_id, "tag": tag, "created_at": now}},
+        upsert=True,
+    )
+    cards = await rest_many(collection, {**_active_cards_scope(user_id), "tags": tag}, tag_source(tag), until, now)
+    logger.info(f"Resting tag {tag!r} for user {user_id}: {cards} cards until {until.isoformat()}")
+    return TagRestResult(tag=tag, rest_until=until, cards=cards)
+
+
+@router.delete("/tags/{tag}/rest", summary="Wake a tag: its hold goes from every card; other holds stay (SR-001)", response_model=TagRestResult)
+async def wake_tag(
+    tag: str,
+    collection: Collection = Depends(get_cards_collection),
+    settings: Collection = Depends(get_tag_settings_collection),
+    user: dict = Depends(get_firebase_user),
+) -> TagRestResult:
+    user_id = user.get("user_id")
+    now = _rest_now()
+    await settings.update_one({"user_id": user_id, "tag": tag}, {"$set": {"rest_until": None, "updated_at": now}})
+    cards = await wake_many(collection, _active_cards_scope(user_id), now, source=tag_source(tag))
+    logger.info(f"Waking tag {tag!r} for user {user_id}: {cards} cards")
+    return TagRestResult(tag=tag, rest_until=None, cards=cards)
 
 
 @router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)
@@ -1099,6 +1252,10 @@ async def list_study_cards(
         ]})
     if due_clause is not None:
         and_clauses.append(due_clause)
+        # A resting card is not due (SR-001, ADR-043 point 4). A plain key on
+        # the query, not another `$and` clause: the clause list is one `$or`
+        # per axis (deck, untagged, search, due) and a test pins that shape.
+        query.update(awake_clause(datetime.now(timezone.utc).replace(tzinfo=None)))
     if and_clauses:
         # Wrap the deck $or and every other $or-shaped clause together
         query["$and"] = [{"$or": query.pop("$or")}, *and_clauses]
@@ -1219,6 +1376,19 @@ async def update_study_card(
         return existing_card
 
     await collection.update_one({"_id": ObjectId(id)}, {"$set": updates})
+
+    # The card's tags or deck changed: its tag and deck holds are rebuilt from
+    # what it carries now (SR-001, D9). Its own hold is untouched.
+    rest_now = _rest_now()
+    if "tags" in updates:
+        resting = await resting_tag_settings(tag_settings_collection, str(existing_card.get("user_id")), rest_now)
+        if resting:
+            await wake_many(collection, {"_id": ObjectId(id)}, rest_now, source_prefix="tag:")
+            await sync_tag_rests(collection, tag_settings_collection, str(existing_card.get("user_id")), {"_id": ObjectId(id)}, rest_now)
+    if "deck_id" in updates and str(new_deck_id) != str(old_deck_id):
+        old_deck = await d_collection.find_one({"_id": ObjectId(old_deck_id)}, {"rest_until": 1}) if old_deck_id and ObjectId.is_valid(str(old_deck_id)) else None
+        target_deck = await d_collection.find_one({"_id": updates["deck_id"]}) if updates.get("deck_id") else None
+        await sync_deck_rest(collection, target_deck, {"_id": ObjectId(id)}, rest_now, left_resting_deck=deck_is_resting(old_deck, rest_now))
 
     updated_card = await collection.find_one({"_id": ObjectId(id)})
     updated_card["_id"] = str(updated_card["_id"])
@@ -1352,6 +1522,42 @@ async def unmark_study_card(
     """
     logger.info(f"Unmarking card {id}")
     return await _write_mark(id, collection, None)
+
+
+async def _serialise_card(id: str, collection: Collection) -> dict:
+    card = await collection.find_one({"_id": ObjectId(id)})
+    card["_id"] = str(card["_id"])
+    if card.get("deck_id"):
+        card["deck_id"] = str(card["deck_id"])
+    if card.get("user_id"):
+        card["user_id"] = str(card["user_id"])
+    return card
+
+
+@router.put("/{id}/rest", summary="Rest a card: out of play, schedule kept (SR-001)", response_model=StudyCard)
+async def rest_study_card(
+    id: str,
+    body: RestBody,
+    collection: Collection = Depends(get_cards_collection),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
+    """The card's own hold. Writes `rests`, `rest_until`, `rested_at` and
+    nothing the scheduler owns (ADR-043 point 1); idempotent, a second rest
+    refreshes the until. A tag's or deck's hold on the same card is untouched."""
+    logger.info(f"Resting card {id}")
+    await rest_many(collection, {"_id": ObjectId(id)}, SOURCE_CARD, body.until, _rest_now())
+    return await _serialise_card(id, collection)
+
+
+@router.delete("/{id}/rest", summary="Wake a card: its own hold goes; a tag's or deck's stays (SR-001)", response_model=StudyCard)
+async def wake_study_card(
+    id: str,
+    collection: Collection = Depends(get_cards_collection),
+    existing_card: dict = Depends(require_ownership(get_cards_collection, "id")),
+):
+    logger.info(f"Waking card {id}")
+    await wake_many(collection, {"_id": ObjectId(id)}, _rest_now(), source=SOURCE_CARD)
+    return await _serialise_card(id, collection)
 
 
 @router.post("/{id}/review", summary="Review a card with SM-2 grading")

@@ -48,6 +48,15 @@ class SourceSection(BaseModel):
     hash: str = Field(max_length=16)
 
 
+class RestEntry(BaseModel):
+    """One grain's hold on a card (SR-001, ADR-043 point 2): ``card``,
+    ``tag:<name>`` or ``deck``, until a date (the far date means until woken)."""
+
+    source: str = Field(max_length=220)
+    until: datetime
+    since: datetime
+
+
 class StudyCard(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: Optional[PyObjectId] = None
@@ -76,6 +85,13 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     # by the generic PATCH. `None` means unmarked; the timestamp is what orders
     # a future cross-deck marked session (MARK-007).
     marked_at: Optional[datetime] = None
+
+    # Rest (SR-001, ADR-043). Written only by the rest and wake routes and the
+    # tag and deck syncs; never through PATCH (StudyCardUpdate omits them).
+    # `rest_until` is derived from `rests`: None awake, the far date until woken.
+    rest_until: Optional[datetime] = None
+    rests: List[RestEntry] = []
+    rested_at: Optional[datetime] = None
 
     # The book→cards link (docs/prd-book-cards.md D1). Written by the generator
     # and the save-to-deck flow only; absent from StudyCardUpdate, so the generic
@@ -171,7 +187,7 @@ class StudyCardUpdate(BaseModel):
 
 MAX_BULK_IDS: int = 500
 
-BulkAction = Literal["move", "tag", "untag", "mark", "unmark", "delete"]
+BulkAction = Literal["move", "tag", "untag", "mark", "unmark", "delete", "rest", "wake"]
 
 
 def _clean_tag(value: str) -> str:
@@ -199,6 +215,8 @@ class BulkCardAction(BaseModel):
     action: BulkAction
     deck_id: Optional[str] = None
     tags: Optional[List[str]] = None
+    # `rest` only: a date, or absent for "until woken" (SR-001).
+    until: Optional[datetime] = None
 
     @field_validator("tags")
     @classmethod
@@ -211,7 +229,23 @@ class BulkCardAction(BaseModel):
             raise ValueError("`move` requires `deck_id` (null removes the cards from their deck)")
         if self.action in ("tag", "untag") and not self.tags:
             raise ValueError(f"`{self.action}` requires a non-empty `tags`")
+        if "until" in self.model_fields_set and self.action != "rest":
+            raise ValueError("`until` belongs to `rest` only")
         return self
+
+
+class RestBody(BaseModel):
+    """What a rest asks for: until a date, or nothing for "until woken" (SR-001)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    until: Optional[datetime] = None
+
+
+class TagRestResult(BaseModel):
+    tag: str
+    rest_until: Optional[datetime]
+    cards: int
 
 
 class BulkCardResult(BaseModel):

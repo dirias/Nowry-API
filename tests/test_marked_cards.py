@@ -47,6 +47,30 @@ sys.modules.setdefault("app.routers.agent", _mock_agent_module)
 
 from app.routers import study_cards
 
+
+class _NoTagSettings:
+    """SR-001: the router grew a tag-settings collaborator. These tests have no
+    resting tags, so it answers nothing and writes nothing."""
+
+    def find(self, query, projection=None):
+        cursor = MagicMock()
+        cursor.to_list = AsyncMock(return_value=[])
+        return cursor
+
+    async def find_one(self, query, **kwargs):
+        return None
+
+    async def update_one(self, *args, **kwargs):
+        return MagicMock(matched_count=0)
+
+    async def delete_one(self, *args, **kwargs):
+        return MagicMock(deleted_count=0)
+
+
+@pytest.fixture(autouse=True)
+def _no_tag_settings(monkeypatch):
+    monkeypatch.setattr(study_cards, "tag_settings_collection", _NoTagSettings())
+
 CARD_ID = "507f1f77bcf86cd799439099"
 DECK_ID = "507f1f77bcf86cd799439077"
 OWNER_USER_ID = "507f1f77bcf86cd799439011"  # matches conftest.mock_firebase_user
@@ -338,6 +362,10 @@ def _matches_operator(value, operator: str, expected) -> bool:
         if operator == "$lte":
             return value <= expected
         return value < expected
+    if operator == "$not":
+        # The rest clause (SR-001): `{$not: {$gt: now}}` is awake — a missing,
+        # null, or past `rest_until`.
+        return not any(_matches_operator(value, inner_op, inner) for inner_op, inner in expected.items())
     raise AssertionError(f"unsupported operator in card list query: {operator}")
 
 
