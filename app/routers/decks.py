@@ -14,7 +14,7 @@ from app.auth.dependencies import require_ownership, require_public_or_ownership
 from app.config.database import cards_collection, decks_collection
 from app.models.Deck import Deck, DeckWithStats
 from app.models.StudyCard import RestBody
-from app.services.rest import SOURCE_DECK, awake_clause, now_naive as _rest_now, rest_many, resting_clause, until_or_indefinite, wake_many
+from app.services.rest import SOURCE_DECK, awake_clause, now_naive as _rest_now, rest_many, resting_clause, spread_cards, until_or_indefinite, wake_many
 from app.models.deck_settings import (
     DeckSettingsUpdate,
     DeckSettingsResponse,
@@ -443,6 +443,9 @@ async def _set_deck_rest(collection: Collection, deck: dict, rest_until: Optiona
         await rest_many(cards_collection, card_match, SOURCE_DECK, rest_until, now)
     else:
         await wake_many(cards_collection, card_match, now, source=SOURCE_DECK)
+        # The woken cards land softly, within the deck's own budget (SR-002).
+        _, _, review_cap = _resolve_deck_config(deck)
+        await spread_cards(cards_collection, card_match, review_cap, now)
     updated = await collection.find_one({"_id": deck_oid})
     return _serialise_deck(updated)
 

@@ -8,6 +8,8 @@ from app.models.StudyCard import (
     BulkCardAction,
     BulkCardResult,
     RestBody,
+    SpreadBody,
+    SpreadResult,
     StudyCard,
     StudyCardUpdate,
     TagRemove,
@@ -26,6 +28,7 @@ from app.services.rest import (
     resting_clause,
     resting_expr,
     resting_tag_settings,
+    spread_cards,
     sync_deck_rest,
     sync_tag_rests,
     tag_source,
@@ -826,11 +829,28 @@ async def get_daily_review_cards(
 
     all_new: list = []
     all_review: list = []
+    landed = {"cards": 0, "days": 0, "decks": 0}
 
     for deck in active_decks:
         new_cap, review_cap = _get_deck_budget(deck)
         deck_oid = deck["_id"]
         deck_or = [{"deck_id": deck_oid}, {"deck_id": str(deck_oid)}]
+
+        # The soft landing (SR-002, ADR-043 point 5): once a day per deck, when
+        # the pile that would land today exceeds the deck's review budget, it
+        # is spread forward before the selection runs. Nothing is dropped.
+        last_spread = deck.get("last_spread_on")
+        if not narrow and (last_spread is None or last_spread < today_start):
+            overdue = await collection.count_documents({
+                "user_id": user_id, "deleted_at": None, "$or": deck_or, **awake_clause(now_dt),
+                "last_reviewed": {"$ne": None}, "next_review": {"$lt": today_start},
+            })
+            if overdue > review_cap:
+                done = await spread_cards(collection, {"user_id": user_id, "deleted_at": None, "$or": deck_or}, review_cap, now_dt)
+                landed = {"cards": landed["cards"] + done["cards"], "days": max(landed["days"], done["days"]), "decks": landed["decks"] + 1}
+                # Stamped only when it ran: a deck under its budget costs one
+                # count per request and no write.
+                await decks_collection.update_one({"_id": deck_oid}, {"$set": {"last_spread_on": today_start}})
 
         new_raw, review_raw = await _select_session_cards(
             collection=collection,
@@ -876,6 +896,8 @@ async def get_daily_review_cards(
         "page": 1,
         "has_more": False,
         "resting": resting,
+        # Said in one sentence on the Today object when it ran (SR-002).
+        "spread": landed if landed["decks"] > 0 else None,
     }
 
 
@@ -1047,6 +1069,39 @@ async def bulk_update_study_cards(
     return BulkCardResult(updated=updated)
 
 
+@router.post("/spread", summary="The soft landing: spread overdue cards forward, at most a day's budget per day (SR-002)", response_model=SpreadResult)
+async def spread_overdue(
+    body: SpreadBody,
+    collection: Collection = Depends(get_cards_collection),
+    user: dict = Depends(get_firebase_user),
+) -> SpreadResult:
+    """One deck, or every active deck. `per_day` below the deck's own cap is
+    "Lighten today"; `include_today` moves today's overflow forward as well.
+    Only `next_review` moves, only forward (ADR-043 point 5)."""
+    user_id = user.get("user_id")
+    now = _rest_now()
+    deck_filter: dict = {"user_id": user_id, **ACTIVE_DECK_FILTER}
+    if body.deck_id:
+        if not ObjectId.is_valid(body.deck_id):
+            raise HTTPException(status_code=404, detail="Deck not found")
+        deck_filter["_id"] = ObjectId(body.deck_id)
+    decks = await decks_collection.find(deck_filter).to_list(length=500)
+    if body.deck_id and not decks:
+        raise HTTPException(status_code=404, detail="Deck not found")
+    cards = days = touched = 0
+    for deck in decks:
+        _, review_cap = _get_deck_budget(deck)
+        per_day = body.per_day or review_cap
+        deck_or = [{"deck_id": deck["_id"]}, {"deck_id": str(deck["_id"])}]
+        done = await spread_cards(collection, {"user_id": user_id, "deleted_at": None, "$or": deck_or}, per_day, now, include_today=body.include_today)
+        if done["cards"]:
+            cards += done["cards"]
+            days = max(days, done["days"])
+            touched += 1
+    logger.info(f"Spread for user {user_id}: {cards} cards over {days} days in {touched} decks")
+    return SpreadResult(cards=cards, days=days, decks=touched)
+
+
 @router.post("/tags/rename", summary="Rename a tag on every card; a merge is a rename onto an existing tag (MGMT-001)", response_model=TagVerbResult)
 async def rename_tag(
     body: TagRename,
@@ -1150,8 +1205,25 @@ async def wake_tag(
     now = _rest_now()
     await settings.update_one({"user_id": user_id, "tag": tag}, {"$set": {"rest_until": None, "updated_at": now}})
     cards = await wake_many(collection, _active_cards_scope(user_id), now, source=tag_source(tag))
+    # The woken cards land softly, per deck budget (SR-002).
+    landed = await _spread_for_user(collection, user_id, {"tags": tag}, now) if cards else None
     logger.info(f"Waking tag {tag!r} for user {user_id}: {cards} cards")
-    return TagRestResult(tag=tag, rest_until=None, cards=cards)
+    return TagRestResult(tag=tag, rest_until=None, cards=cards, spread=landed)
+
+
+async def _spread_for_user(collection: Collection, user_id: str, narrow: dict, now: datetime) -> dict:
+    """The soft landing over every active deck, narrowed (a tag, a selection)."""
+    decks = await decks_collection.find({"user_id": user_id, **ACTIVE_DECK_FILTER}).to_list(length=500)
+    cards = days = touched = 0
+    for deck in decks:
+        _, review_cap = _get_deck_budget(deck)
+        deck_or = [{"deck_id": deck["_id"]}, {"deck_id": str(deck["_id"])}]
+        done = await spread_cards(collection, {"user_id": user_id, "deleted_at": None, "$or": deck_or, **narrow}, review_cap, now)
+        if done["cards"]:
+            cards += done["cards"]
+            days = max(days, done["days"])
+            touched += 1
+    return {"cards": cards, "days": days, "decks": touched}
 
 
 @router.get("/{id}", summary="Get a study card by ID", response_model=StudyCard)

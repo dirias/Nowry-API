@@ -18,7 +18,7 @@ rewritten, which is why every writer re-filters the array.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from pymongo.collection import Collection
@@ -158,3 +158,81 @@ async def sync_deck_rest(collection: Collection, target_deck: Optional[dict], ca
         await rest_many(collection, card_match, SOURCE_DECK, target_deck["rest_until"], now)
     elif left_resting_deck:
         await wake_many(collection, card_match, now, source=SOURCE_DECK)
+
+
+# ---------------------------------------------------------------------------
+# SR-002 — the soft landing (PRD prd-rest.md D5, ADR-043 point 5).
+#
+# A set of cards whose next_review is in the past would all land today. They
+# are spread forward instead: most-overdue first, at most `per_day` a day, at
+# most MAX_SPREAD_DAYS out. Only next_review moves, only forward, only for
+# cards that are already late. Ease, interval, repetitions and last_reviewed
+# are never touched, so the next grade schedules normally.
+# ---------------------------------------------------------------------------
+
+MAX_SPREAD_DAYS = 14
+
+#: The only keys a spread may write.
+SPREAD_FIELDS = ("next_review", "updated_at")
+
+
+def spread_plan(cards: list, per_day: int, today_start: datetime, max_days: int = MAX_SPREAD_DAYS) -> list:
+    """Which day each overdue card lands on: ``[(id, next_review)]``, most-overdue first.
+
+    ``per_day`` is the deck's review cap. When the pile needs more than
+    ``max_days`` at that pace, the pace rises so the last card still lands
+    within ``max_days`` — the cap on days is the promise ("within two weeks"),
+    the cap on cards a preference. A card already due today is left where it is.
+    Pure, and deterministic for a given order.
+    """
+    overdue = sorted(
+        (c for c in cards if c.get("next_review") is not None and c["next_review"] < today_start),
+        key=lambda c: (c["next_review"], str(c.get("_id"))),
+    )
+    if not overdue:
+        return []
+    per_day = max(1, int(per_day))
+    days_needed = -(-len(overdue) // per_day)  # ceil
+    if days_needed > max_days:
+        per_day = -(-len(overdue) // max_days)
+    plan = []
+    for index, card in enumerate(overdue):
+        day = min(index // per_day, max_days - 1)
+        plan.append((card["_id"], today_start + timedelta(days=day)))
+    return plan
+
+
+def spread_days(plan: list) -> int:
+    """How many days a plan spans, for the sentence the Today object says."""
+    if not plan:
+        return 0
+    return len({when for _, when in plan})
+
+
+async def spread_cards(collection: Collection, match: dict, per_day: int, now: datetime, include_today: bool = False) -> dict:
+    """Spread the overdue cards in ``match`` forward and report ``{cards, days}``.
+
+    ``include_today`` is "Lighten today": cards due today count as late too,
+    so the overflow moves to tomorrow onward. Writes SPREAD_FIELDS only, one
+    update per landing day.
+    """
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = now if include_today else today_start
+    late = await collection.find(
+        {**match, **awake_clause(now), "last_reviewed": {"$ne": None}, "next_review": {"$lt": cutoff}},
+        {"_id": 1, "next_review": 1},
+    ).to_list(length=5000)
+    # "Late" for the plan is relative to the cutoff: under Lighten today, a card
+    # due this morning is late too.
+    plan = spread_plan(late, per_day, today_start) if not include_today else spread_plan(
+        [{**c, "next_review": min(c["next_review"], today_start - timedelta(seconds=1))} for c in late], per_day, today_start
+    )
+    by_day: dict = {}
+    for card_id, when in plan:
+        by_day.setdefault(when, []).append(card_id)
+    for when, ids in by_day.items():
+        if when <= today_start and not include_today:
+            # Day 0 lands today, where they already are: nothing to write.
+            continue
+        await collection.update_many({"_id": {"$in": ids}}, {"$set": {"next_review": when, "updated_at": now}})
+    return {"cards": len(plan), "days": spread_days(plan)}

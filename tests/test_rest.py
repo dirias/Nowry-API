@@ -240,3 +240,74 @@ async def test_bulk_rest_writes_the_cards_own_hold(client, cards_collection):
     match, pipeline = cards_collection.update_many.call_args.args
     assert match == {"_id": {"$in": [ObjectId(CARD_ID)]}}
     assert _set_keys(pipeline) == set(rest.REST_FIELDS)
+
+
+# --- SR-002: the soft landing ------------------------------------------------------
+
+def _late(i: int, days_ago: int) -> dict:
+    return {"_id": f"c{i:03d}", "next_review": datetime(2026, 10, 10) - timedelta(days=days_ago)}
+
+
+def test_spread_plan_is_most_overdue_first_at_most_per_day_each_day():
+    today = datetime(2026, 10, 10)
+    cards = [_late(1, 1), _late(2, 5), _late(3, 3), _late(4, 9), _late(5, 2)]
+    plan = rest.spread_plan(cards, per_day=2, today_start=today)
+    assert [cid for cid, _ in plan] == ["c004", "c002", "c003", "c005", "c001"], "most overdue first"
+    assert [when for _, when in plan] == [today, today, today + timedelta(days=1), today + timedelta(days=1), today + timedelta(days=2)]
+    assert rest.spread_days(plan) == 3
+
+
+def test_spread_plan_leaves_cards_due_today_and_later_alone():
+    today = datetime(2026, 10, 10)
+    cards = [{"_id": "due-now", "next_review": today}, {"_id": "tomorrow", "next_review": today + timedelta(days=1)}, {"_id": "never", "next_review": None}]
+    assert rest.spread_plan(cards, per_day=10, today_start=today) == []
+
+
+def test_spread_plan_fits_within_the_day_cap_by_raising_the_pace():
+    today = datetime(2026, 10, 10)
+    cards = [_late(i, 30 + i) for i in range(100)]
+    plan = rest.spread_plan(cards, per_day=5, today_start=today)  # 20 days at 5 a day
+    last_day = max(when for _, when in plan)
+    assert last_day <= today + timedelta(days=rest.MAX_SPREAD_DAYS - 1), "within two weeks, whatever the pile"
+    per_day_seen = max(sum(1 for _, w in plan if w == d) for d in {w for _, w in plan})
+    assert per_day_seen == 8, "100 cards within 14 days is 8 a day"
+    assert rest.spread_days(plan) == 13, "and 8 a day lands the last card on day 13"
+
+
+def test_spread_plan_with_less_than_a_day_is_all_today():
+    today = datetime(2026, 10, 10)
+    plan = rest.spread_plan([_late(1, 4), _late(2, 2)], per_day=20, today_start=today)
+    assert {when for _, when in plan} == {today}
+    assert rest.spread_plan([], per_day=20, today_start=today) == []
+
+
+@pytest.mark.asyncio
+async def test_spread_cards_writes_next_review_only_and_skips_day_zero():
+    now = datetime(2026, 10, 10, 9, 30)
+    today = datetime(2026, 10, 10)
+    collection = MagicMock()
+    collection.find = MagicMock()
+    collection.find.return_value.to_list = AsyncMock(return_value=[_late(i, i) for i in range(1, 7)])  # six late cards
+    collection.update_many = AsyncMock(return_value=_FakeUpdateResult())
+    done = await rest.spread_cards(collection, {"user_id": OWNER_USER_ID}, per_day=2, now=now)
+    assert done == {"cards": 6, "days": 3}
+    # Day 0 stays where it is; days 1 and 2 are written, with next_review and updated_at only.
+    assert collection.update_many.call_count == 2
+    for call in collection.update_many.call_args_list:
+        _, update = call.args
+        assert set(update["$set"].keys()) == set(rest.SPREAD_FIELDS)
+        assert update["$set"]["next_review"] > today
+    # And what it read was the awake, reviewed, late set.
+    query = collection.find.call_args.args[0]
+    assert query["rest_until"] == {"$not": {"$gt": now}}
+    assert query["next_review"] == {"$lt": today}
+    assert query["last_reviewed"] == {"$ne": None}
+
+
+@pytest.mark.asyncio
+async def test_spread_route_refuses_unknown_keys_and_a_bad_deck(client, cards_collection):
+    async with client as c:
+        bad = await c.post("/study-cards/spread", json={"ease_factor": 1})
+        missing = await c.post("/study-cards/spread", json={"deck_id": "not-an-id"})
+    assert bad.status_code == 422
+    assert missing.status_code == 404

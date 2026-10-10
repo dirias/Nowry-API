@@ -246,6 +246,26 @@ class TagRestResult(BaseModel):
     tag: str
     rest_until: Optional[datetime]
     cards: int
+    # What the soft landing did to the woken cards, when it ran (SR-002).
+    spread: Optional[dict] = None
+
+
+class SpreadBody(BaseModel):
+    """The soft landing, asked for (SR-002): one deck or every active deck;
+    `per_day` below the deck's cap is "Lighten today"; `include_today` moves
+    today's overflow forward too."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deck_id: Optional[str] = None
+    per_day: Optional[int] = Field(None, ge=1, le=1000)
+    include_today: bool = False
+
+
+class SpreadResult(BaseModel):
+    cards: int
+    days: int
+    decks: int
 
 
 class BulkCardResult(BaseModel):

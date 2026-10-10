@@ -58,6 +58,8 @@ class Deck(BaseModel, SoftDeleteMixin):
     archived_at: Optional[datetime] = None
     # Set by POST /decks/{id}/rest, cleared by /wake; never through PATCH (SR-001, ADR-043).
     rest_until: Optional[datetime] = None
+    # The last local day the soft landing ran for this deck (SR-002): once a day, at most.
+    last_spread_on: Optional[datetime] = None
     voice_settings: Optional[dict] = {
         "front": {"voice_name": None, "rate": 1.0, "pitch": 1.0},
         "back": {"voice_name": None, "rate": 1.0, "pitch": 1.0}
