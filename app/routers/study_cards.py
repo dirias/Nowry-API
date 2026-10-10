@@ -205,6 +205,10 @@ def _get_deck_budget(deck_doc: dict) -> tuple[int, int]:
 
 STRUGGLING_WINDOW_DAYS = 14
 STRUGGLING_GRADES = ("again", "hard")
+
+# How many Agains a card remembers (SR-004). The leech rule reads the ones
+# inside the Struggling window; a longer memory would only be history.
+LAPSE_HISTORY = 8
 GROUP_KEYS = ("marked", "struggling")
 
 
@@ -1678,19 +1682,23 @@ async def review_card(
 
         logger.info(f"New SM-2: {sm2_result}")
 
-        # Update the card
-        await collection.update_one(
-            {"_id": ObjectId(id)},
-            {
-                "$set": {
-                    "last_reviewed": sm2_result["last_reviewed"],
-                    "next_review": sm2_result["next_review"],
-                    "ease_factor": sm2_result["ease_factor"],
-                    "interval": sm2_result["interval"],
-                    "repetitions": sm2_result["repetitions"],
-                }
-            },
-        )
+        # Update the card. An Again is also recorded as a lapse (SR-004): the
+        # leech rule is the count of these inside the Struggling window, and
+        # SM-2 itself keeps no such memory — it resets the interval and forgets.
+        update: dict = {
+            "$set": {
+                "last_reviewed": sm2_result["last_reviewed"],
+                "next_review": sm2_result["next_review"],
+                "ease_factor": sm2_result["ease_factor"],
+                "interval": sm2_result["interval"],
+                "repetitions": sm2_result["repetitions"],
+            }
+        }
+        if grade == "again":
+            update["$push"] = {
+                "lapses": {"$each": [sm2_result["last_reviewed"]], "$slice": -LAPSE_HISTORY}
+            }
+        await collection.update_one({"_id": ObjectId(id)}, update)
 
         # Award XP for reviewing a card — genuinely fire-and-forget: the SM-2
         # update above already committed, so a grant_xp failure must never

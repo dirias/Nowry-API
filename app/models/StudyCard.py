@@ -93,6 +93,12 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     rests: List[RestEntry] = []
     rested_at: Optional[datetime] = None
 
+    # The leech record (SR-004, D6). One timestamp per Again, kept to the last
+    # few, written by `review_card` alone. The clients count those inside the
+    # Struggling window and offer a way out on the fourth; nothing here changes
+    # the schedule, which is still SM-2's alone.
+    lapses: List[datetime] = []
+
     # The book→cards link (docs/prd-book-cards.md D1). Written by the generator
     # and the save-to-deck flow only; absent from StudyCardUpdate, so the generic
     # PATCH cannot change where a card came from. A hand-written card has neither.
