@@ -167,6 +167,9 @@ class BlockOccurrence(BaseModel):
     block_id: str
     start: str
     length_min: int
+    # The block's title rides on the row so a client can draw a day without a
+    # second lookup; the response model used to drop it and every row read blank.
+    title: str = ""
     log: Optional[BlockLog] = None
 
 

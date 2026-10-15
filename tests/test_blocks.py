@@ -144,6 +144,10 @@ async def test_a_user_with_blocks_is_never_migrated(mock_firebase_user):
     migrate.assert_not_called()
     assert out["migrated"] is None
     assert len(out["occurrences"]) == 5 and out["blocks"][0]["id"] == str(existing["_id"])
+    # The title travels on the row, and the response model must keep it.
+    from app.models.Block import BlocksResponse
+
+    assert BlocksResponse(**out).occurrences[0].title == "Morning review"
 
 
 @pytest.mark.asyncio
