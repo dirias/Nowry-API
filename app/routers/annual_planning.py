@@ -15,6 +15,8 @@ from app.config.database import (
     goals_collection,
     activities_collection,
     daily_routines_collection,
+    blocks_collection,
+    block_log_collection,
     quarter_reports_collection,
     books_collection,
     tasks_collection,
@@ -25,6 +27,10 @@ from app.models.Priority import Priority
 from app.models.Goal import Goal
 from app.models.Activity import Activity, ActivityUpdate
 from app.models.DailyRoutine import DailyRoutineTemplate
+from app.services.blocks import quarter_blocks_summary
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 from app.models.Goal import Milestone
 from app.models.QuarterReport import QuarterReport
 from pydantic import BaseModel
@@ -669,6 +675,19 @@ async def close_quarter(
             "total_items_checked": total_items_checked,
             "completion_rate": min(100, int((active_days / 90) * 100)) if active_days > 0 else 0
         }
+
+    # The quarter's blocks (PLAN-009, ADR-045): kept rate, minutes by source and
+    # area, study minutes against the plan. The legacy routine numbers above
+    # stay until `daily_routines` retires.
+    try:
+        q_start, q_end = start_date.date(), end_date.date()
+        q_blocks = await blocks_collection.find({"user_id": user_id}).to_list(length=500)
+        q_logs = await block_log_collection.find(
+            {"user_id": user_id, "date": {"$gte": q_start.isoformat(), "$lte": q_end.isoformat()}}
+        ).to_list(length=5000)
+        routines_summary["blocks"] = quarter_blocks_summary(q_blocks, q_logs, q_start, q_end)
+    except Exception as exc:  # the report must not fail on its newest section
+        logger.warning(f"[close-quarter] blocks summary skipped: {exc}")
 
     # 4. Create and save QuarterReport
     report = QuarterReport(

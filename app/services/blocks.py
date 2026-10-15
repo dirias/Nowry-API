@@ -264,3 +264,72 @@ async def migrate_legacy(user_id: str, now: Optional[datetime] = None) -> dict[s
     if log_rows:
         await block_log_collection.insert_many(log_rows)
     return {"blocks": len(block_docs), "logs": len(log_rows)}
+
+
+# --- the quarter's blocks, for the report (PLAN-009) ---------------------------
+
+
+def quarter_blocks_summary(blocks: list[dict], logs: list[dict], start: date, end: date) -> dict:
+    """What the quarter's blocks say: planned, kept rate, minutes by source and
+    area, study minutes against the plan, and the ten most-kept rows. Pure, so
+    the report can be tested without a database.
+
+    The planned count expands every block over the quarter; a block created
+    mid-quarter counts from its creation day, since before that it asked for
+    nothing.
+    """
+    by_id = {str(b["_id"]): b for b in blocks}
+    planned_rows = [row for row in expand_occurrences(blocks, start, end) if _planned_after_creation(by_id.get(row["block_id"]), row["date"])]
+    planned = len(planned_rows)
+    per_block: dict[str, dict] = {}
+    for row in planned_rows:
+        entry = per_block.setdefault(row["block_id"], {"title": row["title"], "planned": 0, "kept": 0})
+        entry["planned"] += 1
+    kept = skipped = partial = minutes = 0
+    by_source: dict[str, int] = {}
+    by_area: dict[str, int] = {}
+    study_minutes = 0
+    for log in logs:
+        status = log.get("status")
+        if status == "kept":
+            kept += 1
+        elif status == "skipped":
+            skipped += 1
+            continue
+        elif status == "partial":
+            partial += 1
+        else:
+            continue
+        block = by_id.get(log.get("block_id")) or {}
+        mins = int(log.get("minutes") or 0)
+        minutes += mins
+        source = (block.get("source") or {}).get("type", "free")
+        by_source[source] = by_source.get(source, 0) + mins
+        if block.get("area_id"):
+            by_area[block["area_id"]] = by_area.get(block["area_id"], 0) + mins
+        if source == "study":
+            study_minutes += mins
+        if status == "kept" and log.get("block_id") in per_block:
+            per_block[log["block_id"]]["kept"] += 1
+    study_planned = sum(row["length_min"] for row in planned_rows if ((by_id.get(row["block_id"]) or {}).get("source") or {}).get("type") == "study")
+    rows = sorted(per_block.values(), key=lambda r: (-r["kept"], -r["planned"], r["title"]))[:10]
+    return {
+        "planned": planned,
+        "kept": kept,
+        "skipped": skipped,
+        "partial": partial,
+        "kept_rate": round((kept + partial / 2) / planned, 3) if planned else 0.0,
+        "minutes": minutes,
+        "minutes_by_source": by_source,
+        "minutes_by_area": by_area,
+        "study_minutes_planned": study_planned,
+        "study_minutes_kept": study_minutes,
+        "rows": rows,
+    }
+
+
+def _planned_after_creation(block: Optional[dict], date_key: str) -> bool:
+    created = (block or {}).get("created_at")
+    if not isinstance(created, datetime):
+        return True
+    return created.date().isoformat() <= date_key

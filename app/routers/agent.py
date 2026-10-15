@@ -2154,7 +2154,12 @@ class InterventionRequest(BaseModel):
         "pre_session_framing",
         "re_engagement",
         "streak_milestone",
+        "block_moment",
     ]
+    # --- block moments (PLAN-009): the client reads the moment from the block
+    # log and words it in its own language; the server only dedups the key. ---
+    block_reason: Optional[Literal["kept_after_skips", "week_kept", "under_estimate"]] = None
+    moment_key: Optional[str] = None
     # --- Phase 1 fields (unchanged) ---
     card_id: Optional[str] = None
     card_front: Optional[str] = None
@@ -2216,6 +2221,7 @@ class InterventionResponse(BaseModel):
         "pre_session_framing",
         "re_engagement",
         "streak_milestone",
+        "block_moment",
     ]
     message: str
     card_id: Optional[str] = None
@@ -2348,6 +2354,28 @@ async def _build_streak_milestone_message(
         upsert=True,
     )
     return (_STREAK_MESSAGES.get(milestone, f"You have reached a {milestone}-day streak."), False)
+
+
+_MOMENT_KEY_RE = re.compile(r"^(kept_after_skips|week_kept|under_estimate):[A-Za-z0-9_-]{1,64}(:\d{4}-\d{2}-\d{2})?$")
+_SEEN_MOMENTS_KEPT = 200
+
+
+async def _claim_block_moment(body: InterventionRequest, user_id: str) -> bool:
+    """Whether this moment is new to the account (PLAN-009).
+
+    The key names the reason, the block (or the week's Monday) and the day, so a
+    device that already said it, or another device, says it once. The last two
+    hundred keys are kept; older ones can be said again, which a learner a year
+    on will not mind.
+    """
+    key = body.moment_key or ""
+    if not _MOMENT_KEY_RE.match(key):
+        raise HTTPException(status_code=422, detail="moment_key must be reason:id[:date]")
+    claimed = await users_collection.update_one(
+        {"_id": ObjectId(user_id), "agent.seen_block_moments": {"$ne": key}},
+        {"$push": {"agent.seen_block_moments": {"$each": [key], "$slice": -_SEEN_MOMENTS_KEPT}}},
+    )
+    return claimed.modified_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2652,6 +2680,11 @@ async def post_intervention(
         )
         return InterventionResponse(type="streak_milestone", message=message, already_seen=False)
 
+    if body.type == "block_moment":
+        # No words from here: the client composes the sentence in its own
+        # language from the reason it read off the log (PLAN-009).
+        fresh = await _claim_block_moment(body, user_id)
+        return InterventionResponse(type="block_moment", message="", already_seen=not fresh)
     raise HTTPException(status_code=422, detail="Unknown intervention type.")
 
 
