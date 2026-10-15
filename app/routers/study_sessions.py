@@ -88,12 +88,13 @@ async def log_study_session(
         "completed_at": now,
     }
 
-    await study_sessions_collection.insert_one(doc)
+    inserted = await study_sessions_collection.insert_one(doc)
     logger.info(
         f"[study_sessions] SRS logged: user={user_id}, deck={body.deck_name!r}, "
         f"cards={total}, score={score_percentage}%, duration={duration_seconds}s"
     )
-    return {"logged": True, "score_percentage": score_percentage}
+    # The id travels back so a study block can record the session it ran (PLAN-005).
+    return {"logged": True, "score_percentage": score_percentage, "session_id": str(inserted.inserted_id)}
 
 
 # ---------------------------------------------------------------------------
