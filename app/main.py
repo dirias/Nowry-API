@@ -70,6 +70,7 @@ from app.routers import (
     contact,
     beta,
     copyright,
+    blocks,
 )
 
 
@@ -181,6 +182,7 @@ app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  #
 app.include_router(contact.router)        # The public contact form — POST /contact (SITE-006)
 app.include_router(beta.router)           # The beta gate — GET /beta/config, invites, waitlist (ADR-038)
 app.include_router(copyright.router)      # Takedown notices — POST /copyright-notices (GTM-008)
+app.include_router(blocks.router)        # Blocks — the one object for time (PLAN-001, ADR-045)
 
 
 @app.get("/")

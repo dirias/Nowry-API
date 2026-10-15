@@ -34,6 +34,9 @@ priorities_collection = db["priorities"]
 goals_collection = db["goals"]
 activities_collection = db["activities"]
 daily_routines_collection = db["daily_routines"]
+# Blocks — the one object for time, and its per-day log (PLAN-001, ADR-045)
+blocks_collection = db["blocks"]
+block_log_collection = db["block_log"]
 quarter_reports_collection = db["quarter_reports"]
 book_chunks_collection = db["book_chunks"]
 quiz_sessions_collection = db["quiz_sessions"]
@@ -213,6 +216,12 @@ async def create_indexes():
     await goals_collection.create_index("focus_area_id")
     await activities_collection.create_index("goal_id")
     await daily_routines_collection.create_index("user_id", unique=True)
+    # Blocks (ADR-045): reads are per owner; the log is one row per (owner, block, local date).
+    await blocks_collection.create_index([("user_id", 1), ("deleted_at", 1)], name="blocks_owner")
+    await blocks_collection.create_index([("user_id", 1), ("date", 1)], name="blocks_owner_date")
+    await blocks_collection.create_index([("user_id", 1), ("migrated_from.id", 1)], name="blocks_migrated_from")
+    await block_log_collection.create_index([("user_id", 1), ("block_id", 1), ("date", 1)], unique=True, name="block_log_key")
+    await block_log_collection.create_index([("user_id", 1), ("date", 1)], name="block_log_owner_date")
     await quarter_reports_collection.create_index("annual_plan_id")
 
     # Quiz sessions: TTL index — auto-expire sessions after 1 hour.
