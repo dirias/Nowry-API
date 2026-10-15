@@ -24,3 +24,21 @@ class Activity(BaseModel, SoftDeleteMixin):
         populate_by_name = True
         json_encoders = {ObjectId: str}
         arbitrary_types_allowed = True
+
+
+class ActivityUpdate(BaseModel):
+    """
+    A partial PUT body: only the fields the client sends are written (PLAN-010).
+
+    The calendar renames an activity with ``{title}`` alone. Validating that as
+    a full ``Activity`` filled the rest with the model's defaults, and the route
+    then wrote those defaults — so every rename reset ``frequency``,
+    ``days_of_week`` and ``time_of_day``. Read with ``model_dump(exclude_unset=True)``.
+    """
+    title: Optional[str] = None
+    description: Optional[str] = None
+    frequency: Optional[str] = None
+    days_of_week: Optional[list[int]] = None
+    time_of_day: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    is_active: Optional[bool] = None

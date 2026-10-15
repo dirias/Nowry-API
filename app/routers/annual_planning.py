@@ -23,7 +23,7 @@ from app.models.AnnualPlan import AnnualPlan
 from app.models.FocusArea import FocusArea
 from app.models.Priority import Priority
 from app.models.Goal import Goal
-from app.models.Activity import Activity
+from app.models.Activity import Activity, ActivityUpdate
 from app.models.DailyRoutine import DailyRoutineTemplate
 from app.models.Goal import Milestone
 from app.models.QuarterReport import QuarterReport
@@ -67,6 +67,36 @@ async def verify_goal_ownership(goal_id: str, user_id: str):
         goal = await goals_collection.find_one({"_id": goal_id})
     if not goal: raise HTTPException(status_code=404, detail="Goal not found")
     await verify_focus_area_ownership(goal["focus_area_id"], user_id)
+
+async def owns_plan(plan_id: str, user_id: str) -> bool:
+    """
+    Whether ``plan_id`` is one of this user's plans — a bool rather than a 403,
+    for the delete routes, which answer 404 to a document that is not the
+    caller's and never confirm it exists (PLAN-010).
+    """
+    try:
+        await verify_annual_plan_ownership(plan_id, user_id)
+    except HTTPException:
+        return False
+    return True
+
+
+async def owns_focus_area(fa_id: str, user_id: str) -> bool:
+    """As ``owns_plan``, one step down: through the focus area's plan."""
+    try:
+        await verify_focus_area_ownership(fa_id, user_id)
+    except HTTPException:
+        return False
+    return True
+
+
+def parse_object_id(id: str) -> ObjectId:
+    """The path id as an ObjectId, or a 400 the way the update routes answer one."""
+    try:
+        return ObjectId(id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+
 
 async def verify_priority_ownership(priority_id: str, user_id: str):
     from bson.errors import InvalidId
@@ -748,15 +778,13 @@ async def delete_focus_area(
 
     user_id = current_user.get("user_id")
     now = datetime.now(timezone.utc)
+    obj_id = parse_object_id(id)
 
-    # 1. Verify ownership
-    focus_area = await focus_areas_collection.find_one({
-        "_id": ObjectId(id),
-        "user_id": user_id,
-        "deleted_at": None
-    })
-    
-    if not focus_area:
+    # 1. Verify ownership — through the plan. A focus area carries no
+    # `user_id`, so filtering on one matched nothing and every delete was a
+    # 404 (PLAN-010).
+    focus_area = await focus_areas_collection.find_one({"_id": obj_id, "deleted_at": None})
+    if not focus_area or not await owns_plan(focus_area["annual_plan_id"], user_id):
         raise HTTPException(status_code=404, detail="Focus area not found")
     
     soft_delete_update = {
@@ -769,7 +797,7 @@ async def delete_focus_area(
     
     # 2. Soft delete the focus area
     await focus_areas_collection.update_one(
-        {"_id": ObjectId(id)},
+        {"_id": obj_id},
         soft_delete_update
     )
     
@@ -1137,15 +1165,12 @@ async def delete_goal(id: str, current_user: dict = Depends(get_firebase_user)):
 
     user_id = current_user.get("user_id")
     now = datetime.now(timezone.utc)
+    obj_id = parse_object_id(id)
 
-    # 1. Verify ownership
-    goal = await goals_collection.find_one({
-        "_id": ObjectId(id),
-        "user_id": user_id,
-        "deleted_at": None
-    })
-    
-    if not goal:
+    # 1. Verify ownership — goal → focus area → plan. A goal carries no
+    # `user_id` either (PLAN-010).
+    goal = await goals_collection.find_one({"_id": obj_id, "deleted_at": None})
+    if not goal or not await owns_focus_area(goal["focus_area_id"], user_id):
         raise HTTPException(status_code=404, detail="Goal not found")
     
     soft_delete_update = {
@@ -1158,7 +1183,7 @@ async def delete_goal(id: str, current_user: dict = Depends(get_firebase_user)):
     
     # 2. Soft delete the goal
     await goals_collection.update_one(
-        {"_id": ObjectId(id)},
+        {"_id": obj_id},
         soft_delete_update
     )
     
@@ -1198,31 +1223,22 @@ async def create_activity(
 @router.put("/activities/{id}", response_model=Activity)
 async def update_activity(
     id: str,
-    activity: Activity,
+    activity: ActivityUpdate,
     current_user: dict = Depends(get_firebase_user),
 ):
     user_id = current_user.get("user_id")
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid ID format")
+    obj_id = parse_object_id(id)
 
     existing_act = await activities_collection.find_one({"_id": obj_id})
     if not existing_act:
         raise HTTPException(status_code=404, detail="Activity not found")
     await verify_goal_ownership(existing_act["goal_id"], user_id)
 
-    result = await activities_collection.update_one(
-        {"_id": obj_id},
-        {"$set": {
-            "title": activity.title,
-            "frequency": activity.frequency,
-            "days_of_week": activity.days_of_week,
-            "time_of_day": activity.time_of_day,
-            "is_active": activity.is_active,
-            "updated_at": datetime.now(timezone.utc)
-        }}
-    )
+    # Only the fields the body carries (PLAN-010): the calendar's rename sends
+    # `{title}` and must leave the schedule as it was.
+    update_data: dict = activity.model_dump(exclude_unset=True)
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    result = await activities_collection.update_one({"_id": obj_id}, {"$set": update_data})
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Activity not found")
