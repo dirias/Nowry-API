@@ -11,7 +11,7 @@ class Priority(BaseModel, SoftDeleteMixin):
     focus_area_id: Optional[str] = None
     title: str
     linked_entity_id: Optional[str] = None
-    linked_entity_type: Optional[str] = None # goal, task, routine_morning, routine_afternoon, routine_evening
+    linked_entity_type: Optional[str] = None # goal, task, milestone, routine_morning, routine_afternoon, routine_evening
     description: Optional[str] = ""
     deadline: Optional[datetime] = None
     order: int = 0

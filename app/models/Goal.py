@@ -11,6 +11,7 @@ class Milestone(BaseModel):
     due_date: Optional[str] = None
     completed: bool = False
     is_key_result: bool = False
+    is_priority: bool = False  # ADR-046: a priority is a flag, not an object
 
 class Goal(BaseModel, SoftDeleteMixin):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")

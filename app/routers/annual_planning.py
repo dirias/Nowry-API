@@ -19,7 +19,6 @@ from app.config.database import (
     block_log_collection,
     quarter_reports_collection,
     books_collection,
-    tasks_collection,
 )
 from app.models.AnnualPlan import AnnualPlan
 from app.models.FocusArea import FocusArea
@@ -28,6 +27,7 @@ from app.models.Goal import Goal
 from app.models.Activity import Activity, ActivityUpdate
 from app.models.DailyRoutine import DailyRoutineTemplate
 from app.services.blocks import quarter_blocks_summary
+from app.services.priorities import flagged_items
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -102,48 +102,6 @@ def parse_object_id(id: str) -> ObjectId:
         return ObjectId(id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID format")
-
-
-async def verify_priority_ownership(priority_id: str, user_id: str):
-    from bson.errors import InvalidId
-    try:
-        obj_id = ObjectId(priority_id)
-    except InvalidId:
-        obj_id = priority_id
-    p = await priorities_collection.find_one({"_id": obj_id})
-    if not p:
-        # Fallback: legacy priority stored with string _id
-        p = await priorities_collection.find_one({"_id": priority_id})
-    if not p:
-        raise HTTPException(status_code=404, detail="Priority not found")
-    await verify_annual_plan_ownership(p["annual_plan_id"], user_id)
-
-
-async def sync_linked_task_completion(task_id: str, is_completed: bool, user_id: str) -> None:
-    """ADR-015 point 4: a task-linked priority and its task complete together.
-
-    No-op when the task is gone, belongs to someone else, or is already in the
-    requested state. Awards the task's completion XP once, exactly as
-    PATCH /tasks does, so finishing the work from the planning side is worth
-    the same as finishing it from the task list.
-    """
-    from bson.errors import InvalidId
-    try:
-        task_obj_id = ObjectId(task_id)
-    except (InvalidId, TypeError):
-        return
-    task = await tasks_collection.find_one({"_id": task_obj_id, "deleted_at": None})
-    if not task or str(task.get("user_id")) != str(user_id):
-        return
-    if bool(task.get("is_completed", False)) == is_completed:
-        return
-    await tasks_collection.update_one(
-        {"_id": task_obj_id},
-        {"$set": {"is_completed": is_completed, "updated_at": datetime.now(timezone.utc)}},
-    )
-    if is_completed:
-        from app.routers.agent import grant_xp, XP_PER_TASK_COMPLETE
-        await grant_xp(user_id, XP_PER_TASK_COMPLETE)
 
 
 router = APIRouter(
@@ -289,11 +247,8 @@ async def get_full_annual_plan(
 
     # Level 2: focus areas, priorities, and quarter reports in parallel
     areas_coro = focus_areas_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
-    # D-03 sort — is_active DESC groups active before inactive within non-completed
-    # (aggregation $ifNull normalizes missing is_active on legacy docs — WR-02 fix)
-    priorities_coro = priorities_collection.aggregate(
-        _priorities_sort_pipeline({"annual_plan_id": plan_id, "deleted_at": None}, 50)
-    ).to_list(length=50)
+    # Priorities are flagged tasks and milestones, projected into the old shape (ADR-046)
+    priorities_coro = flagged_items(user_id, plan_id)
     reports_coro = quarter_reports_collection.find({"annual_plan_id": plan_id, "deleted_at": None}).to_list(length=10)
 
     areas, priorities, reports = await asyncio.gather(areas_coro, priorities_coro, reports_coro)
@@ -842,220 +797,48 @@ async def delete_focus_area(
 
 
 # --- Priorities ---
+#
+# ADR-046 §5: a priority is `is_priority` on a task or a milestone. The reader
+# projects flagged items into the old Priority shape; the writers are gone and
+# answer 410 so an old client gets a clear reason rather than a 404.
 
-def _priorities_sort_pipeline(match_filter: dict, limit: int) -> list:
-    """D-03 compound sort — is_active DESC groups active before inactive within
-    non-completed. Uses an aggregation $ifNull instead of a plain .find().sort()
-    so priority documents that predate Phase 24 (missing is_active entirely,
-    which BSON sorts as null — behind explicit false) are treated as active,
-    matching the Pydantic `is_active: bool = True` response default (WR-02 fix).
-    """
-    return [
-        {"$match": match_filter},
-        {"$addFields": {"_is_active_sort": {"$ifNull": ["$is_active", True]}}},
-        {"$sort": {"is_completed": 1, "_is_active_sort": -1, "order": 1, "created_at": 1}},
-        {"$project": {"_is_active_sort": 0}},
-        {"$limit": limit},
-    ]
+PRIORITIES_GONE = "Priorities are a flag on tasks and milestones (ADR-046); write is_priority on the item"
+
+
+def _priorities_gone() -> HTTPException:
+    return HTTPException(status_code=410, detail=PRIORITIES_GONE)
+
 
 @router.get("/priorities", response_model=List[Priority])
 async def get_priorities(
     annual_plan_id: str,
     current_user: dict = Depends(get_firebase_user),
-):
+) -> List[dict]:
     user_id = current_user.get("user_id")
     await verify_annual_plan_ownership(annual_plan_id, user_id)
-    priorities = await priorities_collection.aggregate(
-        _priorities_sort_pipeline({"annual_plan_id": annual_plan_id, "deleted_at": None}, 50)
-    ).to_list(length=50)
-    return priorities
-
-@router.post("/priorities", response_model=Priority)
-async def create_priority(
-    priority: Priority,
-    current_user: dict = Depends(get_firebase_user),
-):
-    user_id = current_user.get("user_id")
-    await verify_annual_plan_ownership(priority.annual_plan_id, user_id)
-    result = await priorities_collection.insert_one(priority.model_dump(by_alias=True))
-    return await priorities_collection.find_one({"_id": result.inserted_id})
-
-@router.put("/priorities/{id}", response_model=Priority)
-async def update_priority(
-    id: str,
-    priority_update: dict,
-    current_user: dict = Depends(get_firebase_user),
-):
-    user_id = current_user.get("user_id")
-    await verify_priority_ownership(id, user_id)
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid ID format")
-
-    # Check if priority exists
-    existing = await priorities_collection.find_one({"_id": obj_id})
-    if not existing:
-        # Try finding with string ID
-        existing = await priorities_collection.find_one({"_id": id})
-        if not existing:
-            raise HTTPException(status_code=404, detail=f"Priority not found: {id}")
-        # Use string ID for update
-        obj_id = id
-
-    # Build update dict with only provided fields
-    update_data = {"updated_at": datetime.now(timezone.utc)}
-
-    if "title" in priority_update:
-        update_data["title"] = priority_update["title"]
-    if "description" in priority_update:
-        update_data["description"] = priority_update["description"]
-    if "deadline" in priority_update:
-        update_data["deadline"] = priority_update["deadline"]
-    if "is_completed" in priority_update:
-        # Same rule as is_active below: a real boolean or nothing (ADR-015).
-        raw_is_completed = priority_update["is_completed"]
-        if not isinstance(raw_is_completed, bool):
-            raise HTTPException(status_code=400, detail="is_completed must be a boolean")
-        update_data["is_completed"] = raw_is_completed
-        update_data["completed_at"] = datetime.now(timezone.utc) if raw_is_completed else None
-    if "is_active" in priority_update:
-        # No completed_at-style timestamp needed — is_active is a manual "not right now"
-        # toggle (D-04), not a completion event. Reject non-boolean values outright
-        # instead of coercing (bool("false") == True would silently invert intent — T-24-01/WR-01).
-        raw_is_active = priority_update["is_active"]
-        if not isinstance(raw_is_active, bool):
-            raise HTTPException(status_code=400, detail="is_active must be a boolean")
-        update_data["is_active"] = raw_is_active
-    if "linked_entity_id" in priority_update:
-        update_data["linked_entity_id"] = priority_update["linked_entity_id"]
-    if "linked_entity_type" in priority_update:
-        update_data["linked_entity_type"] = priority_update["linked_entity_type"]
-    if "annual_plan_id" in priority_update:
-        # Reparenting to a new plan requires proving the caller owns the *target*
-        # plan too — verify_priority_ownership above only confirmed the *current*
-        # parent (CR-02: otherwise a user could move their priority into any
-        # other user's annual_plan_id).
-        await verify_annual_plan_ownership(priority_update["annual_plan_id"], user_id)
-        update_data["annual_plan_id"] = priority_update["annual_plan_id"]
-    if "focus_area_id" in priority_update:
-        await verify_focus_area_ownership(priority_update["focus_area_id"], user_id)
-        update_data["focus_area_id"] = priority_update["focus_area_id"]
-
-    result = await priorities_collection.update_one(
-        {"_id": obj_id},
-        {"$set": update_data}
-    )
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Priority not found")
-
-    # A task-linked priority carries its task with it (ADR-015 point 4). Goal-
-    # linked priorities are deliberately one-way: a goal has several priorities,
-    # so one finishing says nothing about the goal.
-    if "is_completed" in update_data and existing.get("linked_entity_type") == "task" and existing.get("linked_entity_id"):
-        await sync_linked_task_completion(existing["linked_entity_id"], update_data["is_completed"], user_id)
-
-    return await priorities_collection.find_one({"_id": obj_id})
-
-@router.delete("/priorities/{id}", response_model=MessageResponse)
-async def delete_priority(id: str, current_user: dict = Depends(get_firebase_user)):
-    user_id = current_user.get("user_id")
-    await verify_priority_ownership(id, user_id)
-
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        obj_id = id
-
-    now = datetime.now(timezone.utc)
-    soft_delete_update = {
-        "$set": {
-            "deleted_at": now,
-            "deleted_by": user_id,
-            "updated_at": now,
-        }
-    }
-    result = await priorities_collection.update_one({"_id": obj_id}, soft_delete_update)
-    if result.matched_count == 0:
-        # Try string ID as fallback
-        result = await priorities_collection.update_one({"_id": id}, soft_delete_update)
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Priority not found")
-
-    return {"message": "Priority deleted"}
+    return await flagged_items(user_id, annual_plan_id)
 
 
-class PriorityReorderRequest(BaseModel):
-    """Payload for PATCH /annual-plan/priorities/reorder."""
-    annual_plan_id: str
-    priority_ids: List[str]
+@router.post("/priorities", responses={410: {"description": "Gone"}})
+async def create_priority(current_user: dict = Depends(get_firebase_user)) -> None:
+    raise _priorities_gone()
 
 
-# NOTE: this route must remain ABOVE any future PATCH /priorities/{id} to avoid
-# FastAPI matching "reorder" as the {id} path parameter.
-@router.patch("/priorities/reorder", response_model=OkResponse)
-async def reorder_priorities(
-    payload: PriorityReorderRequest,
-    current_user: dict = Depends(get_firebase_user),
-) -> OkResponse:
-    """
-    Accept an ordered list of priority IDs and write sequential `order`
-    values (0-indexed). Validates that all IDs belong to the given plan
-    before performing any writes (D-09/D-10).
-    """
-    from bson.errors import InvalidId
+# NOTE: this route must remain ABOVE PATCH /priorities/{id} should one ever
+# return, so FastAPI never matches "reorder" as the {id} path parameter.
+@router.patch("/priorities/reorder", responses={410: {"description": "Gone"}})
+async def reorder_priorities(current_user: dict = Depends(get_firebase_user)) -> None:
+    raise _priorities_gone()
 
-    user_id = current_user.get("user_id")
 
-    # Guard: oversized payload (DoS defense — T-20-03)
-    if len(payload.priority_ids) > 50:
-        raise HTTPException(status_code=422, detail="priority_ids must contain at most 50 items")
+@router.put("/priorities/{id}", responses={410: {"description": "Gone"}})
+async def update_priority(id: str, current_user: dict = Depends(get_firebase_user)) -> None:
+    raise _priorities_gone()
 
-    # Guard: duplicate IDs would clobber `order` redundantly and can mask a
-    # client-side bug producing the ordered list (IN-03)
-    if len(set(payload.priority_ids)) != len(payload.priority_ids):
-        raise HTTPException(status_code=422, detail="priority_ids must not contain duplicates")
 
-    # Auth + plan ownership (D-12)
-    await verify_annual_plan_ownership(payload.annual_plan_id, user_id)
-
-    # Build ObjectId list with string fallback for legacy docs (D-09, Pattern 4)
-    obj_ids = []
-    for pid in payload.priority_ids:
-        try:
-            obj_ids.append(ObjectId(pid))
-        except InvalidId:
-            obj_ids.append(pid)
-
-    # Include both ObjectId and string forms in $in — covers legacy string-_id docs
-    all_id_forms = obj_ids + payload.priority_ids
-    valid_count = await priorities_collection.count_documents({
-        "_id": {"$in": all_id_forms},
-        "annual_plan_id": payload.annual_plan_id,
-        "deleted_at": None,
-    })
-    if valid_count < len(payload.priority_ids):
-        raise HTTPException(
-            status_code=422,
-            detail="One or more priority IDs do not belong to this plan",
-        )
-
-    # Sequential update_one loop — all-or-nothing validation already passed (D-10)
-    for index, (pid, obj_id) in enumerate(zip(payload.priority_ids, obj_ids)):
-        result = await priorities_collection.update_one(
-            {"_id": obj_id},
-            {"$set": {"order": index, "updated_at": datetime.now(timezone.utc)}},
-        )
-        if result.matched_count == 0:
-            # Fallback: document has string _id (legacy doc)
-            await priorities_collection.update_one(
-                {"_id": pid},
-                {"$set": {"order": index, "updated_at": datetime.now(timezone.utc)}},
-            )
-
-    return {"ok": True}
+@router.delete("/priorities/{id}", responses={410: {"description": "Gone"}})
+async def delete_priority(id: str, current_user: dict = Depends(get_firebase_user)) -> None:
+    raise _priorities_gone()
 
 
 # --- Goals ---
@@ -1287,6 +1070,7 @@ class MilestoneCreate(BaseModel):
     title: str
     due_date: Optional[str] = None
     is_key_result: bool = False
+    is_priority: bool = False
 
 
 class MilestonePatch(BaseModel):
@@ -1294,6 +1078,7 @@ class MilestonePatch(BaseModel):
     due_date: Optional[str] = None
     completed: Optional[bool] = None
     is_key_result: Optional[bool] = None
+    is_priority: Optional[bool] = None
 
 
 class MilestoneResponse(BaseModel):
@@ -1302,6 +1087,7 @@ class MilestoneResponse(BaseModel):
     due_date: Optional[str] = None
     completed: bool
     is_key_result: bool
+    is_priority: bool = False
 
 
 def _resolve_goal_id(goal_id: str):
@@ -1350,6 +1136,7 @@ async def create_milestone(
         title=payload.title,
         due_date=payload.due_date,
         is_key_result=payload.is_key_result,
+        is_priority=payload.is_priority,
         completed=False,
     )
     milestone_doc = new_milestone.model_dump()
@@ -1381,6 +1168,7 @@ async def create_milestone(
         due_date=new_milestone.due_date,
         completed=new_milestone.completed,
         is_key_result=new_milestone.is_key_result,
+        is_priority=new_milestone.is_priority,
     )
 
 
@@ -1421,6 +1209,8 @@ async def update_milestone(
         updated["completed"] = payload.completed
     if payload.is_key_result is not None:
         updated["is_key_result"] = payload.is_key_result
+    if payload.is_priority is not None:
+        updated["is_priority"] = payload.is_priority
 
     obj_id = _resolve_goal_id(goal_id)
     result = await goals_collection.update_one(
@@ -1452,6 +1242,7 @@ async def update_milestone(
         due_date=updated.get("due_date"),
         completed=updated["completed"],
         is_key_result=updated["is_key_result"],
+        is_priority=bool(updated.get("is_priority", False)),
     )
 
 

@@ -18,6 +18,7 @@ class Task(BaseModel, SoftDeleteMixin):
     updated_at: Optional[datetime] = None
     tags: List[str] = Field(default_factory=list)
     category: Optional[str] = None  # study, work, personal, etc.
+    is_priority: bool = False  # ADR-046: a priority is a flag, not an object
 
     class Config:
         populate_by_name = True

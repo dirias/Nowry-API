@@ -1,8 +1,13 @@
 """
-ADR-015 / PRIO-002 — completing a task carries every priority linked to it.
+PATCH /tasks/{id} completion side effects.
 
-PATCH /tasks/{id} is called directly with its dependencies supplied as mocks,
-the way test_annual_planning_be.py drives the annual-planning router.
+ADR-015 point 4 used to carry every yearly priority linked to a task along
+with its completion. Since PLAN-013 (ADR-046) a priority *is* the task's own
+`is_priority` flag, so there is nothing to carry: the route touches no
+priority collection, and only the XP award remains a side effect.
+
+The handler is called directly with its dependencies supplied as mocks, the
+way test_annual_planning_be.py drives the annual-planning router.
 """
 from __future__ import annotations
 
@@ -31,7 +36,7 @@ def _fake_agent_module():
 
 
 async def _patch_task(task_doc, updates, mock_firebase_user):
-    """Returns (priorities mock, tasks collection mock, agent stub)."""
+    """Returns (tasks collection mock, agent stub)."""
     from app.routers.tasks import update_task
 
     task_id = str(task_doc["_id"])
@@ -40,9 +45,7 @@ async def _patch_task(task_doc, updates, mock_firebase_user):
     collection.find_one = AsyncMock(return_value={**task_doc, **updates})
     agent = _fake_agent_module()
 
-    with patch("app.routers.tasks.priorities_collection") as mock_pri, \
-         patch.dict(sys.modules, {"app.routers.agent": agent}):
-        mock_pri.update_many = AsyncMock()
+    with patch.dict(sys.modules, {"app.routers.agent": agent}):
         await update_task(
             id=task_id,
             updates=dict(updates),
@@ -50,52 +53,55 @@ async def _patch_task(task_doc, updates, mock_firebase_user):
             task=task_doc,
             user=mock_firebase_user,
         )
-    return mock_pri, collection, agent
+    return collection, agent
 
 
 def _task(is_completed: bool):
     return {"_id": ObjectId(), "user_id": USER_ID, "title": "T", "is_completed": is_completed, "deleted_at": None}
 
 
+def test_the_tasks_router_no_longer_knows_the_priorities_collection():
+    """ADR-046: the flag lives on the task; no cross-collection sync remains."""
+    from app.routers import tasks as tasks_router
+
+    assert not hasattr(tasks_router, "priorities_collection")
+    assert not hasattr(tasks_router, "sync_linked_priorities_completion")
+
+
 @pytest.mark.asyncio
-async def test_completing_task_completes_linked_priorities(mock_firebase_user):
+async def test_completing_task_writes_it_and_awards_xp_once(mock_firebase_user):
     task_doc = _task(is_completed=False)
 
-    mock_pri, _, agent = await _patch_task(task_doc, {"is_completed": True}, mock_firebase_user)
+    collection, agent = await _patch_task(task_doc, {"is_completed": True}, mock_firebase_user)
 
-    mock_pri.update_many.assert_awaited_once()
-    query, update = mock_pri.update_many.call_args[0]
-    assert query == {"linked_entity_id": str(task_doc["_id"]), "linked_entity_type": "task"}
-    assert update["$set"]["is_completed"] is True
-    assert update["$set"]["completed_at"] is not None
-    agent.grant_xp.assert_awaited_once()
+    assert collection.update_one.call_args[0][1]["$set"]["is_completed"] is True
+    agent.grant_xp.assert_awaited_once_with(USER_ID, 10)
 
 
 @pytest.mark.asyncio
-async def test_uncompleting_task_reverts_linked_priorities(mock_firebase_user):
+async def test_uncompleting_task_awards_nothing(mock_firebase_user):
     task_doc = _task(is_completed=True)
 
-    mock_pri, _, agent = await _patch_task(task_doc, {"is_completed": False}, mock_firebase_user)
+    collection, agent = await _patch_task(task_doc, {"is_completed": False}, mock_firebase_user)
 
-    _, update = mock_pri.update_many.call_args[0]
-    assert update["$set"]["is_completed"] is False
-    assert update["$set"]["completed_at"] is None
+    assert collection.update_one.call_args[0][1]["$set"]["is_completed"] is False
     agent.grant_xp.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_task_patch_without_state_change_touches_no_priority(mock_firebase_user):
+async def test_task_patch_without_state_change_awards_nothing(mock_firebase_user):
     task_doc = _task(is_completed=True)
 
-    mock_pri, _, _ = await _patch_task(task_doc, {"is_completed": True}, mock_firebase_user)
+    _, agent = await _patch_task(task_doc, {"is_completed": True}, mock_firebase_user)
 
-    mock_pri.update_many.assert_not_called()
+    agent.grant_xp.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_task_patch_of_other_fields_touches_no_priority(mock_firebase_user):
+async def test_task_patch_of_other_fields_awards_nothing(mock_firebase_user):
     task_doc = _task(is_completed=False)
 
-    mock_pri, _, _ = await _patch_task(task_doc, {"title": "Renamed"}, mock_firebase_user)
+    collection, agent = await _patch_task(task_doc, {"title": "Renamed"}, mock_firebase_user)
 
-    mock_pri.update_many.assert_not_called()
+    assert collection.update_one.call_args[0][1]["$set"]["title"] == "Renamed"
+    agent.grant_xp.assert_not_called()
