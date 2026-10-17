@@ -43,6 +43,7 @@ from app.routers import (
     cards,
     study_cards,
     tasks,
+    task_lists,
     decks,
     quizzes,
     visualizer,
@@ -158,6 +159,7 @@ app.include_router(cards.router)
 app.include_router(study_cards.router)
 app.include_router(decks.router)
 app.include_router(tasks.router)
+app.include_router(task_lists.router)    # Task lists — named and owned on the server (PLAN-021)
 app.include_router(quizzes.router)
 app.include_router(visualizer.router)
 app.include_router(news.router)

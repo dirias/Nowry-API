@@ -22,6 +22,7 @@ cards_collection = db["cards"]
 study_cards_collection = db["cards"]  # Alias for cards collection
 tag_settings_collection = db["tag_settings"]  # a tag's own record: its rest (SR-001, ADR-043)
 tasks_collection = db["tasks"]
+task_lists_collection = db["task_lists"]  # a task's list, named and owned (PLAN-021)
 bugs_collection = db["bugs"]
 contact_messages_collection = db["contact_messages"]  # the public contact form (SITE-006)
 waitlist_collection = db["waitlist"]  # the beta waitlist, one row per email (ADR-038)
@@ -222,6 +223,9 @@ async def create_indexes():
     await blocks_collection.create_index([("user_id", 1), ("migrated_from.id", 1)], name="blocks_migrated_from")
     await block_log_collection.create_index([("user_id", 1), ("block_id", 1), ("date", 1)], unique=True, name="block_log_key")
     await block_log_collection.create_index([("user_id", 1), ("date", 1)], name="block_log_owner_date")
+    # Task lists (PLAN-021): reads are per owner; the import looks a list up by its legacy id.
+    await task_lists_collection.create_index([("user_id", 1), ("deleted_at", 1)], name="task_lists_owner")
+    await task_lists_collection.create_index([("user_id", 1), ("legacy_id", 1)], name="task_lists_legacy")
     await quarter_reports_collection.create_index("annual_plan_id")
 
     # Quiz sessions: TTL index — auto-expire sessions after 1 hour.
