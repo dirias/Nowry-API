@@ -35,15 +35,18 @@ OTHER_USER_ID = "507f1f77bcf86cd799439099"
 
 
 def make_board(owner_user_id: str, collaborators=None, name: str = "Test Board") -> dict:
-    """Build a Phase 7 multi-board document owned by `owner_user_id`."""
+    """Build a multi-board document owned by `owner_user_id`, stored as v2
+    (ADR-047); v1 boards and their migration are covered in test_board001_v2.py."""
     return {
         "_id": ObjectId(),
         "owner_user_id": owner_user_id,
         "user_id": owner_user_id,
         "collaborators": list(collaborators or []),
         "name": name,
+        "schema": 2,
+        "rev": 1,
         "nodes": [],
-        "edges": [],
+        "links": [],
         "viewport": {"x": 0, "y": 0, "zoom": 1},
     }
 
@@ -103,8 +106,9 @@ async def test_free_board_limit_returns_402(mock_blackboards_collection, mock_fi
     assert exc_info.value.detail == "board_limit_reached"
     # The cap is enforced before any write.
     mock_db.blackboards.insert_one.assert_not_called()
+    # A soft-deleted board no longer counts against the plan (BOARD-001).
     mock_db.blackboards.count_documents.assert_awaited_once_with(
-        {"owner_user_id": mock_firebase_user["user_id"]}
+        {"owner_user_id": mock_firebase_user["user_id"], "deleted_at": None}
     )
 
 
@@ -136,9 +140,9 @@ async def test_list_boards_returns_owned_and_shared(mock_blackboards_collection,
         result = await list_boards(current_user=mock_firebase_user)
 
     assert len(result) == 2
-    by_id = {doc["id"]: doc for doc in result}
-    assert by_id[owned_id]["is_owner"] is True
-    assert by_id[shared_id]["is_owner"] is False
+    by_id = {doc.id: doc for doc in result}
+    assert by_id[owned_id].is_owner is True
+    assert by_id[shared_id].is_owner is False
 
     # Both queries are bounded, use the expected filters, and exclude
     # soft-deleted boards.
@@ -148,32 +152,32 @@ async def test_list_boards_returns_owned_and_shared(mock_blackboards_collection,
 
 
 # --------------------------------------------------------------------------- #
-# BB-02 — Collaboration: save guard
+# BB-02 — Collaboration: save guard (the PATCH since ADR-047)
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_save_board_denied_when_not_owner_or_collaborator(mock_blackboards_collection, mock_firebase_user):
-    """PUT /blackboards/{id} returns 403 when user is neither owner nor collaborator."""
-    from app.routers.blackboards import save_blackboard
-    from app.models.Blackboard import BlackboardUpdate
+    """PATCH /blackboards/{id} returns 403 when user is neither owner nor collaborator."""
+    from app.routers.blackboards import patch_board
+    from app.models.Blackboard import BoardPatch
 
     # Board belongs to someone else and the caller is not a collaborator.
     foreign_board = make_board(owner_user_id=OTHER_USER_ID, collaborators=[])
 
     with patch("app.routers.blackboards.db") as mock_db:
         mock_db.blackboards.find_one = AsyncMock(return_value=foreign_board)
-        mock_db.blackboards.find_one_and_update = AsyncMock()
+        mock_db.blackboards.update_one = AsyncMock()
 
         with pytest.raises(HTTPException) as exc_info:
-            await save_blackboard(
+            await patch_board(
                 board_id=str(foreign_board["_id"]),
-                update=BlackboardUpdate(name="x"),
+                body=BoardPatch(rev=1, name="x"),
                 current_user=mock_firebase_user,
             )
 
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail == "board_access_denied"
     # The guard rejects before persisting anything.
-    mock_db.blackboards.find_one_and_update.assert_not_called()
+    mock_db.blackboards.update_one.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -203,8 +207,8 @@ async def test_get_shared_board_as_collaborator(mock_blackboards_collection, moc
             current_user=mock_firebase_user,
         )
 
-    assert result["id"] == board_id
-    assert result["name"] == "Shared With Me"
+    assert result.id == board_id
+    assert result.name == "Shared With Me"
 
     # The Mongo filter must not scope by the caller's user_id — a collaborator is
     # not the owner, so that filter is exactly what broke sharing.
@@ -234,17 +238,14 @@ async def test_get_board_denied_for_non_collaborator(mock_blackboards_collection
 
 
 # --------------------------------------------------------------------------- #
-# BBAUDIT-01 / F6 — DELETE /{board_id} clear actually clears + is guarded
+# BOARD-001 — DELETE /{board_id} soft-deletes the board, owner only
+# (it used to clear the board for owner or collaborator; BBAUDIT-01/F6 kept
+# the `_id` lookup and the guard, both still asserted here)
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_clear_board_by_object_id(mock_blackboards_collection, mock_firebase_user):
-    """DELETE /blackboards/{id} clears a Phase-7 board keyed on its real `_id`.
-
-    Regression for F6: the old filter was `{"board_id": <str>, "user_id": ...}`,
-    a field Phase-7 boards do not have, so `update_one` matched nothing and the
-    endpoint returned ok without clearing anything.
-    """
-    from app.routers.blackboards import clear_blackboard
+async def test_delete_board_by_object_id_soft_deletes(mock_blackboards_collection, mock_firebase_user):
+    """DELETE /blackboards/{id} stamps `deleted_at` on a board keyed on its real `_id`."""
+    from app.routers.blackboards import delete_board
 
     board = make_board(owner_user_id=mock_firebase_user["user_id"])
     assert "board_id" not in board  # Phase-7 shape: `_id` only
@@ -253,7 +254,7 @@ async def test_clear_board_by_object_id(mock_blackboards_collection, mock_fireba
         mock_db.blackboards.find_one = AsyncMock(return_value=board)
         mock_db.blackboards.update_one = AsyncMock()
 
-        result = await clear_blackboard(
+        result = await delete_board(
             board_id=str(board["_id"]),
             current_user=mock_firebase_user,
         )
@@ -261,20 +262,19 @@ async def test_clear_board_by_object_id(mock_blackboards_collection, mock_fireba
     assert result == {"ok": True}
 
     filter_arg, update_arg = mock_db.blackboards.update_one.await_args.args
-    assert filter_arg["_id"] == board["_id"]
-    assert "board_id" not in filter_arg
-    assert update_arg["$set"]["nodes"] == []
-    assert update_arg["$set"]["edges"] == []
+    assert filter_arg == {"_id": board["_id"]}
+    assert update_arg["$set"]["deleted_at"] is not None
+    assert update_arg["$set"]["deleted_by"] == mock_firebase_user["user_id"]
+    assert "nodes" not in update_arg["$set"]  # a soft delete, not a clear
 
 
 @pytest.mark.asyncio
-async def test_clear_board_denied_for_non_owner(mock_blackboards_collection, mock_firebase_user):
-    """DELETE /blackboards/{id} returns 403 for a caller who is neither owner nor collaborator.
+async def test_delete_board_denied_for_non_owner(mock_blackboards_collection, mock_firebase_user):
+    """DELETE /blackboards/{id} returns 403 for a caller who is not the owner.
 
-    Guards T-34-02: fixing F6's lookup without this check would turn a harmless
-    no-op into "any authenticated user can wipe any board by id".
+    Guards T-34-02: any authenticated user must not be able to remove any board by id.
     """
-    from app.routers.blackboards import clear_blackboard
+    from app.routers.blackboards import delete_board
 
     foreign_board = make_board(owner_user_id=OTHER_USER_ID, collaborators=[])
 
@@ -283,14 +283,13 @@ async def test_clear_board_denied_for_non_owner(mock_blackboards_collection, moc
         mock_db.blackboards.update_one = AsyncMock()
 
         with pytest.raises(HTTPException) as exc_info:
-            await clear_blackboard(
+            await delete_board(
                 board_id=str(foreign_board["_id"]),
                 current_user=mock_firebase_user,
             )
 
     assert exc_info.value.status_code == 403
-    assert exc_info.value.detail == "board_access_denied"
-    # Nothing was cleared.
+    # Nothing was written.
     mock_db.blackboards.update_one.assert_not_called()
 
 
@@ -445,7 +444,7 @@ async def test_list_boards_excludes_soft_deleted(mock_blackboards_collection, mo
 
         result = await list_boards(current_user=mock_firebase_user)
 
-    assert [doc["name"] for doc in result] == ["Live Board"]
+    assert [doc.name for doc in result] == ["Live Board"]
 
 
 @pytest.mark.asyncio
@@ -472,8 +471,8 @@ async def test_list_boards_populates_owner_name(mock_blackboards_collection, moc
         result = await list_boards(current_user=mock_firebase_user)
 
     assert len(result) == 1
-    assert result[0]["owner_name"] == "alice"   # username preferred over email
-    assert result[0]["is_owner"] is False
+    assert result[0].owner_name == "alice"   # username preferred over email
+    assert result[0].is_owner is False
 
     # One bounded $in lookup for the whole batch, not an N+1 per-board query.
     mock_db.users.find.assert_called_once_with({"_id": {"$in": [ObjectId(OTHER_USER_ID)]}})

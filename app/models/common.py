@@ -71,23 +71,6 @@ class UserAuthResponse(BaseModel):
     subscription: Optional[Dict[str, Any]] = None
 
 
-class BlackboardResponse(BaseModel):
-    """Response for GET and PUT blackboard endpoints."""
-    id: str
-    board_id: Optional[str] = None
-    user_id: str
-    owner_user_id: Optional[str] = None
-    collaborators: List[str] = []
-    is_owner: Optional[bool] = None
-    owner_name: Optional[str] = None
-    name: str
-    nodes: List[Dict[str, Any]] = []
-    edges: List[Dict[str, Any]] = []
-    viewport: Optional[Dict[str, Any]] = None
-    created_at: Optional[Any] = None
-    updated_at: Optional[Any] = None
-
-
 class FullAnnualPlanResponse(BaseModel):
     """
     Aggregated response for GET /annual-plan/full.

@@ -108,6 +108,10 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     # Computed on read (D12): the document is gone or soft-deleted, so the readout says so and
     # nothing links to it. Never stored.
     source_book_deleted: Optional[bool] = None
+    # The board→cards link (docs/prd-boards.md D7): the board and the note a
+    # card was made from. Set on create only, like the book's fields above.
+    source_board_id: Optional[str] = None
+    source_board_node_id: Optional[str] = None
 
     # Quiz Specific Fields
     card_type: str = Field(default="flashcard")  # "flashcard", "quiz", "visual"
