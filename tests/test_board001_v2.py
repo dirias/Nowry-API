@@ -497,8 +497,8 @@ async def test_the_wire_shape_over_http():
     finally:
         app.dependency_overrides.clear()
 
-    assert set(got) == {"id", "name", "owner_user_id", "collaborators", "schema", "rev", "nodes", "links",
-                        "viewport", "created_at", "updated_at"}
+    assert set(got) == {"id", "name", "owner_user_id", "owner_name", "collaborators", "collaborator_names",
+                        "schema", "rev", "nodes", "links", "viewport", "created_at", "updated_at"}
     assert got["schema"] == 2 and got["links"] == [{"id": "ab", "from": "a", "to": "b", "label": "why"}]
     assert set(got["nodes"][0]) == {"id", "kind", "x", "y", "w", "h", "z", "text", "color", "size", "title", "ref", "card_ids"}
     assert patched.status_code == 200 and set(patched.json()) == {"rev", "updated_at"} and patched.json()["rev"] == 5

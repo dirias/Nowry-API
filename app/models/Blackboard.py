@@ -77,7 +77,12 @@ class BoardResponse(BaseModel):
     id: str
     name: str
     owner_user_id: Optional[str] = None
+    #: The owner's display name (username, else email); "" when unresolved.
+    owner_name: str = ""
     collaborators: List[str] = []
+    #: {collaborator id: display name}; a collaborator that resolves to no
+    #: name is left out (BOARD-012).
+    collaborator_names: Dict[str, str] = {}
     schema_version: int = Field(2, alias="schema")
     rev: int
     nodes: List[BoardNode] = []
@@ -133,6 +138,8 @@ class BoardListItem(BaseModel):
     owner_user_id: Optional[str] = None
     owner_name: str = ""
     collaborators: List[str] = []
+    #: {collaborator id: display name}, as BoardResponse (BOARD-012).
+    collaborator_names: Dict[str, str] = {}
     is_owner: bool
     updated_at: Optional[datetime] = None
     counts: BoardCounts

@@ -201,6 +201,8 @@ async def test_get_shared_board_as_collaborator(mock_blackboards_collection, moc
 
     with patch("app.routers.blackboards.db") as mock_db:
         mock_db.blackboards.find_one = AsyncMock(return_value=shared_board)
+        # BOARD-012: the owner's and collaborators' names, one bounded lookup.
+        mock_db.users.find = MagicMock(return_value=make_cursor([]))
 
         result = await get_blackboard(
             board_id=board_id,
@@ -474,6 +476,9 @@ async def test_list_boards_populates_owner_name(mock_blackboards_collection, moc
     assert result[0].owner_name == "alice"   # username preferred over email
     assert result[0].is_owner is False
 
-    # One bounded $in lookup for the whole batch, not an N+1 per-board query.
-    mock_db.users.find.assert_called_once_with({"_id": {"$in": [ObjectId(OTHER_USER_ID)]}})
-    users_cursor.to_list.assert_awaited_once_with(length=100)
+    # One bounded $in lookup for the whole batch, not an N+1 per-board query:
+    # owners first, then collaborators (BOARD-012), bounded by the id count.
+    mock_db.users.find.assert_called_once_with(
+        {"_id": {"$in": [ObjectId(OTHER_USER_ID), ObjectId(user_id)]}}
+    )
+    users_cursor.to_list.assert_awaited_once_with(length=2)

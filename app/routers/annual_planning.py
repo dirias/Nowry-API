@@ -855,6 +855,25 @@ async def get_goals(
     ).to_list(length=100)
     return goals
 
+
+@router.get("/goals/{goal_id}", response_model=Goal)
+async def get_goal(
+    goal_id: str,
+    current_user: dict = Depends(get_firebase_user),
+) -> dict:
+    """
+    One goal with its milestones, whichever year's plan it sits in (BOARD-013):
+    a board item reads its goal live even when it left this year's plan.
+
+    Ownership traces goal → focus area → plan (403 for another user's goal,
+    404 for an id that resolves to nothing). A soft-deleted goal is 404, the
+    way the milestone routes read it. One path segment after ``/goals``, so it
+    shadows neither the list nor ``/goals/{goal_id}/activities``.
+    """
+    await verify_goal_ownership(goal_id, current_user.get("user_id"))
+    return await _fetch_goal_doc(goal_id)
+
+
 @router.post("/goals", response_model=Goal)
 async def create_goal(
     goal: Goal,

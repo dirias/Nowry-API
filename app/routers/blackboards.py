@@ -101,13 +101,17 @@ async def _content(doc: dict) -> tuple[list[dict], list[dict]]:
     return svc.board_content(doc, refs)
 
 
-def _board_response(doc: dict) -> BoardResponse:
-    """A v2 document as the wire shape."""
+def _board_response(doc: dict, names: Optional[dict[str, str]] = None) -> BoardResponse:
+    """A v2 document as the wire shape; `names` from `_resolve_names`, none for
+    a board just written by its owner (no collaborators yet)."""
+    names = names or {}
     return BoardResponse(
         id=str(doc["_id"]),
         name=doc.get("name") or "",
         owner_user_id=_owner_of(doc),
+        owner_name=names.get(doc.get("owner_user_id"), ""),
         collaborators=list(doc.get("collaborators") or []),
+        collaborator_names=_collaborator_names(doc, names),
         rev=int(doc.get("rev") or 1),
         nodes=doc.get("nodes") or [],
         links=doc.get("links") or [],
@@ -117,35 +121,40 @@ def _board_response(doc: dict) -> BoardResponse:
     )
 
 
-async def _resolve_owner_names(boards) -> dict:
-    """Map owner_user_id -> display name for a batch of board documents.
+#: The most user ids one name lookup resolves: owners first, then collaborators.
+NAME_LOOKUP_CAP = 500
+
+
+def _people_of(boards: list[dict]) -> list[str]:
+    """The owner and collaborator ids of a batch of boards, owners first,
+    each once, in a stable order, capped at NAME_LOOKUP_CAP."""
+    owners = {board["owner_user_id"] for board in boards if board.get("owner_user_id")}
+    collaborators = {
+        user_id for board in boards for user_id in board.get("collaborators") or [] if user_id
+    }
+    people = sorted(owners) + sorted(collaborators - owners)
+    return people[:NAME_LOOKUP_CAP]
+
+
+async def _resolve_names(boards: list[dict]) -> dict[str, str]:
+    """{user id: display name} for every owner and collaborator of `boards`.
 
     One bounded `$in` query instead of an N+1 per-board lookup. Ids that are not
-    valid ObjectIds (or that no longer resolve to a user) are simply absent from
-    the returned map; callers substitute "".
+    valid ObjectIds, that no longer resolve to a user, or whose user has neither
+    a username nor an email are absent from the map; callers substitute "" for
+    an owner and leave a collaborator out.
     """
-    owner_ids = {
-        board.get("owner_user_id")
-        for board in boards
-        if board.get("owner_user_id")
-    }
-    if not owner_ids:
-        return {}
-
-    object_ids = []
-    for owner_id in owner_ids:
-        try:
-            object_ids.append(ObjectId(owner_id))
-        except Exception:
-            continue
+    object_ids = [ObjectId(user_id) for user_id in _people_of(boards) if ObjectId.is_valid(user_id)]
     if not object_ids:
         return {}
+    users = await db.users.find({"_id": {"$in": object_ids}}).to_list(length=len(object_ids))
+    names = {str(user["_id"]): user.get("username") or user.get("email") or "" for user in users}
+    return {user_id: name for user_id, name in names.items() if name}
 
-    users = await db.users.find({"_id": {"$in": object_ids}}).to_list(length=100)
-    return {
-        str(user["_id"]): (user.get("username") or user.get("email") or "")
-        for user in users
-    }
+
+def _collaborator_names(doc: dict, names: dict[str, str]) -> dict[str, str]:
+    """{collaborator id: name} for the board's collaborators that resolved."""
+    return {user_id: names[user_id] for user_id in doc.get("collaborators") or [] if user_id in names}
 
 
 def _clean_node_text(raw: str, max_chars: int = 500) -> str:
@@ -236,21 +245,22 @@ async def list_boards(current_user: dict = Depends(get_firebase_user)) -> list[B
         all_boards.setdefault(doc["_id"], doc)
     boards = list(all_boards.values())
 
-    owner_names = await _resolve_owner_names(boards)
+    names = await _resolve_names(boards)
     # A v1 board is summarised through the migration builders and NOT written:
     # the write belongs to its first GET.
     refs = await _priority_refs(boards)
-    return [_list_item(doc, user_id, owner_names, refs) for doc in boards]
+    return [_list_item(doc, user_id, names, refs) for doc in boards]
 
 
-def _list_item(doc: dict, user_id: str, owner_names: dict, refs: dict) -> BoardListItem:
+def _list_item(doc: dict, user_id: str, names: dict[str, str], refs: dict) -> BoardListItem:
     nodes, links = svc.board_content(doc, refs)
     return BoardListItem(
         id=str(doc["_id"]),
         name=doc.get("name") or "",
         owner_user_id=_owner_of(doc),
-        owner_name=owner_names.get(doc.get("owner_user_id"), ""),
+        owner_name=names.get(doc.get("owner_user_id"), ""),
         collaborators=list(doc.get("collaborators") or []),
+        collaborator_names=_collaborator_names(doc, names),
         is_owner=_owner_of(doc) == user_id,
         updated_at=doc.get("updated_at"),
         counts=svc.counts(nodes, links),
@@ -266,7 +276,7 @@ async def get_blackboard(
     doc = await _editable_board(board_id, current_user.get("user_id"))
     if not svc.is_v2(doc):
         doc = await _migrate_in_place(doc)
-    return _board_response(doc)
+    return _board_response(doc, await _resolve_names([doc]))
 
 
 async def _migrate_in_place(doc: dict) -> dict:
