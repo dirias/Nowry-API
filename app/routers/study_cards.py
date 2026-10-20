@@ -333,14 +333,17 @@ async def _pool_tags(collection: Collection, match: dict, now_dt: datetime) -> l
     whose cards the day's budget did not pick was simply absent. This counts
     over the whole pool the session draws from — `match` is the deck's cards,
     or every active deck's — so the list reads as "what is waiting, by tag".
-    Only tags with something waiting are listed; a resting card is neither new
-    nor due (`_group_stage`), so a resting tag drops out on its own.
+
+    Every tag of the pool is listed, a tag with nothing waiting at `new: 0,
+    due: 0` (MOB-118, ADR-048): the phone names it, dimmed, so its list is the
+    library's list and never silently empty. A resting card is neither new nor
+    due (`_group_stage`), so a resting tag reads as idle. Readers that want only
+    the waiting tags filter on the counts, as `poolTagRows` does.
     """
     rows = await collection.aggregate([
         {"$match": {**match, "tags": {"$exists": True, "$ne": []}}},
         {"$unwind": "$tags"},
         _group_stage(now_dt, "$tags"),
-        {"$match": {"$expr": {"$gt": [{"$add": ["$due", "$new"]}, 0]}}},
         {"$sort": {"_id": 1}},
         {"$limit": POOL_TAGS_LIMIT},
     ]).to_list(length=POOL_TAGS_LIMIT)

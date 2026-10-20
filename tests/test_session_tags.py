@@ -47,15 +47,15 @@ async def test_deck_session_carries_the_pools_tags(monkeypatch):
         {"tag": "kanji-n3", "new": 10, "due": 0},
         {"tag": "verbs", "new": 0, "due": 3},
     ]
-    # The counting pipeline: the deck's cards, one row per tag, only rows with
-    # something waiting, by tag.
+    # The counting pipeline: the deck's cards, one row per tag, by tag. Every
+    # tag of the pool, idle ones included (MOB-118, ADR-048).
     pipeline = cards.pipelines[-1]
     assert pipeline[0]["$match"]["$or"] == [{"deck_id": DECK_T}, {"deck_id": str(DECK_T)}]
     assert pipeline[0]["$match"]["user_id"] == OWNER
     assert {"$unwind": "$tags"} in pipeline
     assert pipeline[2]["$group"]["_id"] == "$tags"
-    assert pipeline[3] == {"$match": {"$expr": {"$gt": [{"$add": ["$due", "$new"]}, 0]}}}
-    assert pipeline[4] == {"$sort": {"_id": 1}}
+    assert pipeline[3] == {"$sort": {"_id": 1}}
+    assert not any("$expr" in stage.get("$match", {}) for stage in pipeline)
 
 
 @pytest.mark.asyncio
@@ -105,3 +105,17 @@ async def test_daily_review_carries_the_pools_tags_over_the_active_decks(monkeyp
     match = cards.pipelines[-1][0]["$match"]
     assert match["deck_id"] == {"$in": [DECK_T, str(DECK_T)]}
     assert match["tags"] == {"$exists": True, "$ne": []}
+
+
+@pytest.mark.asyncio
+async def test_a_tag_with_nothing_waiting_is_listed_at_zero(monkeypatch):
+    """MOB-118, ADR-048: an idle tag is named, so the phone's list matches the library's."""
+    _, request = _deck_session(monkeypatch, f"/study-cards?deck_id={DECK_T}&due_only=true", pool=[
+        {"_id": "grammar", "due": 0, "new": 0},
+        {"_id": "verbs", "due": 3, "new": 0},
+    ])
+    body = (await request).json()
+    assert body["tags"] == [
+        {"tag": "grammar", "new": 0, "due": 0},
+        {"tag": "verbs", "new": 0, "due": 3},
+    ]
