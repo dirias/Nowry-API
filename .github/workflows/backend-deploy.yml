@@ -1,8 +1,8 @@
 # Backend Deploy — Nowry FastAPI
 #
 # Triggers on push to main and dev, AND on pull requests targeting either, so
-# the security gate below (bandit + pip-audit + the phase-32 regression-guard
-# test suite) surfaces findings BEFORE merge, not just after. Runs validation
+# the gate below (bandit + pip-audit + the full test suite) surfaces findings
+# BEFORE merge, not just after. Runs validation
 # (pip install, lint, type check) before Railway's GitHub integration deploys.
 #
 # `dev` MUST stay in the trigger list. Railway's development service has
@@ -89,22 +89,15 @@ jobs:
           pip-audit -f json -o pip-audit-report.json || true
           python scripts/check_pip_audit_severity.py pip-audit-report.json
 
-      - name: Security regression guards (Phase 32 — SEC-01/SEC-02/SEC-03)
-        run: |
-          pip install pytest==8.4.2 pytest-asyncio==1.2.0
-          pytest tests/test_dependencies.py tests/test_bounded_queries.py tests/test_check_pip_audit_severity.py tests/test_study_cards_review_mode.py -v
-        # Scoped to exactly the regression-guard tests added by Phase 32
-        # (IDOR/ownership, bounded-query, mode-guard, pip-audit severity
-        # classifier) — NOT the full `tests/` suite. The full suite has
-        # pre-existing, unrelated failures (AI-feature tests needing real
-        # API keys, a pre-existing test_deck_fixes.py collection error) that
-        # predate this phase and would make a blocking `pytest tests/` step
-        # red from day one, defeating the point of a gate (see 32-REVIEW.md
-        # CR-03). These four files pass reliably as a scoped set — verified
-        # locally under a fresh Python 3.11 venv mirroring this job's setup.
-        # No continue-on-error: unlike lint/mypy, these are the security
-        # guards this phase exists to add — a failure here is exactly what
-        # this step is supposed to catch.
+      - name: Test suite
+        run: pytest tests/ -q --durations=10
+        # The whole suite, blocking (QA-001, ADR-049). It needs no secrets, no
+        # network and no Mongo: every collection is a mock and a test that
+        # reaches a real service is a bug in the test. pytest and
+        # pytest-asyncio come from requirements.txt. The Phase 32 regression
+        # guards (test_dependencies, test_bounded_queries,
+        # test_check_pip_audit_severity, test_study_cards_review_mode) run as
+        # part of it.
 
       - name: Lint (flake8 — critical errors only)
         run: |

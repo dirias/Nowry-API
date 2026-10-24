@@ -385,7 +385,8 @@ async def test_tts_plus_ignores_language(mock_book_doc_with_counter, mock_user_d
 
     mock_texttospeech = MagicMock()
 
-    with patch("app.routers.tts.books_collection") as mock_col:
+    with patch("app.routers.tts.books_collection") as mock_col, \
+         patch("app.routers.tts.enforce_user_rate_limit", new=AsyncMock(return_value=1)):
         mock_col.find_one = AsyncMock(return_value=mock_book_doc_with_counter)
         with patch("app.routers.tts.get_tts_client", return_value=mock_tts_client):
             with patch("app.routers.tts.texttospeech", mock_texttospeech):
