@@ -47,6 +47,7 @@ feedparser
 # --- Testing ---
 pytest>=8.2.0
 pytest-asyncio>=0.23.7
+mongomock-motor>=0.0.36  # QA-007 cross-user sweep: real filter semantics in tests
 
 # --- Stripe ---
 stripe>=11.0.0

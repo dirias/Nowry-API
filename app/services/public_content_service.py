@@ -780,6 +780,16 @@ class PublicContentService:
         user_id: str
     ) -> dict:
         """Like/favorite public content"""
+        # Only published content can be liked (QA-007): a like on a private
+        # book wrote a like row and then tried to $inc its owner's document.
+        collection = self.db[f"{content_type}s"]
+        published = ObjectId.is_valid(content_id) and await collection.find_one(
+            {"_id": ObjectId(content_id), "is_public": True, "deleted_at": None},
+            {"_id": 1},
+        )
+        if not published:
+            raise HTTPException(status_code=404, detail="Content not found")
+
         # Check if already liked
         existing_like = await self.db["content_likes"].find_one({
             "content_type": content_type,
@@ -800,7 +810,6 @@ class PublicContentService:
         await self.db["content_likes"].insert_one(like.model_dump(by_alias=True))
         
         # Increment like count
-        collection = self.db[f"{content_type}s"]
         await collection.update_one(
             {"_id": ObjectId(content_id)},
             {"$inc": {"public_metadata.likes": 1}}

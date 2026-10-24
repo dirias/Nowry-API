@@ -1069,6 +1069,15 @@ async def update_activity(
 @router.delete("/activities/{id}", response_model=MessageResponse)
 async def delete_activity(id: str, current_user: dict = Depends(get_firebase_user)):
     user_id = current_user.get("user_id")
+    obj_id = parse_object_id(id)
+
+    # Owner first, as update_activity does: this used to soft-delete any user's
+    # activity by id (QA-007).
+    existing_act = await activities_collection.find_one({"_id": obj_id})
+    if not existing_act:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    await verify_goal_ownership(existing_act["goal_id"], user_id)
+
     now = datetime.now(timezone.utc)
     soft_delete_update = {
         "$set": {
@@ -1077,7 +1086,7 @@ async def delete_activity(id: str, current_user: dict = Depends(get_firebase_use
             "updated_at": now,
         }
     }
-    result = await activities_collection.update_one({"_id": ObjectId(id)}, soft_delete_update)
+    result = await activities_collection.update_one({"_id": obj_id}, soft_delete_update)
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Activity not found")
     return {"message": "Activity deleted"}

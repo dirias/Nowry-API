@@ -74,6 +74,8 @@ langgraph-sdk==0.4.4
 langsmith==0.10.11
 limits==5.8.0
 mammoth==1.12.0
+mongomock==4.3.0
+mongomock-motor==0.0.36
 motor==3.7.1
 msgpack==1.2.1
 multidict==6.9.1
@@ -112,9 +114,11 @@ python-dotenv==1.2.2
 python-json-logger==4.1.0
 python-multipart==0.0.32
 pytokens==0.4.1
+pytz==2026.5
 pyyaml==6.0.3
 requests==2.34.2
 requests-toolbelt==1.0.0
+sentinels==1.1.1
 sentry-sdk[fastapi]==2.66.1
 six==1.17.0
 slowapi==0.1.10
