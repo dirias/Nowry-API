@@ -1,5 +1,5 @@
 aiohappyeyeballs==2.7.1
-aiohttp==3.14.3
+aiohttp==3.14.4
 aiosignal==1.4.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
@@ -10,7 +10,7 @@ backoff==2.2.1
 bcrypt==5.0.0
 black==26.5.1
 cachecontrol==0.14.4
-certifi==2026.7.22
+certifi==2026.10.23
 cffi==2.1.0
 charset-normalizer==3.4.9
 click==8.4.2
@@ -76,7 +76,7 @@ limits==5.8.0
 mammoth==1.12.0
 motor==3.7.1
 msgpack==1.2.1
-multidict==6.7.1
+multidict==6.9.1
 mypy-extensions==1.1.0
 numpy==2.4.6
 opentelemetry-api==1.44.0
@@ -135,5 +135,5 @@ watchfiles==1.2.0
 websockets==15.0.1
 wrapt==2.3.0
 xxhash==3.8.1
-yarl==1.24.5
+yarl==1.25.1
 zstandard==0.25.0
