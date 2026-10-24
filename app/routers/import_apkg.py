@@ -3,6 +3,7 @@ from typing import List, Optional
 from datetime import datetime, timezone
 from pydantic import BaseModel
 from bson import ObjectId
+import asyncio
 import zipfile
 import sqlite3
 import tempfile
@@ -23,6 +24,11 @@ logger = get_logger(__name__)
 
 MAX_FILE_SIZE_MB = 50
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+#: The uncompressed collection database: the zip-bomb bound.
+MAX_DATABASE_BYTES = 150 * 1024 * 1024
+#: Read the upload in pieces, so an oversized one is refused at its first
+#: excess megabyte rather than after it sits whole in memory (QA-008).
+READ_CHUNK_BYTES = 1024 * 1024
 PREVIEW_CARD_LIMIT = 5
 
 
@@ -72,7 +78,12 @@ def _parse_apkg(file_bytes: bytes, filename: str) -> tuple[str, List[ParsedCard]
         if not zipfile.is_zipfile(apkg_path):
             raise ValueError("File is not a valid .apkg (not a zip archive).")
 
-        with zipfile.ZipFile(apkg_path, "r") as z:
+        try:
+            archive = zipfile.ZipFile(apkg_path, "r")
+        except zipfile.BadZipFile:
+            raise ValueError("The .apkg archive is damaged and cannot be opened.")
+
+        with archive as z:
             names = z.namelist()
 
             # Pick database — prefer anki21
@@ -86,16 +97,23 @@ def _parse_apkg(file_bytes: bytes, filename: str) -> tuple[str, List[ParsedCard]
                 raise ValueError("No Anki collection database found inside the .apkg file.")
 
             # --- Zip Bomb Mitigation ---
+            # file_size is the header's claim; zipfile stops decompressing at
+            # it, so bounding the claim bounds what reaches the disk.
             info = z.getinfo(db_name)
-            # Limit the uncompressed SQLite DB to 150MB
-            if info.file_size > 150 * 1024 * 1024:
+            if info.file_size > MAX_DATABASE_BYTES:
                 raise ValueError("Database file is dangerously large. Import aborted.")
             # ---------------------------
 
-            z.extract(db_name, tmp)
+            try:
+                z.extract(db_name, tmp)
+            except (zipfile.BadZipFile, EOFError, OSError):
+                raise ValueError("The .apkg archive is damaged and cannot be opened.")
 
         db_path = os.path.join(tmp, db_name)
-        conn = sqlite3.connect(db_path)
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error:
+            raise ValueError("Could not open the Anki database. The file may be corrupt.")
         cur = conn.cursor()
 
         # -- Deck name from col table -----------------------------------------
@@ -122,7 +140,7 @@ def _parse_apkg(file_bytes: bytes, filename: str) -> tuple[str, List[ParsedCard]
         try:
             cur.execute("SELECT flds, tags FROM notes")
             rows = cur.fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError:
             raise ValueError("Could not read cards from the Anki database. The file may be corrupt.")
 
         conn.close()
@@ -210,6 +228,23 @@ async def _get_remaining_quota(user_id: str) -> int:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": QUOTA_UNAVAILABLE_CODE})
 
 
+async def _read_bounded(file: UploadFile) -> bytes:
+    """The upload's bytes, or 413 as soon as it passes the limit."""
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File exceeds the {MAX_FILE_SIZE_MB} MB limit.",
+            )
+        chunks.append(chunk)
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post(
@@ -236,17 +271,11 @@ async def parse_apkg(
             detail="Only .apkg files are supported.",
         )
 
-    # Read and validate size
-    file_bytes = await file.read()
-    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds the {MAX_FILE_SIZE_MB} MB limit.",
-        )
+    file_bytes = await _read_bounded(file)
 
-    # Parse
+    # Parse: unzip and SQLite are blocking, so off the event loop (QA-011)
     try:
-        suggested_name, all_cards = _parse_apkg(file_bytes, file.filename or "deck.apkg")
+        suggested_name, all_cards = await asyncio.to_thread(_parse_apkg, file_bytes, file.filename or "deck.apkg")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception as e:

@@ -132,7 +132,11 @@ async def get_firebase_user(request: Request) -> dict:
         # Firebase deleted the user and re-issued a new UID on re-registration with
         # the same Google account — same email, different UID).
         user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"]})
-        if not user and token_data.get("email"):
+        # Only a verified email may claim an existing account (QA-008): the case
+        # this serves is a Google account, whose email Firebase has verified.
+        # An unverified email is anyone's word, and would have resolved a new
+        # Firebase account to whichever Nowry account holds that address.
+        if not user and token_data.get("email") and token_data.get("email_verified"):
             user = await users_collection.find_one({"email": token_data["email"]})
 
         if user and not user.get("deleted_at"):
@@ -244,6 +248,16 @@ async def get_firebase_user(request: Request) -> dict:
                 # Recover instead of 500ing: re-fetch the real existing doc by
                 # email (most reliable unique key here) and sync firebase_uid
                 # onto it so this and future logins resolve correctly.
+                #
+                # By email only when Firebase has verified it (QA-008): this
+                # branch re-points the account at the caller's uid, so an
+                # unverified address would hand someone else's account over.
+                if email and not token_data.get("email_verified"):
+                    if await users_collection.find_one({"email": email}, {"_id": 1}):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": "email_unverified"},
+                        )
                 existing = await users_collection.find_one({"email": email}) if email else None
                 if not existing:
                     existing = await users_collection.find_one(

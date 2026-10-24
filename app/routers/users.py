@@ -1494,29 +1494,27 @@ async def update_pet_preferences(
 # Data export helper
 # ---------------------------------------------------------------------------
 
-def _serialize_doc(doc: dict) -> dict:
-    """Convert a MongoDB document to a JSON-serializable dict.
+def _serialize_value(value: object) -> object:
+    """One value of a MongoDB document, JSON-ready, at any depth.
 
-    Handles ObjectId → str, datetime → ISO string, and nested structures.
+    By type, not by class name: ``type(v).__name__ == "ObjectId"`` missed every
+    subclass, and lists were walked one level only, so an id or a date inside a
+    list inside a list failed the whole export (QA-008).
     """
-    result = {}
-    for key, value in doc.items():
-        if type(value).__name__ == "ObjectId":
-            result[key] = str(value)
-        elif hasattr(value, "isoformat"):  # datetime / date
-            result[key] = value.isoformat()
-        elif isinstance(value, dict):
-            result[key] = _serialize_doc(value)
-        elif isinstance(value, list):
-            result[key] = [
-                _serialize_doc(v) if isinstance(v, dict)
-                else str(v) if type(v).__name__ == "ObjectId"
-                else v
-                for v in value
-            ]
-        else:
-            result[key] = value
-    return result
+    if isinstance(value, ObjectId):
+        return str(value)
+    if hasattr(value, "isoformat"):  # datetime / date
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _serialize_value(inner) for key, inner in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialize_value(inner) for inner in value]
+    return value
+
+
+def _serialize_doc(doc: dict) -> dict:
+    """Convert a MongoDB document to a JSON-serializable dict."""
+    return _serialize_value(doc)
 
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,16 @@ async def register_user(
             status_code=400,
             detail="Firebase UID mismatch"
         )
+
+    # The body's email is the caller's word; the token's is Firebase's. The
+    # lookup below matches on email, so a mismatch let a signed-in caller read
+    # another account's ids and rename it (QA-008).
+    token_email: str = (firebase_user.get("email") or "").strip().lower()
+    if token_email != request.email.strip().lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Email mismatch"
+        )
     
     # Check if user already exists
     existing_user = await users_collection.find_one({

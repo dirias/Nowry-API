@@ -70,7 +70,7 @@ class World:
 
     def new_user(self, label: str, **fields) -> ObjectId:
         uid = ObjectId()
-        doc = {"_id": uid, "firebase_uid": f"fb-{label}-{uid}", "email": f"{label}@example.test",
+        doc = {"_id": uid, "firebase_uid": f"fb-{label}-{uid}", "email": f"{label}@example.com",
                "username": f"{label}{str(uid)[-6:]}", "subscription": {"tier": "pro", "status": "active"}}
         doc.update(fields)
         self.run(self.raw["users"].insert_one(doc))
