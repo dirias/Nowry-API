@@ -106,9 +106,12 @@ async def get_firebase_user(request: Request) -> dict:
         # Verify token with Firebase Admin SDK (network call - slow)
         decoded_token = verify_firebase_token(token)
     except Exception as e:
+        # The reason (expired, revoked, wrong project) is logged, not returned:
+        # it tells a caller probing tokens which check failed (QA-006).
+        logger.info("get_firebase_user: token rejected: %s", e)
         raise HTTPException(
             status_code=401,
-            detail=f"Invalid Firebase token: {str(e)}"
+            detail="Invalid Firebase token."
         )
 
     try:
@@ -289,13 +292,14 @@ async def get_firebase_user(request: Request) -> dict:
         raise
     except Exception as e:
         # Log the full traceback server-side — the client only ever sees the
-        # generic detail string below, but without this, an unhandled error
+        # generic detail string below (no exception text: it can carry database
+        # internals, QA-006), but without this, an unhandled error
         # here is invisible in the access logs (no traceback is ever printed
         # for a deliberately-raised HTTPException).
         logger.exception("get_firebase_user: failed to resolve user profile")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to resolve user profile: {str(e)}"
+            detail="Failed to resolve user profile."
         )
 
 
