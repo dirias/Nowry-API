@@ -1,4 +1,17 @@
+import os
 import sys
+
+# No test talks to a real service (ADR-049 point 3). app/main.py loads app/.env,
+# which on a developer's machine holds live keys: errors logged on purpose went
+# to Sentry, and an unmocked call could reach Groq, Gemini, Stripe, Langfuse or
+# the configured database. load_dotenv never overrides a variable already set,
+# so these values win; the database URI fails in 200 ms instead of waiting 30 s.
+# Tests that need a key set one themselves with monkeypatch.
+for _name in ("SENTRY_DSN", "GROQ_API_KEY", "GEMINI_API_KEY", "STRIPE_SECRET_KEY", "LANGFUSE_SECRET_KEY",
+              "LANGFUSE_PUBLIC_KEY", "LANGFUSE_HOST", "RESEND_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+              "FIREBASE_SERVICE_ACCOUNT_JSON", "FIREBASE_SERVICE_ACCOUNT_PATH"):
+    os.environ[_name] = ""
+os.environ["MONGO_URI"] = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200"
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch

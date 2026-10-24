@@ -13,18 +13,17 @@ ids, and three things must hold for each call:
 3. it is refused, unless it is on the short list of routes that answer 2xx
    with the caller's own (empty) data.
 
-The database is mongomock behind every Motor object the app imported, so the
-handlers run their real queries against real filter semantics.
+The database is mongomock behind every Motor object the app imported
+(``tests/_fake_world.py``), so the handlers run their real queries.
 """
-import asyncio
-import json
 import re
-import sys
 
 import pytest
 from bson import ObjectId
 
-mongomock_motor = pytest.importorskip("mongomock_motor")
+pytest.importorskip("mongomock_motor")
+
+from tests._fake_world import fake_world  # noqa: E402
 
 AREAS = r"^/(book/|study-cards/|decks/|tasks/|task-lists/|annual-plan|public/)"
 MARK = "SECRET-"
@@ -37,135 +36,38 @@ ANSWERS_THE_CALLER = {
     "GET /public/decks/{deck_id}": "a private deck reads as null, as a missing one does",
 }
 
-WRITES = ("update_one", "update_many", "replace_one", "delete_one", "delete_many",
-          "find_one_and_update", "find_one_and_replace", "find_one_and_delete")
-
-
-class _Recording:
-    """A collection that notes every document a write's filter matches."""
-
-    def __init__(self, inner, touched):
-        self._inner, self._touched = inner, touched
-
-    def __getattr__(self, name):
-        attr = getattr(self._inner, name)
-        if name not in WRITES:
-            return attr
-
-        async def write(filter, *args, **kwargs):
-            for doc in await self._inner.find(filter, {"_id": 1}).to_list(length=None):
-                self._touched.append((self._inner.name, doc["_id"]))
-            return await attr(filter, *args, **kwargs)
-
-        return write
-
-    def __getitem__(self, name):
-        return self._inner[name]
-
-
-class _RecordingDb:
-    def __init__(self, inner, touched):
-        self._inner, self._touched = inner, touched
-
-    def __getitem__(self, name):
-        return _Recording(self._inner[name], self._touched)
-
-    def get_collection(self, name, *args, **kwargs):
-        return self[name]
-
-    def __getattr__(self, name):
-        attr = getattr(self._inner, name)
-        return _Recording(attr, self._touched) if type(attr).__name__.endswith("Collection") else attr
-
 
 @pytest.fixture(scope="module")
 def world():
-    from fastapi.testclient import TestClient
-    from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection, AsyncIOMotorDatabase
+    with fake_world() as w:
+        victim, attacker = w.new_user("victim"), w.new_user("attacker")
+        w.act_as(victim)
 
-    from app.main import app
-    import app.auth.firebase_auth as firebase_auth
+        def create(path, body):
+            response = w.http.post(path, json=body)
+            assert response.status_code in (200, 201), f"seeding {path}: {response.status_code} {response.text[:200]}"
+            payload = response.json()
+            return payload.get("_id") or payload.get("id")
 
-    client = mongomock_motor.AsyncMongoMockClient()
-    raw = client["nowry-cross-user"]
-    touched: list = []
-    db = _RecordingDb(raw, touched)
+        ids = {"book": create("/book/create", {"title": f"{MARK}BOOK", "content": f"{MARK}PAGES"})}
+        ids["deck"] = create("/decks", {"name": f"{MARK}DECK"})
+        ids["card"] = create("/study-cards", {"title": f"{MARK}CARD", "content": f"{MARK}ANSWER", "deck_id": ids["deck"]})
+        ids["task"] = create("/tasks/", {"title": f"{MARK}TASK"})
+        ids["list"] = create("/task-lists/", {"name": f"{MARK}LIST"})
+        ids["plan"] = create("/annual-plan", {"year": 2026, "title": f"{MARK}PLAN"})
+        ids["area"] = create("/annual-plan/focus-areas", {"annual_plan_id": ids["plan"], "name": f"{MARK}AREA", "order": 0})
+        ids["goal"] = create("/annual-plan/goals", {"focus_area_id": ids["area"], "title": f"{MARK}GOAL"})
+        ids["activity"] = create(f"/annual-plan/goals/{ids['goal']}/activities", {"title": f"{MARK}ACTIVITY"})
+        ids["milestone"] = create(f"/annual-plan/goals/{ids['goal']}/milestones", {"title": f"{MARK}MILESTONE"})
 
-    swapped = []
-    for name, module in list(sys.modules.items()):
-        if module is None or not (name == "app" or name.startswith("app.")):
-            continue
-        for attr, value in list(vars(module).items()):
-            if isinstance(value, AsyncIOMotorCollection):
-                replacement = db[value.name]
-            elif isinstance(value, AsyncIOMotorDatabase):
-                replacement = db
-            elif isinstance(value, AsyncIOMotorClient):
-                replacement = client
-            else:
-                continue
-            swapped.append((module, attr, value))
-            setattr(module, attr, replacement)
-    assert len(swapped) > 50, "the app's Motor objects were not found; the sweep would test nothing"
+        victim_docs = set()
+        for name in w.run(w.raw.list_collection_names()):
+            for doc in w.run(w.raw[name].find({}, {"_id": 1}).to_list(length=None)):
+                if doc["_id"] != attacker:
+                    victim_docs.add((name, doc["_id"]))
 
-    victim, attacker = ObjectId(), ObjectId()
-    users = {
-        uid: {"user_id": str(uid), "firebase_uid": f"fb-{uid}", "email": f"{label}@example.test", "email_verified": True}
-        for uid, label in ((victim, "victim"), (attacker, "attacker"))
-    }
-    loop = asyncio.new_event_loop()
-    for uid, user in users.items():
-        loop.run_until_complete(raw["users"].insert_one({
-            "_id": uid, "firebase_uid": user["firebase_uid"], "email": user["email"],
-            "username": f"user{str(uid)[-6:]}", "subscription": {"tier": "pro", "status": "active"},
-        }))
-
-    current = {"user": users[victim]}
-
-    async def as_current():
-        return current["user"]
-
-    previous_overrides = dict(app.dependency_overrides)
-    app.dependency_overrides[firebase_auth.get_firebase_user] = as_current
-    app.dependency_overrides[firebase_auth.get_current_user] = as_current
-    limiter = app.state.limiter
-    was_enabled = getattr(limiter, "enabled", True)
-    limiter.enabled = False
-
-    http = TestClient(app, raise_server_exceptions=False)
-
-    def create(path, body):
-        response = http.post(path, json=body)
-        assert response.status_code in (200, 201), f"seeding {path}: {response.status_code} {response.text[:200]}"
-        payload = response.json()
-        return payload.get("_id") or payload.get("id")
-
-    ids = {"book": create("/book/create", {"title": f"{MARK}BOOK", "content": f"{MARK}PAGES"})}
-    ids["deck"] = create("/decks", {"name": f"{MARK}DECK"})
-    ids["card"] = create("/study-cards", {"title": f"{MARK}CARD", "content": f"{MARK}ANSWER", "deck_id": ids["deck"]})
-    ids["task"] = create("/tasks/", {"title": f"{MARK}TASK"})
-    ids["list"] = create("/task-lists/", {"name": f"{MARK}LIST"})
-    ids["plan"] = create("/annual-plan", {"year": 2026, "title": f"{MARK}PLAN"})
-    ids["area"] = create("/annual-plan/focus-areas", {"annual_plan_id": ids["plan"], "name": f"{MARK}AREA", "order": 0})
-    ids["goal"] = create("/annual-plan/goals", {"focus_area_id": ids["area"], "title": f"{MARK}GOAL"})
-    ids["activity"] = create(f"/annual-plan/goals/{ids['goal']}/activities", {"title": f"{MARK}ACTIVITY"})
-    ids["milestone"] = create(f"/annual-plan/goals/{ids['goal']}/milestones", {"title": f"{MARK}MILESTONE"})
-
-    victim_docs = set()
-    for name in loop.run_until_complete(raw.list_collection_names()):
-        for doc in loop.run_until_complete(raw[name].find({}, {"_id": 1}).to_list(length=None)):
-            if doc["_id"] != attacker:
-                victim_docs.add((name, doc["_id"]))
-
-    yield {"http": http, "ids": ids, "current": current, "users": users, "victim": victim,
-           "attacker": attacker, "touched": touched, "victim_docs": victim_docs, "app": app}
-
-    app.dependency_overrides.clear()
-    app.dependency_overrides.update(previous_overrides)
-    limiter.enabled = was_enabled
-    for module, attr, value in swapped:
-        setattr(module, attr, value)
-    loop.close()
+        yield {"w": w, "http": w.http, "ids": ids, "victim": victim, "attacker": attacker,
+               "touched": w.touched, "victim_docs": victim_docs, "app": w.app}
 
 
 def _path_for(path: str, ids: dict) -> str:
@@ -193,7 +95,7 @@ def _targets(app) -> list:
 
 def test_the_victim_reaches_their_own_content(world):
     """The control: without it, a sweep where every id was wrong would pass."""
-    world["current"]["user"] = world["users"][world["victim"]]
+    world["w"].act_as(world["victim"])
     ids = world["ids"]
     for path in (f"/book/{ids['book']}", f"/decks/{ids['deck']}", f"/study-cards/{ids['card']}",
                  f"/tasks/{ids['task']}", f"/annual-plan/goals/{ids['goal']}"):
@@ -206,7 +108,7 @@ def test_another_user_reaches_none_of_it(world):
     targets = _targets(app)
     assert len(targets) >= 60, "the sweep lost most of its routes"
 
-    world["current"]["user"] = world["users"][world["attacker"]]
+    world["w"].act_as(world["attacker"])
     body = {"title": "overwritten", "name": "overwritten", "content": "overwritten",
             "is_completed": True, "is_public": True, "completed": True}
     writes, leaks, answered = [], [], set()
