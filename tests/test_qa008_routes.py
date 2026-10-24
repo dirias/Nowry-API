@@ -108,6 +108,35 @@ def test_an_unverified_email_never_resolves_to_someone_elses_account(world):
     assert resolved.get("user_id") != str(victim)
 
 
+def test_a_new_email_account_racing_its_own_sign_up_is_not_refused(world):
+    """Sign-up's /users/me and /auth/register both provision the same new uid; the loser must resolve, not 409."""
+    from starlette.requests import Request
+
+    import app.auth.firebase_auth as firebase_auth
+
+    world.run(world.raw["users"].create_index("email", unique=True))
+    world.run(world.raw["users"].create_index("firebase_uid", unique=True))
+    winner = world.new_user("fresh", firebase_uid="fb-fresh", email="fresh@example.com")
+    request = Request({"type": "http", "headers": [(b"authorization", b"Bearer fresh-token")], "query_string": b""})
+    decoded = {"uid": "fb-fresh", "email": "fresh@example.com", "email_verified": False}
+    calls = {"n": 0}
+    real_find_one = world.raw["users"].find_one
+
+    async def first_lookup_misses(filter, *args, **kwargs):
+        # The loser's uid lookup ran before the winner's insert landed.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_one(filter, *args, **kwargs)
+
+    with patch.object(firebase_auth, "verify_firebase_token", return_value=decoded), \
+         patch.object(firebase_auth, "_get_cached_token", return_value=None), \
+         patch.object(firebase_auth, "_cache_token"), \
+         patch("app.config.database.users_collection.find_one", side_effect=first_lookup_misses):
+        resolved = world.run(firebase_auth.get_firebase_user(request))
+    assert resolved["user_id"] == str(winner)
+
+
 def test_an_unverified_email_cannot_take_an_account_over_on_a_duplicate_key(world):
     """Production has a unique email index: the insert collides, and recovery used to adopt the account."""
     from starlette.requests import Request

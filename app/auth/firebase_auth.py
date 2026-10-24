@@ -252,8 +252,14 @@ async def get_firebase_user(request: Request) -> dict:
                 # By email only when Firebase has verified it (QA-008): this
                 # branch re-points the account at the caller's uid, so an
                 # unverified address would hand someone else's account over.
+                #
+                # The same uid is the race above (sign-up's /users/me and
+                # /auth/register both provision), not a claim: a brand-new
+                # email account is always unverified, so refusing it broke
+                # every email sign-up (found by the QA-010 end-to-end run).
                 if email and not token_data.get("email_verified"):
-                    if await users_collection.find_one({"email": email}, {"_id": 1}):
+                    holder = await users_collection.find_one({"email": email}, {"firebase_uid": 1})
+                    if holder and holder.get("firebase_uid") != token_data["firebase_uid"]:
                         raise HTTPException(
                             status_code=409,
                             detail={"code": "email_unverified"},
