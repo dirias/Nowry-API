@@ -9,6 +9,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -130,7 +131,7 @@ async def _generate_question_text(
         return "What can you tell me about this card?"
     fields_json = json.dumps(fields, ensure_ascii=False, default=str)
     try:
-        completion = client.chat.completions.create(
+        completion = await asyncio.to_thread(client.chat.completions.create,
             model=_GROQ_MODEL,
             max_tokens=256,
             messages=[
@@ -256,7 +257,7 @@ Respond ONLY with raw JSON (no markdown):
     parsed: dict | None = None
     for attempt in range(2):
         try:
-            completion = client.chat.completions.create(
+            completion = await asyncio.to_thread(client.chat.completions.create,
                 model=_GROQ_MODEL,
                 max_tokens=1024,
                 temperature=0.6,
@@ -647,7 +648,7 @@ Respond ONLY with raw JSON (no markdown):
     parsed: dict | None = None
     for attempt in range(2):
         try:
-            completion = client.chat.completions.create(
+            completion = await asyncio.to_thread(client.chat.completions.create,
                 model=_GROQ_MODEL,
                 max_tokens=1024,
                 temperature=0.6,

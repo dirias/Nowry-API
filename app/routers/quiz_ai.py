@@ -20,6 +20,7 @@ Design decisions:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -194,7 +195,7 @@ async def _generate_questions(
                             model_parameters={"temperature": 0.7, "max_tokens": 4096},
                         ) as generation:
                             if tier == "free":
-                                completion = llm_client.chat.completions.create(
+                                completion = await asyncio.to_thread(llm_client.chat.completions.create,
                                     model=_GROQ_MODEL, max_tokens=4096, temperature=0.7,
                                     messages=[
                                         {"role": "system", "content": system_prompt},
@@ -216,7 +217,7 @@ async def _generate_questions(
                                 )
                             else:
                                 combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                                completion = llm_client.request(combined_prompt)
+                                completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                                 choice = completion.choices[0]
                                 finish_reason = "stop"
                                 raw_text = (choice.message.content or "").strip()
@@ -230,7 +231,7 @@ async def _generate_questions(
                         f"[ai_quiz] Langfuse tracing failed on attempt {attempt}, continuing without trace: {langfuse_exc}"
                     )
                     if tier == "free":
-                        completion = llm_client.chat.completions.create(
+                        completion = await asyncio.to_thread(llm_client.chat.completions.create,
                             model=_GROQ_MODEL, max_tokens=4096, temperature=0.7,
                             messages=[
                                 {"role": "system", "content": system_prompt},
@@ -242,13 +243,13 @@ async def _generate_questions(
                         raw_text = (choice.message.content or "").strip()
                     else:
                         combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                        completion = llm_client.request(combined_prompt)
+                        completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                         choice = completion.choices[0]
                         finish_reason = "stop"
                         raw_text = (choice.message.content or "").strip()
             else:
                 if tier == "free":
-                    completion = llm_client.chat.completions.create(
+                    completion = await asyncio.to_thread(llm_client.chat.completions.create,
                         model=_GROQ_MODEL, max_tokens=4096, temperature=0.7,
                         messages=[
                             {"role": "system", "content": system_prompt},
@@ -260,7 +261,7 @@ async def _generate_questions(
                     raw_text = (choice.message.content or "").strip()
                 else:
                     combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                    completion = llm_client.request(combined_prompt)
+                    completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                     choice = completion.choices[0]
                     finish_reason = "stop"
                     raw_text = (choice.message.content or "").strip()
@@ -633,7 +634,7 @@ async def generate_quiz_from_book(
                             input=[{"role": "user", "content": combined_prompt}],
                             model_parameters={"question_limit": question_limit},
                         ) as generation:
-                            completion = llm_client.request(combined_prompt)
+                            completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                             raw_text = (completion.choices[0].message.content or "").strip()
                             # D-13: full output, no truncation. Gemini wrapper exposes no usage -> None.
                             generation.update(output=raw_text, usage_details=None)
@@ -641,10 +642,10 @@ async def generate_quiz_from_book(
                     logger.warning(
                         f"[generate_quiz_from_book] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
                     )
-                    completion = llm_client.request(combined_prompt)
+                    completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                     raw_text = (completion.choices[0].message.content or "").strip()
             else:
-                completion = llm_client.request(combined_prompt)
+                completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                 raw_text = (completion.choices[0].message.content or "").strip()
 
             if raw_text:
@@ -763,7 +764,7 @@ async def analyze_deck_for_quiz(
         for attempt in range(1, 3):
             try:
                 combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                completion = llm_client.request(combined_prompt)
+                completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                 raw_text = (completion.choices[0].message.content or "").strip()
                 if raw_text:
                     break

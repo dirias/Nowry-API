@@ -6,6 +6,7 @@ illustration counter for Free-tier gating (D-10). Plus and Pro have no cap.
 """
 from __future__ import annotations
 
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from app.core.limiter import limiter
 
@@ -77,7 +78,7 @@ async def generate_diagram(
     }
 
     try:
-        result = orchestrator.invoke("visualizer", inputs)  # synchronous — NO await
+        result = await asyncio.to_thread(orchestrator.invoke, "visualizer", inputs)  # sync graph, off the event loop (QA-011)
     except Exception as exc:
         logger.error(f"[illustrations] LLM error for book={book_id} tier={tier}: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))

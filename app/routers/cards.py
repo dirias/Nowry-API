@@ -118,7 +118,7 @@ async def generate_card(
     logger.info(f"[cards] tier={tier} adaptive={adaptive} cap={effective_cap}")
     try:
         logger.info(f"Received generation request: {payload}")
-        result = orchestrator.invoke(
+        result = await asyncio.to_thread(orchestrator.invoke,
             "rag",
             {
                 "prompt": payload.prompt,
@@ -372,7 +372,7 @@ async def _generate_cards_for_text(
                             input=[{"role": "user", "content": combined_prompt}],
                             model_parameters={"card_limit": card_limit},
                         ) as generation:
-                            completion = llm_client.request(combined_prompt)
+                            completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                             raw_text = (completion.choices[0].message.content or "").strip()
                             # D-13: full output, no truncation. Gemini wrapper exposes no usage -> None.
                             generation.update(output=raw_text, usage_details=None)
@@ -382,10 +382,10 @@ async def _generate_cards_for_text(
                     logger_cards.warning(
                         f"[generate_cards_from_book] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
                     )
-                    completion = llm_client.request(combined_prompt)
+                    completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                     raw_text = (completion.choices[0].message.content or "").strip()
             else:
-                completion = llm_client.request(combined_prompt)
+                completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                 raw_text = (completion.choices[0].message.content or "").strip()
 
             if raw_text:
@@ -579,7 +579,7 @@ async def analyze_deck(
             delay: float = _BACKOFF_BASE * (2 ** (attempt - 2)) + random.uniform(0.0, 0.3)
             await asyncio.sleep(delay)
         try:
-            completion = llm_client.request(combined_prompt)
+            completion = await asyncio.to_thread(llm_client.request, combined_prompt)
             raw_text = (completion.choices[0].message.content or "").strip()
             if raw_text:
                 break

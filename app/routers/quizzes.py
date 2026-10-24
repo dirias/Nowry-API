@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from app.models.QuizGenerationRequest import QuizGenerationRequest
 from app.ai_orchestrator.orchestrator import orchestrator
@@ -46,7 +47,7 @@ async def generate_quiz(
         )
 
         # Invoke the 'quiz' graph
-        result = orchestrator.invoke(
+        result = await asyncio.to_thread(orchestrator.invoke,
             "quiz",
             {
                 "sampleText": payload.sampleText,

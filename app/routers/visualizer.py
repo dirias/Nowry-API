@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends, Request
 from app.core.limiter import limiter
 from pydantic import BaseModel
@@ -34,7 +35,7 @@ async def generate_visual(
     try:
         inputs = {"text": body.text, "viz_type": body.viz_type, "tier": tier}
         # Invoke via orchestrator
-        result = orchestrator.invoke("visualizer", inputs)
+        result = await asyncio.to_thread(orchestrator.invoke, "visualizer", inputs)
 
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])

@@ -166,7 +166,7 @@ class AgentLLM:
             gemini_history.append({"role": role, "parts": [msg["content"]]})
             
         chat_session = model.start_chat(history=gemini_history)
-        response = chat_session.send_message(message, request_options=GEMINI_REQUEST_OPTIONS)
+        response = await asyncio.to_thread(chat_session.send_message, message, request_options=GEMINI_REQUEST_OPTIONS)
         
         # Function calling loop
         MAX_ROUNDS = 5
@@ -208,7 +208,7 @@ class AgentLLM:
                     )
                 )
             
-            response = chat_session.send_message(tool_results, request_options=GEMINI_REQUEST_OPTIONS)
+            response = await asyncio.to_thread(chat_session.send_message, tool_results, request_options=GEMINI_REQUEST_OPTIONS)
             rounds += 1
             
         return response.text
@@ -230,7 +230,7 @@ class AgentLLM:
             return None
         try:
             intent_model = os.getenv("GROQ_INTENT_MODEL") or self.groq_model
-            completion = self.groq_client.chat.completions.create(
+            completion = await asyncio.to_thread(self.groq_client.chat.completions.create,
                 model=intent_model,
                 messages=[
                     {"role": "system", "content": instruction},
@@ -325,7 +325,7 @@ class AgentLLM:
                 if openai_tools:
                     completion_kwargs["tools"] = openai_tools
                     completion_kwargs["tool_choice"] = "auto"
-                completion = self.groq_client.chat.completions.create(**completion_kwargs)
+                completion = await asyncio.to_thread(self.groq_client.chat.completions.create, **completion_kwargs)
             except Exception as e:
                 if openai_tools and self._is_tool_use_failed(e):
                     # Known Groq/Llama failure mode: the model emitted a malformed
@@ -341,7 +341,7 @@ class AgentLLM:
                     )
                     openai_tools = None
                     try:
-                        completion = self.groq_client.chat.completions.create(
+                        completion = await asyncio.to_thread(self.groq_client.chat.completions.create,
                             model=self.groq_model,
                             messages=messages,
                         )

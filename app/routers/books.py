@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -550,7 +551,7 @@ async def ai_expand_text(
                             model_parameters={"temperature": 0.7, "max_tokens": 1500},
                         ) as generation:
                             if tier == "free":
-                                completion = llm_client.chat.completions.create(
+                                completion = await asyncio.to_thread(llm_client.chat.completions.create,
                                     model=_GROQ_MODEL,
                                     max_tokens=1500,
                                     temperature=0.7,
@@ -572,7 +573,7 @@ async def ai_expand_text(
                                 )
                             else:
                                 combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                                completion = llm_client.request(combined_prompt)
+                                completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                                 raw_text = (completion.choices[0].message.content or "").strip()
                                 usage_details = None
 
@@ -583,7 +584,7 @@ async def ai_expand_text(
                         f"[ai_expand] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
                     )
                     if tier == "free":
-                        completion = llm_client.chat.completions.create(
+                        completion = await asyncio.to_thread(llm_client.chat.completions.create,
                             model=_GROQ_MODEL,
                             max_tokens=1500,
                             temperature=0.7,
@@ -595,11 +596,11 @@ async def ai_expand_text(
                         raw_text = (completion.choices[0].message.content or "").strip()
                     else:
                         combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                        completion = llm_client.request(combined_prompt)
+                        completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                         raw_text = (completion.choices[0].message.content or "").strip()
             else:
                 if tier == "free":
-                    completion = llm_client.chat.completions.create(
+                    completion = await asyncio.to_thread(llm_client.chat.completions.create,
                         model=_GROQ_MODEL,
                         max_tokens=1500,
                         temperature=0.7,
@@ -611,7 +612,7 @@ async def ai_expand_text(
                     raw_text = (completion.choices[0].message.content or "").strip()
                 else:
                     combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                    completion = llm_client.request(combined_prompt)
+                    completion = await asyncio.to_thread(llm_client.request, combined_prompt)
                     raw_text = (completion.choices[0].message.content or "").strip()
 
             if raw_text:
