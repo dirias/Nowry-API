@@ -15,13 +15,14 @@ import pytest
 
 APP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
 
-#: Synchronous provider calls, and the sync graph that makes them.
+#: Synchronous provider calls (LLM and Google TTS), and the sync graph that makes them.
 BLOCKING_CALLS = (
     "chat.completions.create",
     "generate_content",
     "send_message",
     "llm_client.request",
     "orchestrator.invoke",
+    "synthesize_speech",
 )
 
 

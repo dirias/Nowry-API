@@ -12,6 +12,7 @@ silently ignored (never errored, never partially applied) for Plus/Free.
 """
 from __future__ import annotations
 
+import asyncio
 from bson import ObjectId
 from datetime import datetime, timezone
 from typing import Optional
@@ -370,7 +371,7 @@ async def generate_tts(
                             segment_span_cm = contextlib.nullcontext()
 
                     with segment_span_cm as segment_span:
-                        segment_response = tts_client.synthesize_speech(
+                        segment_response = await asyncio.to_thread(tts_client.synthesize_speech,
                             input=segment_synthesis_input,
                             voice=segment_voice,
                             audio_config=audio_config,
@@ -393,8 +394,8 @@ async def generate_tts(
 
                 audio_bytes = concatenate_mp3_segments(audio_chunks)
             else:
-                # ── The ONE TTS synthesis call — executes exactly once ────
-                tts_response = tts_client.synthesize_speech(
+                # ── The ONE TTS synthesis call — executes exactly once, off the loop ──
+                tts_response = await asyncio.to_thread(tts_client.synthesize_speech,
                     input=synthesis_input, voice=voice, audio_config=audio_config,
                 )
                 audio_bytes = tts_response.audio_content
