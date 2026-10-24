@@ -97,6 +97,7 @@ def _ensure_cards_importable() -> None:
     mock_limiter_mod = MagicMock()
     mock_limiter_instance = MagicMock()
     mock_limiter_instance.limit = lambda *a, **k: (lambda fn: fn)
+    mock_limiter_instance.exempt = lambda fn: fn
     mock_limiter_mod.limiter = mock_limiter_instance
     sys.modules["app.core.limiter"] = mock_limiter_mod
 

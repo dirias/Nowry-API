@@ -22,6 +22,7 @@ if "app.core.limiter" not in sys.modules:
     _mock_limiter_mod = MagicMock()
     _mock_limiter_instance = MagicMock()
     _mock_limiter_instance.limit = lambda *a, **k: (lambda fn: fn)
+    _mock_limiter_instance.exempt = lambda fn: fn
     _mock_limiter_mod.limiter = _mock_limiter_instance
     sys.modules["app.core.limiter"] = _mock_limiter_mod
 

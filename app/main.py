@@ -72,6 +72,7 @@ from app.routers import (
     beta,
     copyright,
     blocks,
+    health,
 )
 
 
@@ -141,16 +142,21 @@ env_origins: list[str] = [
 # dict.fromkeys preserves order while removing duplicates.
 allowed_origins: list[str] = list(dict.fromkeys(DEFAULT_ALLOWED_ORIGINS + env_origins))
 
+# Credentialed CORS for every *.vercel.app let any Vercel project call the API
+# with a user's token (QA-004). Previews are opt-in, and the pattern must end in
+# the team's own scope, e.g. ``https://nowry-[a-z0-9-]+-<team>\.vercel\.app``.
+allowed_origin_regex: str | None = os.getenv("ALLOWED_ORIGIN_REGEX") or None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    # Vercel preview deployments (e.g. https://nowry-git-<branch>-<team>.vercel.app)
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=allowed_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
+app.include_router(health.router)  # Readiness for the uptime monitor
 app.include_router(auth.router)  # Firebase auth
 app.include_router(books.router)
 app.include_router(users.router)

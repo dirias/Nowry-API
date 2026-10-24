@@ -247,6 +247,7 @@ def _ensure_cards_importable():
     stub_if_missing("slowapi.util")
     if "app.core.limiter" not in sys.modules:
         mock_limiter_mod = MagicMock()
+        mock_limiter_mod.limiter.exempt = lambda fn: fn
         sys.modules["app.core.limiter"] = mock_limiter_mod
     # Stub app.models.quiz — contains str|None Pydantic fields that fail on Python 3.9
     # Must provide real Pydantic models so FastAPI router @response_model works at import time

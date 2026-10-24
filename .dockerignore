@@ -6,3 +6,12 @@ __pycache__
 venv/
 node_modules/
 data/
+
+# Credentials never enter an image (QA-004). `.env` above matches the root only;
+# app/.env holds the real keys. Local compose bind-mounts the folder, so the
+# service-account file still reaches a dev container.
+**/.env
+*service-account*.json
+nowry-88f05-*.json
+*.apkg
+scratch/

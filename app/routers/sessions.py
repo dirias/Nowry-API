@@ -11,7 +11,8 @@ from fastapi.responses import JSONResponse
 import jwt
 import bcrypt
 from slowapi import Limiter
-from slowapi.util import get_remote_address
+
+from app.core.limiter import client_address
 
 from app.config.database import users_collection
 from app.config.auth_config import SECRET_KEY, SECURE_COOKIE, SAMESITE_COOKIE
@@ -33,7 +34,7 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/login", deprecated=True)
-@Limiter(key_func=get_remote_address).limit("5/minute")
+@Limiter(key_func=client_address).limit("5/minute")
 async def login_deprecated(request: Request, credentials: LoginRequest):
     """
     DEPRECATED: Use Firebase Auth via /auth/login instead
