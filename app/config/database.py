@@ -179,6 +179,35 @@ async def create_fork_indexes(collection) -> list:
     return missing
 
 
+#: The due-card queries (QA-003). Both filter by owner or deck and `deleted_at`,
+#: then range and sort on `next_review`: equality fields first, the sorted range
+#: last, so the sort is read off the index instead of done in memory.
+DUE_BY_USER_INDEX = "cards_due_by_user"
+DUE_BY_DECK_INDEX = "cards_due_by_deck"
+#: Indexed a field no code reads or writes; every write paid for it.
+UNUSED_REVIEW_DATE_INDEX = "next_review_date_1"
+
+
+async def create_due_card_indexes(collection) -> None:
+    """Index the study queue's due-card reads and drop the unused one.
+
+    `study_cards._select_session_cards` reads by `user_id`; `quiz` reads by
+    `deck_id`. A failure is logged, never raised: a missing index makes the
+    queue slow, not wrong, and must not stop the API starting.
+    """
+    try:
+        await collection.create_index(
+            [("user_id", 1), ("deleted_at", 1), ("next_review", 1)], name=DUE_BY_USER_INDEX
+        )
+        await collection.create_index(
+            [("deck_id", 1), ("deleted_at", 1), ("next_review", 1)], name=DUE_BY_DECK_INDEX
+        )
+        if UNUSED_REVIEW_DATE_INDEX in await collection.index_information():
+            await collection.drop_index(UNUSED_REVIEW_DATE_INDEX)
+    except Exception:
+        logger.error("Failed to create the due-card indexes", exc_info=True)
+
+
 async def create_indexes():
     # User indexes
     await users_collection.create_index("firebase_uid", unique=True)
@@ -192,7 +221,7 @@ async def create_indexes():
     await decks_collection.create_index("created_at")
     await cards_collection.create_index("deck_id")
     await cards_collection.create_index("user_id")
-    await cards_collection.create_index("next_review_date")
+    await create_due_card_indexes(cards_collection)
     # Marked cards — ADR-010. Backs `marked_only` on the card list (and the
     # deferred cross-deck marked session) without touching any SM-2 index.
     await cards_collection.create_index([("user_id", 1), ("marked_at", -1)])
