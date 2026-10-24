@@ -5,8 +5,8 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import google.generativeai as genai
-from groq import Groq
 from app.utils.logger import get_logger
+from app.core.llm_timeouts import GEMINI_REQUEST_OPTIONS, bounded_groq
 from app.config.subscription_plans import AGENT_MODELS
 
 logger = get_logger(__name__)
@@ -41,7 +41,7 @@ class AgentLLM:
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
             
-        self.groq_client = Groq(api_key=self.groq_api_key) if self.groq_api_key else None
+        self.groq_client = bounded_groq(self.groq_api_key) if self.groq_api_key else None
 
     def _get_provider(self, tier: Optional[str] = None) -> str:
         """The provider a tier is sold: Free on Groq, Plus and Pro on Gemini (v1.0 Phase 4, GTM-004).
@@ -166,7 +166,7 @@ class AgentLLM:
             gemini_history.append({"role": role, "parts": [msg["content"]]})
             
         chat_session = model.start_chat(history=gemini_history)
-        response = chat_session.send_message(message)
+        response = chat_session.send_message(message, request_options=GEMINI_REQUEST_OPTIONS)
         
         # Function calling loop
         MAX_ROUNDS = 5
@@ -208,7 +208,7 @@ class AgentLLM:
                     )
                 )
             
-            response = chat_session.send_message(tool_results)
+            response = chat_session.send_message(tool_results, request_options=GEMINI_REQUEST_OPTIONS)
             rounds += 1
             
         return response.text

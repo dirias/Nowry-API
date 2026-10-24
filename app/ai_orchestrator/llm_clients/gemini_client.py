@@ -13,6 +13,8 @@ from typing import List
 import google.generativeai as genai
 from google.api_core import exceptions as _google_exc
 
+from app.core.llm_timeouts import GEMINI_REQUEST_OPTIONS
+
 
 # ---------------------------------------------------------------------------
 # Typed exceptions for upstream retry/status-code decisions
@@ -105,6 +107,7 @@ class Gemini_client:
             response = self.model.generate_content(
                 request_string,
                 generation_config=genai.types.GenerationConfig(temperature=0.7),
+                request_options=GEMINI_REQUEST_OPTIONS,
             )
             return _GeminiResponseShim.from_text(response.text)
         except _google_exc.ResourceExhausted as e:

@@ -30,6 +30,7 @@ import httpx
 from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from app.core.limiter import limiter
+from app.core.llm_timeouts import GEMINI_REQUEST_OPTIONS
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
@@ -3739,7 +3740,9 @@ async def generate_personality(
         generation_config=genai.types.GenerationConfig(temperature=0.9, max_output_tokens=512),
     )
     try:
-        response = gen_model.generate_content(user_prompt, safety_settings=PERSONALITY_SAFETY_SETTINGS)
+        response = gen_model.generate_content(
+            user_prompt, safety_settings=PERSONALITY_SAFETY_SETTINGS, request_options=GEMINI_REQUEST_OPTIONS
+        )
         personality_text = response.text.strip()
     except Exception as exc:
         # Safety block or API error

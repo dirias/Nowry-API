@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import ai_quiz_sessions_collection, cards_collection, decks_collection, quiz_sessions_collection, study_sessions_collection
 from app.core.limiter import limiter
+from app.core.llm_timeouts import bounded_groq
 from app.models.quiz import (
     AIQuizQuestionResponse,
     AIQuizQuestionStored,
@@ -56,7 +57,7 @@ def _get_groq_client() -> Groq:
     api_key: str = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable is not set")
-    return Groq(api_key=api_key)
+    return bounded_groq(api_key)
 
 
 def _extract_card_fields(card: dict) -> dict:

@@ -1,5 +1,6 @@
 import os
-from groq import Groq
+
+from app.core.llm_timeouts import bounded_groq
 
 
 class Groq_client:
@@ -11,7 +12,7 @@ class Groq_client:
         if not api_key:
             raise ValueError("Missing GROQ_API_KEY environment variable")
 
-        self.client = Groq(api_key=api_key)
+        self.client = bounded_groq(api_key)
         self.model = groq_model
 
     def request(self, request_string: str) -> dict:

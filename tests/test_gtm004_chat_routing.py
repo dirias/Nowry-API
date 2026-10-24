@@ -27,7 +27,7 @@ def _llm(groq=None, gemini=None):
                 import os
                 os.environ.pop(name, None)
         from app.utils import agent_llm as module
-        with patch.object(module, "Groq", MagicMock()), patch.object(module.genai, "configure", MagicMock()):
+        with patch.object(module, "bounded_groq", MagicMock()), patch.object(module.genai, "configure", MagicMock()):
             return module.AgentLLM()
 
 
