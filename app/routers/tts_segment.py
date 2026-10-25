@@ -95,7 +95,7 @@ async def segment_tts_text(
     )
 
     try:
-        segments = segment_text(text)
+        segments = segment_text(text, lang_hint=body.lang_hint)
     except Exception as exc:
         # Full traceback logged server-side only — classifier internals
         # (lingua, script-range regexes) are never leaked to the client.

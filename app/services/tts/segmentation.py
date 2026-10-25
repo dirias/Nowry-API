@@ -24,8 +24,13 @@ Algorithm
    every Han/Kana boundary would fragment ordinary Japanese into alternating
    micro-segments. Within a merged Han/Kana run, each sentence-level chunk
    (see step 2) is resolved to "ja" if it contains any Hiragana/Katakana
-   character, otherwise "zh" — still zero-classifier-cost, since presence of
-   a kana character is a deterministic signal, not a statistical guess.
+   character — still zero-classifier-cost, since presence of a kana
+   character is a deterministic signal, not a statistical guess.
+
+   A sentence of kanji alone (学生, 日本語) carries no such signal, and Han
+   is written identically in both languages. ADR-050: it takes the next
+   strongest evidence — kana anywhere in the same text, then the caller's
+   `lang_hint` when it is "ja" or "zh" — and only then falls back to "zh".
 
 2. **Sentence-level splitting.** Within each script run, text is further
    split on sentence-terminal punctuation (`. ! ? 。 ！ ？`, with an allowance
@@ -260,12 +265,27 @@ def _resolve_latin_lang(sentence: str, default_lang: str) -> str:
     return top.language.iso_code_639_1.name.lower()
 
 
-def _resolve_deterministic_lang(sentence: str, category: str) -> str:
+_HAN_LANGS = frozenset({"ja", "zh"})
+
+
+def _han_fallback(text: str, lang_hint: str | None) -> str:
+    """The language for a sentence of kanji with no kana (ADR-050).
+
+    Kana elsewhere in the text, then a "ja"/"zh" hint, then "zh". The hint
+    breaks only this tie; any other hint is ignored.
+    """
+    if _KANA_RE.search(text):
+        return "ja"
+    base = (lang_hint or "").replace("_", "-").split("-")[0].lower()
+    return base if base in _HAN_LANGS else "zh"
+
+
+def _resolve_deterministic_lang(sentence: str, category: str, han_fallback: str) -> str:
     """Resolve the language of a script run whose script maps 1:1 to a
     language, except `han_kana`, which still needs a presence-of-kana check
     (see module docstring, step 1)."""
     if category == _CATEGORY_HAN_KANA:
-        return "ja" if _KANA_RE.search(sentence) else "zh"
+        return "ja" if _KANA_RE.search(sentence) else han_fallback
     return _DETERMINISTIC_LANG_BY_CATEGORY[category]
 
 
@@ -286,7 +306,7 @@ def _merge_adjacent_same_lang(segments: list[TextSegment]) -> list[TextSegment]:
     return merged
 
 
-def segment_text(text: str, default_lang: str = "en") -> list[TextSegment]:
+def segment_text(text: str, default_lang: str = "en", lang_hint: str | None = None) -> list[TextSegment]:
     """Split `text` into per-language `TextSegment`s.
 
     Pure function — no I/O, no Mongo, no FastAPI/HTTP imports. See the
@@ -299,6 +319,8 @@ def segment_text(text: str, default_lang: str = "en") -> list[TextSegment]:
         default_lang: Fallback ISO 639-1 language code (e.g. "en", "de")
             used for script-neutral text and for short, low-confidence
             Latin-script segments (see `_LOW_CONFIDENCE_THRESHOLD`).
+        lang_hint: The language the caller expects (e.g. a deck's "ja-JP").
+            Used only for a sentence of kanji with no kana (ADR-050).
 
     Returns:
         A list of `TextSegment`, in original text order, with adjacent
@@ -307,6 +329,7 @@ def segment_text(text: str, default_lang: str = "en") -> list[TextSegment]:
     if not text or not text.strip():
         return []
 
+    han_fallback = _han_fallback(text, lang_hint)
     raw_segments: list[TextSegment] = []
     for run_text, category in _split_by_script(text):
         for sentence in _split_sentences(run_text):
@@ -315,7 +338,7 @@ def segment_text(text: str, default_lang: str = "en") -> list[TextSegment]:
             elif category == _CATEGORY_NEUTRAL:
                 lang_code = default_lang
             else:
-                lang_code = _resolve_deterministic_lang(sentence, category)
+                lang_code = _resolve_deterministic_lang(sentence, category, han_fallback)
             raw_segments.append(TextSegment(text=sentence, lang_code=lang_code))
 
     return _merge_adjacent_same_lang(raw_segments)

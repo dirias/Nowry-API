@@ -96,6 +96,36 @@ class TestScriptSplitting:
 
 
 # ---------------------------------------------------------------------------
+# segment_text() — kanji with no kana (ADR-050)
+# ---------------------------------------------------------------------------
+class TestKanjiWithoutKana:
+    def test_kanji_alone_with_no_evidence_is_still_zh(self):
+        assert [s.lang_code for s in segment_text("学生")] == ["zh"]
+
+    @pytest.mark.parametrize("hint", ["ja", "ja-JP", "ja_JP", "JA-jp"])
+    def test_a_japanese_hint_makes_kanji_alone_ja(self, hint):
+        assert [s.lang_code for s in segment_text("日本語", lang_hint=hint)] == ["ja"]
+
+    def test_a_chinese_hint_keeps_it_zh(self):
+        assert [s.lang_code for s in segment_text("学生", lang_hint="zh-CN")] == ["zh"]
+
+    def test_kana_elsewhere_in_the_text_makes_a_kanji_sentence_ja(self):
+        segments = segment_text("東京大学。とうきょうだいがく")
+        assert [s.lang_code for s in segments] == ["ja"]
+
+    def test_kana_in_the_text_outranks_a_chinese_hint(self):
+        assert {s.lang_code for s in segment_text("学生。がくせい", lang_hint="zh")} == {"ja"}
+
+    @pytest.mark.parametrize("hint", ["es-ES", "en", "", None, "japanese"])
+    def test_any_other_hint_is_ignored(self, hint):
+        assert [s.lang_code for s in segment_text("学生", lang_hint=hint)] == ["zh"]
+
+    def test_a_hint_never_relabels_another_script(self):
+        segments = segment_text("Good morning everyone. 안녕하세요.", lang_hint="ja-JP")
+        assert [s.lang_code for s in segments] == ["en", "ko"]
+
+
+# ---------------------------------------------------------------------------
 # segment_text() — Latin-script classifier disambiguation
 # ---------------------------------------------------------------------------
 class TestLatinClassifierDisambiguation:
@@ -228,6 +258,21 @@ class TestSegmentEndpoint:
         assert len(response.segments) >= 1
         assert all(isinstance(s, TextSegment) for s in response.segments)
         rate_limit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_hint_reaches_the_segmenter(self):
+        rate_limit = AsyncMock(return_value=1)
+        with patch.object(tts_segment_module, "enforce_user_rate_limit", rate_limit):
+            hinted = await tts_segment_module.segment_tts_text(
+                request=_fake_request({"text": "学生", "lang_hint": "ja-JP"}),
+                current_user=_current_user(),
+            )
+            unhinted = await tts_segment_module.segment_tts_text(
+                request=_fake_request({"text": "学生"}),
+                current_user=_current_user(),
+            )
+        assert [s.lang_code for s in hinted.segments] == ["ja"]
+        assert [s.lang_code for s in unhinted.segments] == ["zh"]
 
     @pytest.mark.asyncio
     async def test_empty_text_is_400_and_skips_rate_limit(self):
