@@ -166,6 +166,8 @@ class AgentStateResponse(BaseModel):
     current_xp: int = 0
     xp_for_next_level: int = 50
     level_progress: float = 0.0
+    # EVO-004: toward the next FORM, not the next level; None at the last stage.
+    stage_progress: Optional[float] = None
     current_stage: int = 1
     pet_name: str | None = None
     is_default_companion: bool = True
@@ -1555,6 +1557,22 @@ def _level_progress(xp: int) -> float:
     return min(1.0, max(0.0, (xp - start) / span))
 
 
+def _stage_progress(xp: int) -> Optional[float]:
+    """Fraction of the way from this stage's first level to the next stage's, in [0, 1].
+
+    What lets the companion show an evolution coming (EVO-004). The level ring
+    resets every level; the stage is what the learner is actually waiting for,
+    and between forms that wait is weeks. None at the last stage: there is no
+    next form to stir toward.
+    """
+    stage = _level_to_stage(_calculate_level(xp))
+    if stage >= STAGE_COUNT:
+        return None
+    start = 0 if stage == 1 else _xp_for_level(STAGE_LEVEL_THRESHOLDS[stage - 2])
+    end = _xp_for_level(STAGE_LEVEL_THRESHOLDS[stage - 1])
+    return min(1.0, max(0.0, (xp - start) / (end - start)))
+
+
 async def grant_xp(user_id: str, amount: int) -> dict:
     """Atomically increment the user's XP in MongoDB and return level-up data."""
     try:
@@ -1634,6 +1652,7 @@ async def grant_xp(user_id: str, amount: int) -> dict:
             "current_xp": xp_after,
             "xp_for_next_level": _xp_for_next_level(xp_after),
             "level_progress": _level_progress(xp_after),
+            "stage_progress": _stage_progress(xp_after),
         }
     except Exception:
         return {
@@ -1644,6 +1663,7 @@ async def grant_xp(user_id: str, amount: int) -> dict:
             "current_xp": None,
             "xp_for_next_level": None,
             "level_progress": None,
+            "stage_progress": None,
         }
 
 
@@ -1706,6 +1726,7 @@ async def _grant_chat_xp(user_id: str) -> dict:
             "current_xp": current_xp,
             "xp_for_next_level": _xp_for_next_level(current_xp),
             "level_progress": _level_progress(current_xp),
+            "stage_progress": _stage_progress(current_xp),
         }
 
     return await grant_xp(user_id, XP_PER_CHAT_MESSAGE)
@@ -2799,6 +2820,7 @@ class XpGrantResponse(BaseModel):
     current_xp: Optional[int] = None
     xp_for_next_level: Optional[int] = None
     level_progress: Optional[float] = None
+    stage_progress: Optional[float] = None
 
 
 @router.post('/xp/session', response_model=XpGrantResponse)
@@ -2816,6 +2838,7 @@ async def award_session_xp(
         current_xp=xp_result.get("current_xp"),
         xp_for_next_level=xp_result.get("xp_for_next_level"),
         level_progress=xp_result.get("level_progress"),
+        stage_progress=xp_result.get("stage_progress"),
     )
 
 
@@ -2842,6 +2865,7 @@ async def award_streak_xp(
             current_xp=current_streak_xp,
             xp_for_next_level=_xp_for_next_level(current_streak_xp),
             level_progress=_level_progress(current_streak_xp),
+            stage_progress=_stage_progress(current_streak_xp),
         )
 
     # Award XP and record today's date atomically
@@ -2858,6 +2882,7 @@ async def award_streak_xp(
         current_xp=xp_result.get("current_xp"),
         xp_for_next_level=xp_result.get("xp_for_next_level"),
         level_progress=xp_result.get("level_progress"),
+        stage_progress=xp_result.get("stage_progress"),
     )
 
 
@@ -2921,6 +2946,7 @@ async def get_agent_state(
         current_xp=xp,
         xp_for_next_level=_xp_for_next_level(xp),
         level_progress=_level_progress(xp),
+        stage_progress=_stage_progress(xp),
         current_stage=_level_to_stage(_calculate_level(xp)),
         pet_name=pet_prefs.get("pet_name") or DEFAULT_PET_NAME,
         is_default_companion=wears_nowry,

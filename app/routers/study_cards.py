@@ -1779,6 +1779,7 @@ async def review_card(
                 "current_xp": xp_result.get("current_xp"),
                 "xp_for_next_level": xp_result.get("xp_for_next_level"),
                 "level_progress": xp_result.get("level_progress"),
+                "stage_progress": xp_result.get("stage_progress"),
             }
             if xp_result
             else None,

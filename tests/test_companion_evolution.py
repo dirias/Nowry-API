@@ -63,3 +63,29 @@ async def test_only_a_paid_account_is_sent_to_regenerate_on_evolving(tier: str, 
     assert result["new_stage"] == 2
     assert result["avatar_regen_pending"] is raised
     assert _regen_was_raised(collection) is raised
+
+
+class TestStageProgress:
+    """EVO-004: how close the next form is, by XP across the whole stage."""
+
+    def test_it_runs_from_the_stage_s_first_level_to_the_next_stage_s(self) -> None:
+        from app.routers.agent import _stage_progress
+
+        assert _stage_progress(0) == 0.0
+        assert _stage_progress(_xp_for_level(3) - 1) == pytest.approx(0.99)
+        assert _stage_progress(_xp_for_level(3)) == 0.0
+        halfway = (_xp_for_level(6) + _xp_for_level(10)) // 2
+        assert _stage_progress(halfway) == pytest.approx(0.5, abs=0.01)
+
+    def test_there_is_nothing_to_stir_toward_at_the_last_stage(self) -> None:
+        from app.routers.agent import _stage_progress
+
+        assert _stage_progress(_xp_for_level(18)) is None
+        assert _stage_progress(10**7) is None
+
+    @pytest.mark.asyncio
+    async def test_a_grant_reports_it(self) -> None:
+        collection = _collection("free", 50, {})
+        with patch.dict(grant_xp.__globals__, {"users_collection": collection}):
+            result = await grant_xp("64b7f0000000000000000001", 2)
+        assert result["stage_progress"] == pytest.approx(52 / _xp_for_level(3))
