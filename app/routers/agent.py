@@ -828,9 +828,37 @@ DEFAULT_PET_INTERESTS = ["artificial_intelligence", "technology", "science", "mu
 DEFAULT_PET_STUDY_GOAL = "hobby"      # labelled "Personal Interest" in the UI
 
 
-def _is_default_companion(pet_prefs: dict) -> bool:
-    """True while the user has not personalised their companion."""
-    return not pet_prefs.get("avatar_url")
+# Species that are Nowry: the current one, and the owl Nowry was before the
+# Spiral (ADR-034) — accounts from that era stored it as their default.
+_NOWRY_SPECIES = {None, "", DEFAULT_PET_SPECIES, "owl"}
+
+
+def _companion_portrait(pet_prefs: dict, stage: int) -> tuple[Optional[str], bool]:
+    """What the companion wears at `stage`: (portrait url or None, is_default_companion).
+
+    A portrait belongs to the stage it was made for (ADR-052). The old rule
+    fell back to the last `avatar_url` at every stage, so a free account's one
+    portrait from first reveal was worn forever and the default line never
+    showed again. Now a stage with no portrait of its own wears Nowry's form
+    for that stage — unless the learner chose another species, which is not
+    shown somebody else's creature.
+
+    The one fallback kept is the legacy account whose single portrait predates
+    per-stage storage: it has no `stage_avatars`, and that portrait IS its form.
+    """
+    worn = _worn_portrait(pet_prefs, stage)
+    if worn:
+        return worn, False
+    legacy = None if pet_prefs.get("stage_avatars") else pet_prefs.get("avatar_url")
+    if legacy:
+        return legacy, False
+    never_generated = not pet_prefs.get("stage_avatars") and not pet_prefs.get("avatar_url")
+    return None, never_generated or pet_prefs.get("pet_species") in _NOWRY_SPECIES
+
+
+def _is_default_companion(pet_prefs: dict, stage: int = 1) -> bool:
+    """True while the companion wears Nowry's own form at `stage`."""
+    return _companion_portrait(pet_prefs, stage)[1]
 
 # Hue bands for a theme colour that is not one of the presets — the field
 # accepts any hex, so the prompt must still describe something truthful rather
@@ -1530,7 +1558,7 @@ async def grant_xp(user_id: str, amount: int) -> dict:
         user_doc = await users_collection.find_one(
             {"_id": ObjectId(user_id)},
             {"agent.xp": 1, "preferences.pet.avatar_url": 1,
-             "preferences.pet.stage_avatars": 1},
+             "preferences.pet.stage_avatars": 1, "subscription.tier": 1},
         )
         xp_before: int = (user_doc or {}).get("agent", {}).get("xp", 0) if user_doc else 0
         level_before: int = _calculate_level(xp_before)
@@ -1578,7 +1606,10 @@ async def grant_xp(user_id: str, amount: int) -> dict:
             # a form that had ALREADY been generated, billing a second image
             # for art the user already owned. stage_avatars is authoritative.
             already_generated = bool(_portraits_for(pet_prefs, new_stage))
-            if stored_avatar_url and not already_generated:
+            # A free account's one portrait is for life (ADR-041), so its next
+            # form is the default line's, not a generation it would be refused.
+            may_generate = _resolve_tier(user_doc) != SubscriptionTier.FREE
+            if stored_avatar_url and not already_generated and may_generate:
                 await users_collection.update_one(
                     {"_id": ObjectId(user_id)},
                     {"$set": {
@@ -2863,9 +2894,11 @@ async def get_agent_state(
     # A form generated ahead of time becomes the worn one the moment its stage
     # is reached — the reveal needs no extra request and no extra generation.
     current_stage_for_art: int = _level_to_stage(_calculate_level(xp))
-    avatar_url = _worn_portrait(pet_prefs, current_stage_for_art) or pet_prefs.get("avatar_url")
+    avatar_url, wears_nowry = _companion_portrait(pet_prefs, current_stage_for_art)
     avatar_stage = pet_prefs.get("avatar_stage")
-    avatar_regen_pending = pet_prefs.get("avatar_regen_pending", False)
+    # A free account is never sent to regenerate: it would be refused (ADR-041),
+    # and a flag raised before EVO-001 would retry on every load.
+    avatar_regen_pending = pet_prefs.get("avatar_regen_pending", False) and tier != SubscriptionTier.FREE
     animation_url = pet_prefs.get("animation_url")
     animation_stage = pet_prefs.get("animation_stage")
     animation_regen_pending = pet_prefs.get("animation_regen_pending", False)
@@ -2887,7 +2920,7 @@ async def get_agent_state(
         level_progress=_level_progress(xp),
         current_stage=_level_to_stage(_calculate_level(xp)),
         pet_name=pet_prefs.get("pet_name") or DEFAULT_PET_NAME,
-        is_default_companion=_is_default_companion(pet_prefs),
+        is_default_companion=wears_nowry,
         pet_species=pet_prefs.get("pet_species"),
         avatar_url=avatar_url,
         avatar_stage=avatar_stage,
@@ -3026,7 +3059,7 @@ async def get_journey(
         {"_id": ObjectId(user_id)},
         {"agent.xp": 1, "preferences.pet.evolution_history": 1,
          "preferences.pet.avatar_url": 1, "preferences.pet.stage_avatars": 1,
-         "preferences.pet.worn_avatars": 1, "created_at": 1},
+         "preferences.pet.worn_avatars": 1, "preferences.pet.pet_species": 1, "created_at": 1},
     )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -3077,7 +3110,7 @@ async def get_journey(
         stages=stages,
         days_studied=await _days_studied_together(user_id),
         companion_since=companion_since,
-        is_default_companion=_is_default_companion(user.get("preferences", {}).get("pet", {})),
+        is_default_companion=_is_default_companion(journey_pet, current_stage),
     )
 
 
