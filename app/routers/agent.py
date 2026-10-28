@@ -991,12 +991,15 @@ AVATAR_STAGE_NAMES: dict[int, str] = {
 
 # What the image model is told a species IS. Most species are a word it already
 # knows; the Spiral is not, and left as the bare word it draws a swirl or a
-# staircase. The wording carries the brand's guardrails (BRAND.md): a coil
-# first, one round eye, and nothing that reads as a threat or as medicine.
+# staircase. Since ADR-052 it is the B2 line's serpent, the standard every
+# companion follows: a snake with two eyes (the mark's one eye is a side view),
+# smooth, one body colour, cream belly bands. Written as what it IS — the
+# image model ignores negations — with the brand's guardrails kept at the end.
 AVATAR_SPECIES_DESCRIPTORS: dict[str, str] = {
     "spiral": (
-        "smooth coiled spiral serpent creature, its body a single tapering coil "
-        "whose gaps widen with every turn, a round head with one large round eye, "
+        "cute cartoon snake curled in a spiral coil, a small rounded head "
+        "with two large round dark eyes, a smooth tapering body in one flat colour, "
+        "cream belly bands under its neck, "
         "no fangs, no tongue, no scale texture, no staff"
     ),
 }

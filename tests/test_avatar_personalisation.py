@@ -251,8 +251,8 @@ class TestPromptComposition:
             {"username": "", "preferences": {"pet": {}, "general": {}}}, 1
         )
         assert "Wisp" in prompt
-        # Nothing chosen means the brand's own creature (BRAND-007), never the owl.
-        assert "coiled spiral" in prompt
+        # Nothing chosen means the brand's own creature (ADR-052), never the owl.
+        assert "snake curled in a spiral coil" in prompt
         assert "owl" not in prompt
         assert isinstance(seed, int)
 
@@ -467,10 +467,14 @@ class TestDefaultSpeciesIsTheSpiral:
         assert DEFAULT_PET_SPECIES == "spiral"
         assert "spiral" in VALID_SPECIES
 
-    def test_an_unset_species_is_described_as_a_coil_and_never_as_an_owl(self) -> None:
+    def test_an_unset_species_is_described_as_the_b2_serpent_and_never_as_an_owl(self) -> None:
         prompt, _ = _build_avatar_prompt(self._doc(None), 3)
-        assert "coiled spiral" in prompt
-        assert "one large round eye" in prompt
+        assert "snake curled in a spiral coil" in prompt
+        assert "two large round dark eyes" in prompt
+        assert "cream belly bands" in prompt
+        # The retired drawn mark's wording (EVO-002): one eye, a widening coil.
+        assert "one large round eye" not in prompt
+        assert "gaps widen" not in prompt
         assert "owl" not in prompt
 
     def test_the_spiral_carries_the_brand_guardrails_into_the_prompt(self) -> None:
