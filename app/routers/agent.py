@@ -1150,9 +1150,13 @@ def _strip_generated_backdrop(image_bytes: bytes) -> bytes:
     in the orb, and it makes a locked look-ahead form silhouette into a
     featureless circle instead of the creature's actual shape.
 
-    Flood-filled from the corners rather than keyed on white globally: a pet's
-    own highlights, eyes and pale plumage are near-white too, and a global
-    threshold punches holes straight through the character.
+    Flood-filled from the border rather than keyed on white globally: a pet's
+    own highlights, eyes and pale belly are near-white too, and a global
+    threshold punches holes straight through the character. The fill runs
+    through "paper" — bright and colourless — rather than through pixels close
+    to the corner's colour: FLUX paints a soft glow around a gold ring and a
+    pale shadow under the body, and a corner-colour fill stopped at both and
+    left a pale box around the companion (EVO-006 trial 1).
 
     Best-effort — returns the original bytes untouched on any failure, since a
     portrait with a backdrop is far better than no portrait.
@@ -1160,10 +1164,14 @@ def _strip_generated_backdrop(image_bytes: bytes) -> bytes:
     try:
         import io
 
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageChops, ImageDraw
 
-        SENTINEL = (254, 0, 254)
-        THRESHOLD = 26
+        # Paper: every channel at least this bright, and no channel further than
+        # TINT from the others — white, its glow and its softest shadow, but not
+        # the cream belly or the gold, which carry colour.
+        PAPER = 205
+        TINT = 26
+        GROUND = 128
         # The portrait renders at 56-110px; 512 covers any retina display.
         # Alpha PNGs are far heavier than the flat source, so without this the
         # backdrop removal would roughly triple what every user downloads.
@@ -1171,15 +1179,24 @@ def _strip_generated_backdrop(image_bytes: bytes) -> bytes:
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = image.size
-        corners = ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1))
-        for corner in corners:
-            ImageDraw.floodfill(image, corner, SENTINEL, thresh=THRESHOLD)
+        red, green, blue = image.split()
+        darkest = ImageChops.darker(ImageChops.darker(red, green), blue)
+        lightest = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+        bright = darkest.point(lambda v: 255 if v >= PAPER else 0)
+        neutral = ImageChops.subtract(lightest, darkest).point(lambda v: 255 if v <= TINT else 0)
+        paper = ImageChops.multiply(bright, neutral)
+
+        # Seed from every paper pixel on the border: the ground is whatever
+        # paper reaches the edge, however the model shaded it.
+        border = [(x, y) for x in range(width) for y in (0, height - 1)]
+        border += [(x, y) for y in range(height) for x in (0, width - 1)]
+        for seed in border:
+            if paper.getpixel(seed) == 255:
+                ImageDraw.floodfill(paper, seed, GROUND, thresh=0)
+        alpha = paper.point(lambda v: 0 if v == GROUND else 255)
 
         rgba = image.convert("RGBA")
-        rgba.putdata([
-            (0, 0, 0, 0) if pixel[:3] == SENTINEL else pixel
-            for pixel in rgba.getdata()
-        ])
+        rgba.putalpha(alpha)
 
         # Trim to the character before scaling, so the pet fills the frame
         # rather than the empty margin the model left around it.

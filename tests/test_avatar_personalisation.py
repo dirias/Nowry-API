@@ -389,6 +389,28 @@ class TestGeneratedBackdrop:
         # Source was 300x300 with the subject inset; output should be tighter.
         assert max(out.size) < 300
 
+    def test_a_glow_and_a_soft_shadow_go_with_the_backdrop(self) -> None:
+        # EVO-006 trial 1: a pale glow around the gold ring and a shadow pool
+        # under the body stopped a corner-colour fill and left a pale box.
+        import io
+
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (300, 300), (252, 250, 251))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((0, 0, 299, 40), fill=(243, 239, 247))   # a vignette band at the edge
+        draw.ellipse((60, 60, 240, 240), fill=(240, 236, 228))  # the glow halo
+        draw.ellipse((80, 230, 220, 260), fill=(214, 210, 216))  # the shadow pool
+        draw.ellipse((100, 100, 200, 200), fill=(40, 140, 70))  # the companion
+        draw.rectangle((130, 170, 170, 195), fill=(238, 226, 190))  # its cream belly
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        out = self._open(_strip_generated_backdrop(buf.getvalue()))
+        assert out.size == (101, 101)  # cropped to the companion alone
+        belly = out.getpixel((50, 85))
+        assert belly[3] == 255 and belly[:3] == (238, 226, 190)
+
     def test_unreadable_bytes_pass_through_untouched(self) -> None:
         # A portrait with a backdrop beats no portrait, so failure returns the
         # original rather than raising into the generation path.
