@@ -1431,6 +1431,21 @@ class PetPreferencesResponse(BaseModel):
     pet_revealed: bool = True
 
 
+# ADR-053: changing who the companion is — its name, its species — is a paid
+# feature. A free account's companion is Nowry. Showing or hiding the companion
+# (`pet_active`) is not customisation and stays free.
+PAID_PET_FIELDS: frozenset[str] = frozenset({"pet_name", "pet_species"})
+
+
+async def _require_paid_pet_customization(user_id: str) -> None:
+    """Refuse a free account's change to the companion's name or species."""
+    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)}, {"subscription.tier": 1})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+    if (user_doc.get("subscription") or {}).get("tier", "free") not in (SubscriptionTier.PLUS, SubscriptionTier.PRO):
+        raise HTTPException(status_code=403, detail="pet_customization_requires_plus")
+
+
 @router.get("/preferences/pet", response_model=PetPreferencesResponse)
 async def get_pet_preferences(
     current_user: dict = Depends(get_firebase_user),
@@ -1472,6 +1487,9 @@ async def update_pet_preferences(
     database — omitting a field never nulls an existing stored value.
     """
     user_id: str = current_user.get("user_id")
+
+    if body.model_fields_set & PAID_PET_FIELDS:
+        await _require_paid_pet_customization(user_id)
 
     update_fields: dict[str, object] = {}
     for field in body.model_fields_set:
