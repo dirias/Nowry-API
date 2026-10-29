@@ -194,8 +194,18 @@ async def test_tts_reservation_is_skipped_without_a_ceiling():
 # ── 7. Companion ─────────────────────────────────────────────────────────────
 
 
-def test_free_gets_one_portrait_for_life():
-    source = (APP / "routers" / "agent.py").read_text()
-    block = source[source.index("async def generate_avatar(") :][:2500]
-    assert 'if pet_now.get("avatar_url") or pet_now.get("stage_avatars"):' in block
-    assert "SubscriptionTier.FREE: 1" in block
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["manual", "evolution", "next_stage"])
+async def test_free_never_generates_a_portrait(trigger):
+    """ADR-053: no trigger, first or later, generates a portrait for a free account."""
+    from app.routers import agent
+
+    users = MagicMock()
+    users.find_one = AsyncMock(return_value={"_id": ObjectId(USER), "subscription": {"tier": "free"}, "preferences": {"pet": {"pet_species": "spiral"}}})
+    users.update_one = AsyncMock()
+    with patch.dict(agent.generate_avatar.__globals__, {"users_collection": users}):
+        with pytest.raises(HTTPException) as refused:
+            await agent.generate_avatar(agent.GenerateAvatarRequest(trigger=trigger), current_user={"user_id": USER})
+    assert refused.value.status_code == 403
+    assert refused.value.detail == "avatar_generation_requires_plus"
+    users.update_one.assert_not_awaited()
