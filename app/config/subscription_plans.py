@@ -4,7 +4,7 @@ Defines the features and limitations for each subscription tier.
 
 Tiers (ADR-041, the tier contract):
   - free:  everything by hand unlimited; AI as a taste in per-call sizes under a
-           monthly ceiling; 50 companion messages; one portrait at first reveal.
+           monthly ceiling; 50 companion messages; Nowry, the default companion (ADR-053: portraits are paid).
   - plus:  $8.99/month — book-level AI, read-aloud, companion memory and personality.
   - pro:   $19.99/month — deck-level AI, any language read-aloud, top model.
 Limits are -1 for unlimited. The two "fair use" ceilings (ai_calls_per_month on
