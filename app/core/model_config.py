@@ -22,6 +22,8 @@ import os
 import logging
 from typing import Optional
 
+from app.core import llm_health
+
 logger = logging.getLogger(__name__)
 
 # Class references imported once at initial load time.
@@ -88,13 +90,47 @@ else:
     )
 
 
+class FallbackClient:
+    """A Gemini client with Groq behind it (ADR-054, AI-003).
+
+    Same ``request()`` contract as both clients: the response has
+    ``.choices[0].message.content``. A provider failure on Gemini marks it down
+    and asks Groq; anything else is the request's and is raised. A provider
+    that is down is skipped while another remains, and the last one is always
+    tried, so a route still gets an error it already knows how to answer.
+    """
+
+    def __init__(self, primary, secondary) -> None:
+        self._chain = [("gemini", primary), ("groq", secondary)]
+
+    def request(self, request_string: str):
+        for index, (provider, client) in enumerate(self._chain):
+            is_last = index == len(self._chain) - 1
+            if not is_last and llm_health.is_down(provider):
+                continue
+            try:
+                return client.request(request_string)
+            except Exception as exc:
+                if is_last or not llm_health.is_provider_failure(exc):
+                    raise
+                llm_health.mark_down(provider, exc)
+                logger.error("[llm] fallback: %s failed for generation (%s): %s", provider, type(exc).__name__, exc)
+
+
+def _with_groq_behind(gemini_client):
+    """The Gemini client, with Groq behind it when Groq is configured."""
+    if gemini_client is None or _groq_client is None:
+        return gemini_client
+    return FallbackClient(gemini_client, _groq_client)
+
+
 def get_client_for_tier(tier: str):
     """Return the singleton LLM client for the given subscription tier.
 
     Resolution (D-10, D-11):
         free  → _groq_client   (Groq/Llama 3.3 70B)
-        plus  → _gemini_flash_client (Gemini Flash)
-        pro   → _gemini_pro_client   (Gemini Pro)
+        plus  → _gemini_flash_client (Gemini Flash), Groq behind it (AI-003)
+        pro   → _gemini_pro_client   (Gemini Pro), Groq behind it (AI-003)
         other → WARNING + _groq_client (free-tier fallback)
 
     Returns:
@@ -107,9 +143,9 @@ def get_client_for_tier(tier: str):
     if tier == "free":
         return _groq_client
     elif tier == "plus":
-        return _gemini_flash_client
+        return _with_groq_behind(_gemini_flash_client)
     elif tier == "pro":
-        return _gemini_pro_client
+        return _with_groq_behind(_gemini_pro_client)
     else:
         logger.warning(
             "model_config: Unknown tier '%s' — defaulting to free (Groq).",
