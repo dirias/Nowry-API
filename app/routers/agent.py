@@ -121,6 +121,8 @@ class ScreenContextPayload(BaseModel):
     card_index: Optional[int] = None
     total_cards: Optional[int] = None
     card_type: Optional[str] = None      # 'basic' | 'cloze' | 'quiz' | 'visual'
+    # The subject's language, a BCP 47 base code from the deck's voice settings (CHAT-003)
+    language: Optional[str] = Field(default=None, max_length=16)
     is_flipped: Optional[bool] = None
     front: Optional[str] = None
     back: Optional[str] = None           # None when is_flipped is False
@@ -154,6 +156,9 @@ class ChatRequest(BaseModel):
     # Structured screen context from the frontend (replaces the old Optional[str])
     context: Optional[ScreenContextPayload] = None
     language: str = 'en'   # BCP 47 language code (e.g. 'es', 'fr-CA')
+    # Which client is asking (ADR-055 §3): the phone has no quiz, so it gets
+    # neither the quiz contract nor the quiz tool. Absent means the web.
+    client: Literal['web', 'phone'] = 'web'
 
 
 class AgentStateResponse(BaseModel):
@@ -345,7 +350,7 @@ def _build_context_injection(
         ) if ctx.mode == 'browse' else ""
 
         return (
-            f"\n\nCURRENT SCREEN CONTEXT:\n"
+            f"\n\nTHE SUBJECT OF THIS CONVERSATION (CURRENT SCREEN CONTEXT):\n"
             f"The user is studying {position} in their {session_label}. "
             f"Card type: {ctx.card_type or 'basic'}. "
             f"They are viewing the {view_side} of the card.\n"
@@ -363,7 +368,7 @@ def _build_context_injection(
         if book_text:
             text_block = f"\n\nRelevant book content:\n{book_text}"
         return (
-            f"\n\nCURRENT SCREEN CONTEXT:\n"
+            f"\n\nTHE SUBJECT OF THIS CONVERSATION (CURRENT SCREEN CONTEXT):\n"
             f"The user is reading '{ctx.book_title or 'a book'}' (book_id: {ctx.book_id}){chapter}.{text_block}\n"
             f"Use the book content above as your primary context for questions about this topic. "
             f"If the answer is not fully covered in the excerpt, supplement with your general knowledge — never say 'it's not in the book'. "
@@ -429,82 +434,50 @@ def _intervention_language_directive(language_code: str) -> str:
 
 
 TUTOR_RULES = """
-TUTOR BEHAVIOR (core teaching identity — always active):
+TUTOR BEHAVIOR (always active):
+- Answer about the subject from your own knowledge: examples, explanations and formulas
+  need no tool call.
+- Examples: natural, everyday use, not textbook-stilted; a real-world scenario for science or
+  history.
+- When the subject says the last grade was Again or Hard, or the learner is struggling: coach,
+  don't correct. Say why the answer is what it is, give one analogy or real use that makes it
+  stick, and end with a short question that helps it settle.
+- When the answer is showing and they ask for more, add ONE enrichment, not several: a
+  collocation, where it is used, a common confusion, or a memorable fact.
+- Pacing: near the end of a session, keep energy up; early on, be more exploratory; never make
+  them feel behind.
+"""
 
-When the user is in a study session (page = study_session in screen context):
-1. AFTER A CORRECT ANSWER: Don't just confirm. Immediately enrich:
-   - Give 2–3 example sentences using the word/concept in real context
-   - Add one memory hook: a mnemonic, etymology, or vivid association
-   - For languages: include pronunciation notes, formality level (casual vs formal), or common collocations
-   - Keep it tight — this is a study session, not a lecture
 
-2. AFTER A WRONG ANSWER OR STRUGGLE: Be a coach, not a corrector:
-   - Acknowledge the attempt ("Good try — easy to mix up")
-   - Explain WHY the correct answer is what it is
-   - Give one analogy or real-world usage that makes it stick
-   - End with a question that helps cement the memory
-
-3. WHEN ASKED FOR EXAMPLES: Always answer from your own knowledge first.
-   - You do NOT need to fetch data to provide examples of vocabulary, concepts, or formulas
-   - Draw examples from the user's interests and daily life context
-   - For language cards: give sentences at natural speech level, not textbook-stilted
-   - For science/history cards: give a real-world scenario or historical parallel
-
-4. PROACTIVE ENRICHMENT: After confirming a correct answer, you may (briefly) add:
-   - "This word also pairs with..." (collocations)
-   - "You'll see this a lot in..." (context of use)
-   - "A common mistake is confusing this with..." (contrast)
-   - "Interesting fact: ..." (memorable hook)
-   Only add ONE of these per card — not all of them. Keep it conversational.
-
-5. SESSION PACING: You are aware of where the user is in their session (card index / total).
-   - On the last few cards: acknowledge they're almost done, keep energy up
-   - If they're early in a session: be more exploratory
-   - Never make them feel behind or overwhelmed
-
-LANGUAGE LEARNING SPECIFICS (apply when primary_topic or card content is a language):
+# Only for a language subject (ADR-055 §3): a chemistry card has no romaji.
+LANGUAGE_TUTOR_RULES = """
+LANGUAGE LEARNING SPECIFICS:
 - Always show the target word in the reply when giving examples (bold it or put it in context)
-- For Japanese/Chinese/Korean: include romaji/pinyin/romanization unless the user seems advanced
+- Give readings in the subject's own language: kana and romaji for Japanese, pinyin for Chinese,
+  romanization for Korean — never another language's reading for the same characters
 - Distinguish casual vs formal/polite forms when relevant
 - Common usage patterns are worth more than rare textbook examples
 """
 
 
 SMALL_TALK_RULES = """
-SMALL TALK & GREETINGS (highest priority — overrides IDENTITY RULES #2/#3 and QUIZ MODE below):
-- If the user's message is a simple greeting, farewell, or short social remark
-  (e.g. "Hola", "hi", "good morning", "thanks", "how are you", "lol", "ok"), respond
-  briefly and naturally to THAT message — a short, warm greeting back. Do NOT pivot
-  into a lesson, explanation, or example about the user's primary topic or interests,
-  even if earlier conversation history is about those topics.
-- In this case: do NOT call the `start_quiz` tool, and do NOT append a
-  [[QUIZ_OFFER:...]] marker — regardless of what was discussed earlier in this
-  conversation.
-- Only bring up study content, the user's interests, or a quiz offer if the user's
-  CURRENT message actually asks for help, study, practice, or references that topic.
-  A bare greeting is never, by itself, a reason to continue an earlier topic.
+SMALL TALK & GREETINGS (comes before the tutor and quiz rules below):
+- A greeting, thanks or short social remark ("hi", "Hola", "thanks", "ok") gets a short, warm
+  reply to THAT message. No lesson, no example, no quiz tool, no [[QUIZ_OFFER:...]] marker,
+  whatever earlier turns were about.
+- Bring up study content only when the current message asks for help or names the topic.
 """
 
 
 LANGUAGE_MIRRORING_RULES = """
-LANGUAGE MIRRORING (strict — applies to every reply):
-- Write ALL explanations, meta-commentary, encouragement, and follow-up questions
-  in the language the user's CURRENT message is written in. The message language is
-  the strongest signal — it overrides the interface language setting and the
-  language of the study material.
-- Study content in the language being studied (example sentences, vocabulary,
-  grammar demonstrations) stays in that target language — but EVERY such example
-  MUST be immediately followed by a translation into the user's language.
-  Example: the user asks in English for examples of a grammar point in the language
-  they are studying (e.g. Japanese) → give each example sentence in the target
-  language, follow it with its English translation, and write all explanations and
-  follow-up questions in English.
-- If the user writes their message IN the language being studied, respond fully in
-  that language — by writing in it they have opted into immersion, and no
-  translations are needed.
-- NEVER answer entirely in the target language when the user asked in another
-  language: a learner cannot understand an explanation written in the very
-  language they are trying to learn.
+LANGUAGE MIRRORING (every reply):
+- Write explanations, encouragement and questions in the language of the learner's CURRENT
+  message; it outranks the interface language and the study material's language.
+- Material in the language being studied (sentences, vocabulary, grammar) stays in that
+  language, each example followed by its translation into the learner's language.
+- If the learner writes IN the language being studied, answer fully in it, no translations.
+- Never answer only in the target language to a question asked in another: a learner cannot
+  read an explanation in the language they are still learning.
 """
 
 
@@ -1354,14 +1327,19 @@ def _build_system_prompt(
     pet_name: Optional[str] = None,
     pet_species: Optional[str] = None,
     rag_book_context: Optional[str] = None,
+    client: str = "web",
 ) -> str:
     """
     Construct a rich system prompt that makes the pet feel like it was
     born from the user's own data. All values come from the onboarding
     wizard fields stored in preferences.general and preferences.agent.
+
+    Order (ADR-055 §3): identity, priorities, the learner, style, rules,
+    format, tools for this client, and the subject last, nearest the question.
+    `client` is "web" or "phone"; the phone has no quiz, so it gets neither
+    the quiz contract nor, in the route, the quiz tool.
     """
     prefs = user.get("preferences", {}).get("general", {})
-    preferred_name = user.get("username", "there")
     primary_topic = prefs.get("primary_topic") or "general knowledge"
     interests = prefs.get("interests", [])
     study_goal = prefs.get("study_goal", "general")
@@ -1424,17 +1402,15 @@ def _build_system_prompt(
     if knowledge_access:
         tool_instructions = """
 
-KNOWLEDGE ACCESS RULES (you have tools — use them wisely):
-- When the user asks about their study progress, ALWAYS call get_study_summary first.
-- When the user asks "what books do I have" or "what decks do I have", call list_books or list_decks.
-- When the user wants to deep-dive into a SPECIFIC DECK and no card context is already available in CURRENT SCREEN CONTEXT, call get_deck_content.
-- CRITICAL: If CURRENT SCREEN CONTEXT already contains the card text (front/back), DO NOT call get_deck_content — you already have the information. Answer directly from the context.
-- CRITICAL: NEVER call get_deck_content when the user asks to study or quiz on a topic (e.g. "study Japanese verbs", "quiz me on history"). Only call it when the user explicitly names one of their own decks by name. Never guess or fabricate a deck_id — if you are unsure of the deck_id, call list_decks first. When quiz intent is detected, respond with one brief sentence and let the quiz system handle question generation.
-- When the user asks about their goals or annual plan, call get_annual_plan_context.
-- NEVER call get_user_interests — the user's interests, primary topic, and study goal are already present in this system prompt. Calling this tool mid-conversation is redundant and breaks the flow.
-- You MUST NEVER attempt to create, edit, or delete any data. You are read-only.
-- Tell the user to go to the Study Session to review cards — you cannot mark cards for them.
-- After calling a tool, synthesize the result naturally into your reply. Never dump raw data.
+KNOWLEDGE ACCESS RULES (read-only tools):
+- Progress questions: call get_study_summary first. "What books / decks do I have": list_books or list_decks.
+  Goals or the annual plan: get_annual_plan_context.
+- get_deck_content only when the learner names one of their own decks and the card text is not already in
+  CURRENT SCREEN CONTEXT; never for a topic to study or a quiz request; never with a guessed deck_id (call
+  list_decks first when unsure).
+- Never call get_user_interests: their interests are already above.
+- You cannot create, edit, delete or mark anything; send them to the study session to review cards.
+- Weave tool results into a natural reply; never dump raw data.
 """
     else:
         tool_instructions = """
@@ -1445,52 +1421,69 @@ KNOWLEDGE ACCESS (disabled):
   "AI Knowledge Access" in Settings to give you that ability.
 """
 
-    base_prompt = f"""You are the Nowry Study Buddy — a warm, curious, and deeply personalized AI
-learning companion. You are NOT a generic assistant. You were created specifically for {preferred_name}.
+    # One identity, said once (ADR-055 §3). The learner is not addressed by name:
+    # the only one on file is their username, which is a handle, not a name.
+    companion_name = pet_name or DEFAULT_PET_NAME
+    identity_block = (
+        f"You are {companion_name}, a warm, curious study companion in Nowry, made for this one learner. "
+        f"Always call yourself {companion_name}; never a generic assistant, never an AI model.\n"
+    )
+    if pet_species and pet_species in SPECIES_PERSONALITY_HINTS:
+        identity_block += SPECIES_PERSONALITY_HINTS[pet_species] + "\n"
 
-IDENTITY RULES (never break these):
-1. Always call the user "{preferred_name}" — never a generic "there" or "user".
-2. Your personality mirrors their interests: {interests_text}.
-   Use analogies, examples, and references from these fields whenever possible.
-3. Their primary learning focus is: {primary_topic}.
-   Prioritize this domain when generating examples or explanations.
-4. Their study goal is to {goal_description}.
-   Keep this goal in mind for motivation and long-term encouragement.
+    has_subject = screen_context is not None and screen_context.page in ("study_session", "book")
+    # Interests are for colour, never for the subject: a card's own content
+    # comes first, and a Japanese learner does not need a technology analogy.
+    interests_rule = (
+        f"- Only when the subject gives no example of its own, you may draw an analogy from their interests: {interests_text}."
+        if has_subject
+        else f"- Draw analogies and examples from their interests where it helps: {interests_text}."
+    )
 
-STYLE DIRECTIVES (highest priority — override default behavior):
+    base_prompt = f"""
+PRIORITY ORDER (when rules pull different ways):
+1. THE SUBJECT OF THIS CONVERSATION, at the end of this prompt, and its rule about hidden answers.
+2. The learner's current message.
+3. The style directives.
+4. Everything else.
+
+ABOUT THE LEARNER:
+- Their main study focus is {primary_topic}; their goal is to {goal_description}.
+{interests_rule}
+
+STYLE DIRECTIVES:
 {conciseness_directive}
 {tone_directive}
 
 {SMALL_TALK_RULES}
 BEHAVIORAL RULES:
 - You are encouraging but honest — never give empty praise.
-- If the user is struggling with a concept, use a concrete analogy from their interests.
-- Never break character or refer to yourself as an AI model. You are their Study Buddy.
+- If the learner is struggling with a concept, use one concrete analogy.
 - React naturally: celebrate milestones, gently nudge after inactivity.
 
 {TUTOR_RULES}
-{QUIZ_TRIGGER_RULES}
+{LANGUAGE_TUTOR_RULES if _is_language_subject(screen_context, study_goal) else ""}
+{QUIZ_TRIGGER_RULES if client == "web" else ""}
 {LANGUAGE_MIRRORING_RULES}
 {MARKDOWN_FORMAT_RULES}
 {tool_instructions}"""
-    identity_block = ""
-    if pet_name:
-        identity_block += (
-            f"Your name is {pet_name}. "
-            f"Always refer to yourself as {pet_name}. "
-            "Never call yourself 'Study Buddy' or any other name.\n"
-        )
-    if pet_species and pet_species in SPECIES_PERSONALITY_HINTS:
-        identity_block += SPECIES_PERSONALITY_HINTS[pet_species] + "\n"
 
     personality_block = STAGE_PERSONALITY.get(stage, STAGE_PERSONALITY[1])
     return (
         identity_block
         + base_prompt
         + f"\n\n{personality_block}"
-        + _build_context_injection(screen_context, rag_book_context=rag_book_context)
         + _build_language_directive(language)
+        # Last, nearest the question: what this conversation is about.
+        + _build_context_injection(screen_context, rag_book_context=rag_book_context)
     )
+
+
+def _is_language_subject(screen_context: Optional[ScreenContextPayload], study_goal: str) -> bool:
+    """Whether the language-learning rules apply: a language subject, or a learner whose goal is a language."""
+    if screen_context is not None and screen_context.language:
+        return True
+    return study_goal == "language"
 
 
 # ---------------------------------------------------------------------------
@@ -3688,6 +3681,7 @@ async def chat(
         pet_name=pet_name_custom,
         pet_species=pet_species_custom,
         rag_book_context=rag_book_context,
+        client=body.client,
     )
 
     history = history_for_llm
@@ -3709,7 +3703,7 @@ async def chat(
     # calls start_quiz with confidence="high". Read after agent_llm.chat() returns.
     quiz_result_holder: dict = {}
 
-    tools_for_call = (KNOWLEDGE_TOOLS if knowledge_access else []) + QUIZ_TOOLS
+    tools_for_call = (KNOWLEDGE_TOOLS if knowledge_access else []) + (QUIZ_TOOLS if body.client == "web" else [])
 
     # ── The ONE LLM call for this turn ────────────────────────────────────────
     turn_input = history + [{"role": "user", "content": body.message}]
