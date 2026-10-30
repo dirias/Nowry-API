@@ -31,7 +31,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from app.core.limiter import limiter
 from app.core.llm_timeouts import GEMINI_REQUEST_OPTIONS
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from app.auth.firebase_auth import get_firebase_user
@@ -116,6 +116,8 @@ class ScreenContextPayload(BaseModel):
     # study_session fields
     deck_id: Optional[str] = None
     deck_name: Optional[str] = None
+    # The card's own id: the key of its memory thread (CHAT-001)
+    card_id: Optional[str] = Field(default=None, max_length=64)
     card_index: Optional[int] = None
     total_cards: Optional[int] = None
     card_type: Optional[str] = None      # 'basic' | 'cloze' | 'quiz' | 'visual'
@@ -2179,25 +2181,73 @@ def _build_quiz_handoff_message(topic_label: str, language: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _load_persistent_history(user_id: str, limit: int = 20) -> list[dict]:
-    """Load last `limit` turns from MongoDB agent.chat_history (Plus/Pro only)."""
+#: Turns kept across every subject. Each thread is a slice of this, so it is
+#: larger than the 50 a single unscoped thread used to keep (ADR-055 §2).
+CHAT_HISTORY_KEPT = 200
+GENERAL_SUBJECT = "general"
+
+
+def _subject_of(ctx: Optional["ScreenContextPayload"]) -> tuple[str, str]:
+    """The thread a chat belongs to, as (key, title), from what the screen declared (ADR-055 §1–2).
+
+    A card chat is that card's thread; a session with no card id falls back to
+    its deck. Anything the screen did not name is General.
+    """
+    if ctx is None:
+        return GENERAL_SUBJECT, ""
+    if ctx.page == "study_session":
+        if ctx.card_id:
+            return f"card:{ctx.card_id}", (ctx.front or "")[:80]
+        if ctx.deck_id and ctx.deck_id != "daily-review":
+            return f"deck:{ctx.deck_id}", ctx.deck_name or ""
+    if ctx.page == "book" and ctx.book_id:
+        return f"book:{ctx.book_id}", ctx.book_title or ""
+    return GENERAL_SUBJECT, ""
+
+
+async def _load_persistent_history(user_id: str, limit: int = 20, subject: str = GENERAL_SUBJECT) -> list[dict]:
+    """The last `limit` turns of one subject's thread (Plus/Pro only).
+
+    Turns saved before threads existed carry no subject and belong to General,
+    so an old conversation never leaks into a card's chat (ADR-055 §2).
+    """
     doc = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
-        {"agent.chat_history": {"$slice": -limit}},
+        {"agent.chat_history": {"$slice": -CHAT_HISTORY_KEPT}},
     )
     raw = (doc or {}).get("agent", {}).get("chat_history", [])
-    return [{"role": entry["role"], "content": entry["content"]} for entry in raw]
+    thread = [entry for entry in raw if entry.get("subject", GENERAL_SUBJECT) == subject]
+    return [{"role": entry["role"], "content": entry["content"]} for entry in thread[-limit:]]
 
 
-async def _append_to_persistent_history(user_id: str, user_msg: str, model_reply: str) -> None:
-    """Append two turns to MongoDB and cap at 50 via $slice."""
+def _merge_history(saved: list[dict], session: list[dict]) -> list[dict]:
+    """The saved thread followed by this session's turns, each turn once.
+
+    The session's earlier turns were saved as they happened, so the saved
+    thread already ends with them; sending both gave the model every turn twice.
+    """
+    for overlap in range(min(len(saved), len(session)), 0, -1):
+        if saved[-overlap:] == session[:overlap]:
+            return saved + session[overlap:]
+    return saved + session
+
+
+async def _append_to_persistent_history(
+    user_id: str,
+    user_msg: str,
+    model_reply: str,
+    subject: str = GENERAL_SUBJECT,
+    subject_title: str = "",
+) -> None:
+    """Append two turns to their subject's thread, keeping the last CHAT_HISTORY_KEPT overall."""
     now = datetime.now(timezone.utc)
+    tag = {"subject": subject, "subject_title": subject_title}
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
         {"$push": {"agent.chat_history": {"$each": [
-            {"role": "user", "content": user_msg, "ts": now},
-            {"role": "model", "content": model_reply, "ts": now},
-        ], "$slice": -50}}},
+            {"role": "user", "content": user_msg, "ts": now, **tag},
+            {"role": "model", "content": model_reply, "ts": now, **tag},
+        ], "$slice": -CHAT_HISTORY_KEPT}}},
         upsert=True,
     )
 
@@ -3584,12 +3634,17 @@ async def chat(
             upsert=True,
         )
 
+    # The thread this chat belongs to (ADR-055 §2): memory, saving and the
+    # recent-threads list all key on it.
+    subject_key, subject_title = _subject_of(body.context)
+
     # Tier-gated memory: session-only for Free, persistent for Plus/Pro
     if plan_features.get("agent_persistent_memory"):
-        saved_history = await _load_persistent_history(user_id, limit=20)
-        history_for_llm = saved_history + [
-            {"role": msg.role, "content": msg.content} for msg in body.history[-10:]
-        ]
+        saved_history = await _load_persistent_history(user_id, limit=20, subject=subject_key)
+        history_for_llm = _merge_history(
+            saved_history,
+            [{"role": msg.role, "content": msg.content} for msg in body.history[-10:]],
+        )
     else:
         # Free: session-only — never load from MongoDB
         history_for_llm = [
@@ -3771,7 +3826,7 @@ async def chat(
 
     # Append to persistent history for Plus/Pro
     if plan_features.get("agent_persistent_memory"):
-        await _append_to_persistent_history(user_id, body.message, reply)
+        await _append_to_persistent_history(user_id, body.message, reply, subject_key, subject_title)
 
     # Track last interaction timestamp + award XP for engagement
     await users_collection.update_one(
