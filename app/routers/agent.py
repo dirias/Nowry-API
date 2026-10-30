@@ -52,7 +52,8 @@ from app.utils.agent_tools import (
     read_book_section,
 )
 
-from app.utils.agent_llm import agent_llm, ToolCallRejectedError
+from app.core import llm_health
+from app.utils.agent_llm import agent_llm, AllProvidersFailed, ToolCallRejectedError
 from app.core.model_config import TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
@@ -3509,6 +3510,27 @@ async def generate_animation(
     )
 
 
+async def _refund_chat_message(user_id: str, current_month: str) -> None:
+    """Give back the message a failed reply was charged (ADR-054 §6).
+
+    The count goes up before the model call so the cap stays race-safe; a
+    reply that never came must not use up the budget. Never below zero, and
+    never into a month the count has already rolled past.
+    """
+    try:
+        await users_collection.update_one(
+            {
+                "_id": ObjectId(user_id),
+                "agent.tracked_month": current_month,
+                "agent.messages_used_this_month": {"$gt": 0},
+            },
+            {"$inc": {"agent.messages_used_this_month": -1}},
+        )
+    except Exception as exc:
+        # The user already has an error; a failed refund must not replace it.
+        logger.warning(f"[SmartPet] message refund failed for {user_id}: {exc}")
+
+
 @router.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
 async def chat(
@@ -3701,10 +3723,22 @@ async def chat(
                     logger.warning(
                         f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"
                     )
+    except AllProvidersFailed as exc:
+        # Every provider is out or down: a code the clients translate, and
+        # when to try again (ADR-054). The message was not answered, so it is
+        # not charged.
+        logger.error(f"Agent Chat Error: {exc}", exc_info=True)
+        await _refund_chat_message(user_id, current_month)
+        raise HTTPException(
+            status_code=503,
+            detail="ai_unavailable",
+            headers={"Retry-After": str(int(llm_health.TRANSIENT_DOWN_SECONDS))},
+        )
     except Exception as exc:
         # Full details go to the log (and Sentry via the error handler) —
         # never into the client-facing detail string.
         logger.error(f"Agent Chat Error: {exc}", exc_info=True)
+        await _refund_chat_message(user_id, current_month)
         raise HTTPException(
             status_code=502,
             detail="AI service error. Please try again.",
