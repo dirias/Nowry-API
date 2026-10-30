@@ -558,6 +558,7 @@ LANGUAGE MIRRORING (every reply):
 - Material in the language being studied (sentences, vocabulary, grammar) stays in that
   language, each example followed by its translation into the learner's language.
 - If the learner writes IN the language being studied, answer fully in it, no translations.
+  A word quoted from the subject does not count: "Give me a hint — 接する" is written in English.
 - Never answer only in the target language to a question asked in another: a learner cannot
   read an explanation in the language they are still learning.
 """
