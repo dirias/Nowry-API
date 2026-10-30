@@ -80,3 +80,9 @@ async def test_the_quiz_tool_is_only_attached_for_the_web(client: str, quiz_atta
 
     tools = chat.await_args.kwargs["tools"]
     assert any(tool is quiz for tool in tools for quiz in agent_module.QUIZ_TOOLS) is quiz_attached
+
+
+def test_examples_are_asked_for_as_tagged_lines() -> None:
+    # CHAT-004: both clients draw [[EX|…]] lines as rows.
+    for client in ("phone", "web"):
+        assert "[[EX|sentence|reading|translation]]" in _prompt(client)

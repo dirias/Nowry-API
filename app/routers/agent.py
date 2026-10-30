@@ -512,14 +512,23 @@ LANGUAGE MIRRORING (every reply):
 """
 
 
+# Both clients draw these lines as rows the learner can hear and keep as a
+# card (CHAT-004, ADR-055 §5); `parseReply` in @nowry/core reads them.
+EXAMPLE_FORMAT_RULES = """
+EXAMPLE SENTENCES (strict format):
+- Put every example sentence on its own line, exactly as
+  [[EX|sentence|reading|translation]]
+  with the reading empty when the language needs none ([[EX|La casa es grande.||The house is big.]]),
+  and the translation in the learner's language. No bullet, number or bold around the tag.
+- Only real sentences or phrases in the subject's language go in a tag; explanations stay prose.
+"""
+
+
 MARKDOWN_FORMAT_RULES = """
-FORMATTING (chat bubble constraints — strict):
-- You may use ONLY this markdown subset: **bold**, *italics*, bullet lists,
-  numbered lists, and `inline code`.
-- NEVER use headers (#, ##, ...), tables, images, horizontal rules (---), or
-  fenced code blocks — they break the small chat bubble UI.
-- Keep replies compact and chat-sized: short paragraphs and short lists, never
-  document-style structure.
+FORMATTING (a small chat bubble):
+- Only **bold**, *italics*, bullet and numbered lists, and `inline code`; never headers, tables,
+  images, rules or code blocks.
+- Short paragraphs and short lists, never document-style structure.
 """
 
 
@@ -1497,6 +1506,7 @@ BEHAVIORAL RULES:
 {QUIZ_TRIGGER_RULES if client == "web" else ""}
 {LANGUAGE_MIRRORING_RULES}
 {MARKDOWN_FORMAT_RULES}
+{EXAMPLE_FORMAT_RULES}
 {tool_instructions}"""
 
     personality_block = STAGE_PERSONALITY.get(stage, STAGE_PERSONALITY[1])
