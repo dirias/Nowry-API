@@ -3672,9 +3672,14 @@ async def chat(
         user_message=body.message,  # threaded to the server-side quiz intent gate
     )
 
+    # Which provider answered, and whether it was the fallback (ADR-054).
+    answered_by: dict = {}
+
     try:
         with attrs_cm, gen_cm as turn_generation:
             # ── The ONE LLM call for this turn — executes exactly once ──────
+            # (a provider failure inside it moves to the next provider; that is
+            # still one call from here)
             reply = await agent_llm.chat(
                 message=body.message,
                 history=history,
@@ -3683,6 +3688,7 @@ async def chat(
                 tool_dispatcher=tool_dispatcher,
                 user_id=user_id,
                 tier=tier,
+                meta=answered_by,
             )
 
             # Record the result on the Langfuse generation, if one is active.
@@ -3690,7 +3696,7 @@ async def chat(
             # hand, so we log and continue — never re-invoke agent_llm.chat.
             if turn_generation is not None:
                 try:
-                    turn_generation.update(output=reply)  # D-13: full reply, no truncation
+                    turn_generation.update(output=reply, metadata=answered_by)  # D-13: full reply, no truncation
                 except Exception as langfuse_exc:
                     logger.warning(
                         f"[SmartPet] Langfuse tracing failed, continuing without trace: {langfuse_exc}"

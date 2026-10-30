@@ -56,8 +56,7 @@ def test_no_keys_is_an_error():
 
 
 def test_chat_passes_the_tier_to_the_provider_choice():
-    import inspect
-    from app.utils.agent_llm import AgentLLM
-
-    source = inspect.getsource(AgentLLM.chat)
-    assert "self._get_provider(tier)" in source
+    # The chain starts with the provider the tier is sold; AI-002 puts Groq behind Gemini.
+    llm = _llm(groq="g", gemini="m")
+    assert llm._provider_chain("pro") == ["gemini", "groq"]
+    assert llm._provider_chain("free") == ["groq"]

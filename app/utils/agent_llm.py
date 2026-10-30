@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import google.generativeai as genai
 from app.utils.logger import get_logger
+from app.core import llm_health
 from app.core.llm_timeouts import GEMINI_REQUEST_OPTIONS, bounded_groq
 from app.config.subscription_plans import AGENT_MODELS
 
@@ -25,6 +26,18 @@ class ToolCallRejectedError(Exception):
         self.tool_name = tool_name
         self.reason = reason
         super().__init__(f"{tool_name}: {reason}")
+
+
+class AllProvidersFailed(RuntimeError):
+    """No provider in the tier's chain could answer (ADR-054).
+
+    Every one either failed with a provider failure or was already marked down.
+    The route answers 503 ``ai_unavailable``; the cause is the last failure.
+    """
+
+    def __init__(self, providers: List[str]) -> None:
+        self.providers = providers
+        super().__init__(f"no provider could answer: {', '.join(providers)}")
 
 
 class AgentLLM:
@@ -141,13 +154,45 @@ class AgentLLM:
         tool_dispatcher: Optional[callable] = None,
         user_id: str = None,
         tier: str = None,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> str:
-        provider = self._get_provider(tier)
+        """Answer with the first provider in the tier's chain that can (ADR-054).
 
-        if provider == "gemini":
-            return await self._chat_gemini(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
-        else:
-            return await self._chat_groq(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
+        A provider failure (quota, 5xx, timeout) moves to the next provider and
+        marks the failed one down, so the next turn skips it without a call. Any
+        other error is the request's and is raised as is. ``meta``, when given,
+        is filled with the provider that answered and whether it was a fallback.
+        """
+        chain = self._provider_chain(tier)
+        last_failure: Optional[BaseException] = None
+        for index, provider in enumerate(chain):
+            if llm_health.is_down(provider):
+                continue
+            try:
+                if provider == "gemini":
+                    reply = await self._chat_gemini(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
+                else:
+                    reply = await self._chat_groq(message, history, system_prompt, tools, tool_dispatcher, user_id, tier=tier)
+            except Exception as exc:
+                if not llm_health.is_provider_failure(exc):
+                    raise
+                llm_health.mark_down(provider, exc)
+                logger.error("[llm] fallback: %s failed for %s-tier chat (%s): %s", provider, tier, type(exc).__name__, exc)
+                last_failure = exc
+                continue
+            if meta is not None:
+                meta["provider"] = provider
+                meta["fallback"] = index > 0
+            return reply
+        logger.error("[llm] all providers failed for %s-tier chat: %s", tier, chain)
+        raise AllProvidersFailed(chain) from last_failure
+
+    def _provider_chain(self, tier: Optional[str] = None) -> List[str]:
+        """The tier's provider, then Groq behind Gemini; never Gemini behind Groq (ADR-054 §4)."""
+        primary = self._get_provider(tier)
+        if primary == "gemini" and self.groq_api_key:
+            return ["gemini", "groq"]
+        return [primary]
 
     async def _chat_gemini(self, message, history, system_prompt, tools, tool_dispatcher, user_id, tier: str = None):
         # Resolve model based on tier — falls back to gemini-flash-latest for unknown/None tiers

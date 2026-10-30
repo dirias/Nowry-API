@@ -841,7 +841,8 @@ async def test_chat_happy_path_traces_smart_pet_chat_with_session_id(mock_langfu
     assert gen_kwargs["as_type"] == "generation"
 
     generation_ctx = mock_langfuse_client.start_as_current_observation.return_value.__enter__.return_value
-    generation_ctx.update.assert_called_once_with(output="Hello! How can I help you study today?")
+    # metadata carries the provider that answered (ADR-054); the mocked chat fills none
+    generation_ctx.update.assert_called_once_with(output="Hello! How can I help you study today?", metadata={})
 
     mock_append.assert_not_called()  # free tier — agent_persistent_memory feature is False
 
