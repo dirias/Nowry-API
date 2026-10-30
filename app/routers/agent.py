@@ -112,7 +112,8 @@ class ScreenContextPayload(BaseModel):
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
-    page: Literal['study_session', 'book', 'annual_planning', 'dashboard']
+    # 'deck', 'board', 'today' and 'plans' are the subjects beyond a card (CHAT-010).
+    page: Literal['study_session', 'book', 'annual_planning', 'dashboard', 'deck', 'board', 'today', 'plans']
     # study_session fields
     deck_id: Optional[str] = None
     deck_name: Optional[str] = None
@@ -136,6 +137,18 @@ class ScreenContextPayload(BaseModel):
     book_title: Optional[str] = None
     chapter_title: Optional[str] = None
     visible_text: Optional[str] = None   # max 500 chars
+    # deck fields (CHAT-010)
+    due_cards: Optional[int] = Field(default=None, ge=0)
+    new_cards: Optional[int] = Field(default=None, ge=0)
+    # board fields (CHAT-010)
+    board_id: Optional[str] = Field(default=None, max_length=64)
+    board_title: Optional[str] = Field(default=None, max_length=200)
+    note_text: Optional[str] = Field(default=None, max_length=1500)
+    # today fields (CHAT-010)
+    reviews_due: Optional[int] = Field(default=None, ge=0)
+    tasks_left: Optional[int] = Field(default=None, ge=0)
+    # plans fields (CHAT-010)
+    goal_title: Optional[str] = Field(default=None, max_length=200)
 
     @field_validator('visible_text')
     @classmethod
@@ -406,8 +419,46 @@ def _build_context_injection(
             f"Always be helpful and educational.\n"
         )
 
-    elif ctx.page == 'annual_planning':
-        return "\n\nCURRENT SCREEN CONTEXT:\nThe user is on their Annual Planning page."
+    elif ctx.page == 'deck':
+        counts = ", ".join(
+            part for part in (
+                f"{ctx.due_cards} due" if ctx.due_cards is not None else "",
+                f"{ctx.new_cards} new" if ctx.new_cards is not None else "",
+            ) if part
+        )
+        return (
+            f"\n\nTHE SUBJECT OF THIS CONVERSATION (CURRENT SCREEN CONTEXT):\n"
+            f"The learner is looking at their deck '{ctx.deck_name or 'a deck'}'"
+            + (f" ({counts})" if counts else "") + "."
+            + (f"\nActive deck ID: {ctx.deck_id}. Use it for get_deck_content; never guess another." if ctx.deck_id else "")
+            + _subject_facts(ctx)
+        )
+
+    elif ctx.page == 'board':
+        note = f"\nThe selected note:\n{ctx.note_text}" if ctx.note_text else ""
+        return (
+            f"\n\nTHE SUBJECT OF THIS CONVERSATION (CURRENT SCREEN CONTEXT):\n"
+            f"The learner is working on their board '{ctx.board_title or 'a board'}'.{note}"
+        )
+
+    elif ctx.page == 'today':
+        facts = ", ".join(
+            part for part in (
+                f"{ctx.reviews_due} reviews due" if ctx.reviews_due is not None else "",
+                f"{ctx.tasks_left} tasks left" if ctx.tasks_left is not None else "",
+            ) if part
+        )
+        return (
+            "\n\nTHE SUBJECT OF THIS CONVERSATION (CURRENT SCREEN CONTEXT):\n"
+            "The learner is looking at their day" + (f": {facts}" if facts else "") + "."
+        )
+
+    elif ctx.page in ('plans', 'annual_planning'):
+        goal = f" Goal on screen: '{ctx.goal_title}'." if ctx.goal_title else ""
+        return (
+            "\n\nTHE SUBJECT OF THIS CONVERSATION (CURRENT SCREEN CONTEXT):\n"
+            f"The learner is on their annual plan.{goal}"
+        )
 
     elif ctx.page == 'dashboard':
         return "\n\nCURRENT SCREEN CONTEXT:\nThe user is on the Study Center dashboard."
@@ -1471,7 +1522,7 @@ KNOWLEDGE ACCESS (disabled):
     if pet_species and pet_species in SPECIES_PERSONALITY_HINTS:
         identity_block += SPECIES_PERSONALITY_HINTS[pet_species] + "\n"
 
-    has_subject = screen_context is not None and screen_context.page in ("study_session", "book")
+    has_subject = screen_context is not None and screen_context.page not in ("dashboard",)
     # Interests are for colour, never for the subject: a card's own content
     # comes first, and a Japanese learner does not need a technology analogy.
     interests_rule = (
@@ -2236,6 +2287,14 @@ def _subject_of(ctx: Optional["ScreenContextPayload"]) -> tuple[str, str]:
             return f"deck:{ctx.deck_id}", ctx.deck_name or ""
     if ctx.page == "book" and ctx.book_id:
         return f"book:{ctx.book_id}", ctx.book_title or ""
+    if ctx.page == "deck" and ctx.deck_id:
+        return f"deck:{ctx.deck_id}", ctx.deck_name or ""
+    if ctx.page == "board" and ctx.board_id:
+        return f"board:{ctx.board_id}", ctx.board_title or ""
+    if ctx.page == "today":
+        return "today", ""
+    if ctx.page in ("plans", "annual_planning"):
+        return "plan", ctx.goal_title or ""
     return GENERAL_SUBJECT, ""
 
 
@@ -3613,6 +3672,45 @@ async def _refund_chat_message(user_id: str, current_month: str) -> None:
     except Exception as exc:
         # The user already has an error; a failed refund must not replace it.
         logger.warning(f"[SmartPet] message refund failed for {user_id}: {exc}")
+
+
+class ChatThread(BaseModel):
+    """One subject's thread, for the General chat's Continue list (CHAT-010)."""
+    subject: str
+    title: str
+    last_at: Optional[datetime] = None
+
+
+class ChatThreadsResponse(BaseModel):
+    threads: list[ChatThread]
+
+
+#: Threads listed under Continue; the General thread itself is never one of them.
+RECENT_THREADS = 5
+
+
+def _recent_threads(history: list[dict], limit: int = RECENT_THREADS) -> list[ChatThread]:
+    """The most recent subjects in a history, newest first, one entry each."""
+    seen: dict[str, ChatThread] = {}
+    for entry in reversed(history):
+        subject = entry.get("subject", GENERAL_SUBJECT)
+        if subject == GENERAL_SUBJECT or subject in seen:
+            continue
+        seen[subject] = ChatThread(subject=subject, title=entry.get("subject_title") or "", last_at=entry.get("ts"))
+        if len(seen) == limit:
+            break
+    return list(seen.values())
+
+
+@router.get("/threads", response_model=ChatThreadsResponse)
+async def get_chat_threads(current_user: dict = Depends(get_firebase_user)) -> ChatThreadsResponse:
+    """Recent subjects with a saved thread (Plus/Pro keep threads; Free has none)."""
+    doc = await users_collection.find_one(
+        {"_id": ObjectId(current_user.get("user_id"))},
+        {"agent.chat_history": {"$slice": -CHAT_HISTORY_KEPT}},
+    )
+    history = (doc or {}).get("agent", {}).get("chat_history", [])
+    return ChatThreadsResponse(threads=_recent_threads(history))
 
 
 @router.post("/chat", response_model=ChatResponse)
