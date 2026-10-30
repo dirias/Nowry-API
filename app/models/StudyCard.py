@@ -112,6 +112,10 @@ class StudyCard(BaseModel, SoftDeleteMixin):
     # card was made from. Set on create only, like the book's fields above.
     source_board_id: Optional[str] = None
     source_board_node_id: Optional[str] = None
+    # The card→chat link (CHAT-006, ADR-055 §5): the card a kept example sentence
+    # was asked about. Set on create only; stored, not shown on the card.
+    source_card_id: Optional[str] = Field(default=None, max_length=64)
+    source_card_title: Optional[str] = Field(default=None, max_length=100)
 
     # Quiz Specific Fields
     card_type: str = Field(default="flashcard")  # "flashcard", "quiz", "visual"
