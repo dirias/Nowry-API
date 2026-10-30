@@ -123,6 +123,9 @@ class ScreenContextPayload(BaseModel):
     card_type: Optional[str] = None      # 'basic' | 'cloze' | 'quiz' | 'visual'
     # The subject's language, a BCP 47 base code from the deck's voice settings (CHAT-003)
     language: Optional[str] = Field(default=None, max_length=16)
+    # How the card has gone (CHAT-003): recent lapses, and the last grade when the opener knows it
+    lapses: Optional[int] = Field(default=None, ge=0, le=1000)
+    last_grade: Optional[Literal['again', 'hard', 'good', 'easy']] = None
     is_flipped: Optional[bool] = None
     front: Optional[str] = None
     back: Optional[str] = None           # None when is_flipped is False
@@ -274,6 +277,33 @@ def _get_agent_prefs(user: dict) -> tuple[bool, bool, str, str]:
     )
 
 
+#: How each script-sharing language is read aloud in an example (CHAT-003).
+_READING_RULES: dict[str, str] = {
+    "ja": "give readings in kana and romaji, never pinyin",
+    "zh": "give readings in pinyin",
+    "ko": "give readings in revised romanization",
+}
+
+
+def _subject_facts(ctx: "ScreenContextPayload") -> str:
+    """The card's language and how it has gone, as lines under its front (CHAT-003).
+
+    The deck's language was never said, so a model reading 効果 alone answered
+    in Chinese; and the tutor rules about struggling had no grade to react to.
+    """
+    facts = ""
+    if ctx.language:
+        base = ctx.language.split("-")[0].lower()
+        name = LANGUAGE_NAMES.get(base, ctx.language)
+        rule = _READING_RULES.get(base)
+        facts += f"\nLanguage: {name}" + (f" ({rule})" if rule else "")
+    if ctx.last_grade:
+        facts += f"\nLast grade: {ctx.last_grade.capitalize()}"
+    if ctx.lapses:
+        facts += f"\nForgotten {ctx.lapses} time{'s' if ctx.lapses != 1 else ''} recently"
+    return facts
+
+
 def _build_context_injection(
     ctx: Optional[ScreenContextPayload],
     rag_book_context: Optional[str] = None,
@@ -305,6 +335,7 @@ def _build_context_injection(
         )
 
         content_block = f"Front: {ctx.front}" if ctx.front else ""
+        content_block += _subject_facts(ctx)
         if ctx.is_flipped and ctx.back:
             content_block += f"\nBack: {ctx.back}"
 
