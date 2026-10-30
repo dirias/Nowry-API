@@ -16,6 +16,8 @@ from app.models.Deck import Deck, DeckWithStats
 from app.models.StudyCard import RestBody
 from app.services.rest import SOURCE_DECK, awake_clause, now_naive as _rest_now, rest_many, resting_clause, spread_cards, until_or_indefinite, wake_many
 from app.models.deck_settings import (
+    DeckFieldResponse,
+    DeckFieldUpdate,
     DeckSettingsUpdate,
     DeckSettingsResponse,
     VoiceSettings,
@@ -30,6 +32,8 @@ from app.models.deck_config import (
     PaceMode,
     resolve_deck_budget,
 )
+from app.core.model_config import get_client_for_tier
+from app.services import deck_field
 from app.utils.logger import get_logger
 
 router = APIRouter(
@@ -708,3 +712,59 @@ async def update_deck_settings(
         public_metadata=pub_meta,
         updated_at=updated["updated_at"],
     )
+
+
+# ---------------------------------------------------------------------------
+# GET / PUT /decks/{deck_id}/field — the deck's field (CHAT-009, ADR-055 §6)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{deck_id}/field",
+    summary="The deck's field, guessed once and saved when nothing says it",
+    response_model=DeckFieldResponse,
+)
+async def get_deck_field(
+    deck_id: str,
+    collection: Collection = Depends(get_decks_collection),
+    deck: dict = Depends(require_ownership(get_decks_collection, "deck_id")),
+) -> DeckFieldResponse:
+    known = deck_field.resolve_known(deck)
+    if known:
+        return DeckFieldResponse(field=known[0], source=known[1])
+
+    deck_oid = ObjectId(deck["_id"])
+    cards = await cards_collection.find(
+        {"deck_id": {"$in": [deck_oid, str(deck_oid)]}, "deleted_at": None},
+        {"title": 1, "content": 1},
+    ).limit(deck_field.GUESS_SAMPLE_CARDS).to_list(length=deck_field.GUESS_SAMPLE_CARDS)
+
+    # Groq, the free tier's model: a one-word guess is not worth paid credit.
+    guessed = await deck_field.guess_field(deck, cards, get_client_for_tier("free"))
+    if guessed is None:
+        return DeckFieldResponse(field="general", source="default")
+
+    await collection.update_one({"_id": deck_oid}, {"$set": {"field_guess": guessed}})
+    return DeckFieldResponse(field=guessed, source="guess")
+
+
+@router.put(
+    "/{deck_id}/field",
+    summary="Set the deck's field, or clear the learner's choice",
+    response_model=DeckFieldResponse,
+)
+async def set_deck_field(
+    deck_id: str,
+    body: DeckFieldUpdate,
+    collection: Collection = Depends(get_decks_collection),
+    deck: dict = Depends(require_ownership(get_decks_collection, "deck_id")),
+) -> DeckFieldResponse:
+    deck_oid = ObjectId(deck["_id"])
+    if body.field is None:
+        await collection.update_one({"_id": deck_oid}, {"$unset": {"field": ""}})
+        deck = {**deck, "field": None}
+    else:
+        await collection.update_one({"_id": deck_oid}, {"$set": {"field": body.field}})
+        return DeckFieldResponse(field=body.field, source="learner")
+
+    known = deck_field.resolve_known(deck)
+    return DeckFieldResponse(field=known[0], source=known[1]) if known else DeckFieldResponse(field="general", source="default")

@@ -42,3 +42,14 @@ class DeckSettingsResponse(BaseModel):
     published_at: Optional[datetime] = None
     public_metadata: Optional[PublicMetadataInput] = None
     updated_at: datetime
+
+
+class DeckFieldResponse(BaseModel):
+    """A deck's field and where it came from (CHAT-009)."""
+    field: Literal["language", "math", "science", "certification", "concept", "general"]
+    source: Literal["learner", "language", "guess", "default"]
+
+
+class DeckFieldUpdate(BaseModel):
+    """The learner's choice of field; null hands it back to the voice language and the guess."""
+    field: Optional[Literal["language", "math", "science", "certification", "concept", "general"]] = None
