@@ -188,6 +188,8 @@ class AgentStateResponse(BaseModel):
     tier: str
     knowledge_access_enabled: bool
     proactive_nudging_enabled: bool
+    #: How the companion teaches (CHAT-012): the chat offers the other style per card (CHAT-014).
+    teaching_style: str = "show"
     current_xp: int = 0
     xp_for_next_level: int = 50
     level_progress: float = 0.0
@@ -262,8 +264,14 @@ class GenerateAnimationResponse(BaseModel):
 
 
 class NudgeResponse(BaseModel):
+    """A proactive nudge. The client writes the line from the facts, in the learner's language and tone (CHAT-015);
+    `nudge` is the English sentence older clients show."""
+
     nudge: Optional[str] = None
     has_nudge: bool
+    deck_name: Optional[str] = None
+    count: Optional[int] = None
+    tone: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -2986,7 +2994,7 @@ async def get_agent_state(
     messages_used: int = agent_data.get("messages_used_this_month", 0)
     preferred_name = user.get("username", "Learner")
 
-    knowledge_access, proactive_nudging, _ = _get_agent_prefs(user)
+    knowledge_access, proactive_nudging, style = _get_agent_prefs(user)
 
     prefs: dict = user.get("preferences", {}).get("agent", {})
     agent_roaming_enabled: bool = bool(prefs.get("roaming_enabled", True))
@@ -3023,6 +3031,7 @@ async def get_agent_state(
         preferred_name=preferred_name,
         tier=tier.value,
         knowledge_access_enabled=knowledge_access,
+        teaching_style=style.teaching,
         proactive_nudging_enabled=proactive_nudging,
         current_xp=xp,
         xp_for_next_level=_xp_for_next_level(xp),
@@ -3224,6 +3233,21 @@ async def get_journey(
     )
 
 
+def _nudge_from(pending_decks: list[dict], waiting: int, tone: str) -> NudgeResponse:
+    """The nudge's facts: the busiest deck's waiting cards, else all waiting cards (CHAT-015).
+
+    No handle in it: the only name on file is the username (ADR-055).
+    """
+    if pending_decks:
+        deck = pending_decks[0]
+        count = int(deck.get("due_cards", 0)) + int(deck.get("new_cards", 0))
+        name = deck["deck_name"]
+        sentence = f"'{name}' has {count} {'card' if count == 1 else 'cards'} waiting. Head to your Study Session when you're ready!"
+        return NudgeResponse(nudge=sentence, has_nudge=True, deck_name=name, count=count, tone=tone)
+    sentence = f"You have {waiting} {'card' if waiting == 1 else 'cards'} to review. Head to your Study Session when you're ready!"
+    return NudgeResponse(nudge=sentence, has_nudge=True, count=waiting, tone=tone)
+
+
 @router.get("/nudge", response_model=NudgeResponse)
 async def get_proactive_nudge(
     current_user: dict = Depends(get_firebase_user),
@@ -3238,7 +3262,7 @@ async def get_proactive_nudge(
     if not user:
         return NudgeResponse(has_nudge=False)
 
-    knowledge_access, proactive_nudging, _ = _get_agent_prefs(user)
+    knowledge_access, proactive_nudging, style = _get_agent_prefs(user)
 
     # Both must be on for a nudge to trigger
     if not knowledge_access or not proactive_nudging:
@@ -3246,7 +3270,6 @@ async def get_proactive_nudge(
 
     try:
         summary = await get_study_summary(user_id)
-        preferred_name = user.get("username", "there")
         due = summary.get("due_cards", 0)
         new = summary.get("new_cards", 0)
         pending_decks = summary.get("decks_with_pending_work", [])
@@ -3254,22 +3277,7 @@ async def get_proactive_nudge(
         if due == 0 and new == 0:
             return NudgeResponse(has_nudge=False)
 
-        # Build a concise, personal nudge message
-        if pending_decks:
-            top_deck = pending_decks[0]
-            deck_name = top_deck["deck_name"]
-            deck_due = top_deck["due_cards"]
-            deck_new = top_deck["new_cards"]
-            parts = []
-            if deck_due > 0:
-                parts.append(f"{deck_due} due")
-            if deck_new > 0:
-                parts.append(f"{deck_new} new")
-            nudge = f"Hey {preferred_name}! '{deck_name}' has {' and '.join(parts)} {'cards' if len(parts) > 1 else 'card'} waiting. Head to your Study Session when you're ready! 🎯"
-        else:
-            nudge = f"Hey {preferred_name}! You have {due} cards due for review. Go crush them in your Study Session! 💪"
-
-        return NudgeResponse(nudge=nudge, has_nudge=True)
+        return _nudge_from(pending_decks, due + new, style.tone)
 
     except Exception:
         return NudgeResponse(has_nudge=False)

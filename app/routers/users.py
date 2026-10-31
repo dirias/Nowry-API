@@ -63,6 +63,7 @@ from app.config.database import (
     blackboards_collection,
 )
 from app.auth.firebase_auth import get_firebase_user
+from app.services.companion_style import LEGACY_SOCRATIC, resolve_style
 
 router = APIRouter(
     prefix="/users",
@@ -231,7 +232,12 @@ class GeneralPreferencesUpdate(BaseModel):
     agent_tone: str | None = Field(
         default=None,
         pattern='^(friendly|professional|strict|socratic)$',
-        description="Controls the pet's personality style"
+        description="The companion's voice; 'socratic' is still accepted from older clients and read as friendly + guide (ADR-056)"
+    )
+    agent_teaching_style: str | None = Field(
+        default=None,
+        pattern='^(show|guide)$',
+        description="How the companion teaches: show (direct, default) or guide (a clue and a question first) (CHAT-012)"
     )
     agent_roaming_enabled: bool | None = Field(
         default=None,
@@ -291,6 +297,7 @@ class GeneralPreferencesResponse(BaseModel):
     agent_proactive_nudging: bool = False
     agent_conciseness: str = 'balanced'
     agent_tone: str = 'friendly'
+    agent_teaching_style: str = 'show'
     agent_roaming_enabled: bool = True
     agent_intervention_frequency: str = 'balanced'
     agent_focus_mode: bool = False
@@ -750,8 +757,7 @@ async def get_general_preferences(
         favorite_news=general_prefs.get("favorite_news", []),
         agent_knowledge_access=agent_prefs.get("knowledge_access", False),
         agent_proactive_nudging=agent_prefs.get("proactive_nudging", False),
-        agent_conciseness=agent_prefs.get("conciseness", "balanced"),
-        agent_tone=agent_prefs.get("tone", "friendly"),
+        **_style_response_fields(agent_prefs),
         agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", True)),
         agent_intervention_frequency=agent_prefs.get("intervention_frequency", "balanced"),
         agent_focus_mode=bool(agent_prefs.get("focus_mode", False)),
@@ -764,6 +770,28 @@ async def get_general_preferences(
         **_pomodoro_response_fields(pomodoro_prefs),
         updated_at=updated_at,
     )
+
+
+def _style_response_fields(agent_prefs: dict) -> dict:
+    """Length, tone and teaching style as the learner sees them: a stored 'socratic' reads as friendly + guide."""
+    style = resolve_style(agent_prefs)
+    return {
+        "agent_conciseness": style.conciseness,
+        "agent_tone": style.tone,
+        "agent_teaching_style": style.teaching,
+    }
+
+
+async def _keeps_socratic_method(user_id: str, data: "GeneralPreferencesUpdate") -> bool:
+    """Whether a new tone replaces 'socratic' for a learner who never chose a teaching style (ADR-056 §2).
+
+    Picking a voice must not silently drop the method that 'socratic' meant.
+    """
+    if "agent_tone" not in data.model_fields_set or "agent_teaching_style" in data.model_fields_set:
+        return False
+    user = await users_collection.find_one({"_id": ObjectId(user_id)}, {"preferences.agent": 1})
+    agent_prefs = (user or {}).get("preferences", {}).get("agent", {})
+    return agent_prefs.get("tone") == LEGACY_SOCRATIC and not agent_prefs.get("teaching_style")
 
 
 @router.put("/preferences/general", response_model=GeneralPreferencesResponse)
@@ -790,6 +818,7 @@ async def update_general_preferences(
         "agent_proactive_nudging":             "preferences.agent.proactive_nudging",
         "agent_conciseness":                   "preferences.agent.conciseness",
         "agent_tone":                          "preferences.agent.tone",
+        "agent_teaching_style":                "preferences.agent.teaching_style",
         "agent_roaming_enabled":               "preferences.agent.roaming_enabled",
         "agent_intervention_frequency":        "preferences.agent.intervention_frequency",
         "agent_focus_mode":                    "preferences.agent.focus_mode",
@@ -812,6 +841,8 @@ async def update_general_preferences(
     for field_name, db_path in field_map.items():
         if field_name in data.model_fields_set:
             set_doc[db_path] = getattr(data, field_name)
+    if await _keeps_socratic_method(user_id, data):
+        set_doc["preferences.agent.teaching_style"] = "guide"
 
     # Defensive sync: primary_topic and interests[0] drifted apart in the previous
     # wizard because they were two independent questions. Deriving here guarantees
@@ -841,8 +872,7 @@ async def update_general_preferences(
         favorite_news=general_prefs.get("favorite_news", []),
         agent_knowledge_access=agent_prefs.get("knowledge_access", False),
         agent_proactive_nudging=agent_prefs.get("proactive_nudging", False),
-        agent_conciseness=agent_prefs.get("conciseness", "balanced"),
-        agent_tone=agent_prefs.get("tone", "friendly"),
+        **_style_response_fields(agent_prefs),
         agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", True)),
         agent_intervention_frequency=agent_prefs.get("intervention_frequency", "balanced"),
         agent_focus_mode=bool(agent_prefs.get("focus_mode", False)),
