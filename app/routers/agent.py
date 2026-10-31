@@ -53,6 +53,7 @@ from app.utils.agent_tools import (
 )
 
 from app.core import llm_health
+from app.services.companion_style import CompanionStyle, resolve_style, style_section
 from app.utils.agent_llm import agent_llm, AllProvidersFailed, ToolCallRejectedError
 from app.core.model_config import TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
@@ -279,14 +280,13 @@ def _resolve_tier(user: dict) -> SubscriptionTier:
         return SubscriptionTier.FREE
 
 
-def _get_agent_prefs(user: dict) -> tuple[bool, bool, str, str]:
-    """Return (knowledge_access_enabled, proactive_nudging_enabled, conciseness, tone)."""
+def _get_agent_prefs(user: dict) -> tuple[bool, bool, CompanionStyle]:
+    """Return (knowledge_access_enabled, proactive_nudging_enabled, the learner's style)."""
     agent_prefs = user.get("preferences", {}).get("agent", {})
     return (
         bool(agent_prefs.get("knowledge_access", False)),
         bool(agent_prefs.get("proactive_nudging", False)),
-        agent_prefs.get("conciseness", "balanced"),
-        agent_prefs.get("tone", "friendly"),
+        resolve_style(agent_prefs),
     )
 
 
@@ -352,14 +352,10 @@ def _build_context_injection(
         if ctx.is_flipped and ctx.back:
             content_block += f"\nBack: {ctx.back}"
 
-        hint_rule = (
-            "\nIMPORTANT: If the user asks for the answer and is_flipped is False, "
-            "do NOT reveal it. Guide them with a Socratic hint instead."
-        ) if not ctx.is_flipped else ""
+        hint_rule = FRONT_SIDE_RULE if not ctx.is_flipped else ""
 
         tutor_hint = (
-            "\nTUTOR MODE ACTIVE: You have full card content available above. "
-            "Answer questions about this card directly from this context — no tool calls needed for this card's content. "
+            "\nTUTOR MODE: Answer about this card from the content above; no tool call needed. "
         )
         if ctx.is_flipped and ctx.back:
             if ctx.mode == 'browse':
@@ -377,7 +373,7 @@ def _build_context_injection(
                 )
         else:
             tutor_hint += (
-                "The answer is not yet revealed. Guide the user toward it — don't spoil it."
+                "The answer is not yet revealed: teach around it (see HIDDEN ANSWER)."
             )
 
         deck_ref_block = ""
@@ -523,18 +519,25 @@ TUTOR BEHAVIOR (always active):
   history.
 - When the subject says the last grade was Again or Hard, or the learner is struggling: coach,
   don't correct. Say why the answer is what it is, give one analogy or real use that makes it
-  stick, and end with a short question that helps it settle.
+  stick, and close with one line that makes it settle.
 - When the answer is showing and they ask for more, add ONE enrichment, not several: a
   collocation, where it is used, a common confusion, or a memorable fact.
-- Pacing: near the end of a session, keep energy up; early on, be more exploratory; never make
-  them feel behind.
+- Never make them feel behind.
 """
+
+
+#: A card's front (ADR-056 §4): only the meaning is held back; everything else is taught.
+FRONT_SIDE_RULE = (
+    "\nHIDDEN ANSWER: Never state the back or translate the front until the card is turned. Teach everything "
+    "else: a sentence using it, with its reading (the translation only in the [[EX]] field; the app hides it), "
+    "its parts, a clue. Asked for the answer: it is one tap away, turn the card."
+)
 
 
 # Only for a language subject (ADR-055 §3): a chemistry card has no romaji.
 LANGUAGE_TUTOR_RULES = """
 LANGUAGE LEARNING SPECIFICS:
-- Always show the target word in the reply when giving examples (bold it or put it in context)
+- Every example uses the target word
 - Give readings in the subject's own language: kana and romaji for Japanese, pinyin for Chinese,
   romanization for Korean — never another language's reading for the same characters
 - Distinguish casual vs formal/polite forms when relevant
@@ -559,8 +562,7 @@ LANGUAGE MIRRORING (every reply):
   language, each example followed by its translation into the learner's language.
 - If the learner writes IN the language being studied, answer fully in it, no translations.
   A word quoted from the subject does not count: "Give me a hint — 接する" is written in English.
-- Never answer only in the target language to a question asked in another: a learner cannot
-  read an explanation in the language they are still learning.
+- Never explain only in the target language: they are still learning it.
 """
 
 
@@ -654,40 +656,6 @@ QUIZ MODE — TOOL USE CONTRACT:
 """
 
 
-STAGE_PERSONALITY: dict[int, str] = {
-    1: (
-        "Your current personality style: You are tentative and inquisitive. "
-        "Ask at least one follow-up question per reply. Keep sentences short (under 15 words). "
-        "End messages with a small question or uncertainty marker."
-    ),
-    2: (
-        "Your current personality style: You are warm and energized. "
-        "Mirror the user's enthusiasm when detected. Use bullet lists when helpful. "
-        "Reference one of the user's stated interests per session."
-    ),
-    3: (
-        "Your current personality style: You are confident and playful. "
-        "Offer one brief unsolicited study tip per conversation. Use analogies freely. "
-        "Occasionally acknowledge how far the user has come."
-    ),
-    4: (
-        "Your current personality style: You are strategic and measured. "
-        "Prioritize long-term thinking. Every sentence serves a purpose — no filler. "
-        "Reference the user's stated study goal when giving advice."
-    ),
-    5: (
-        "Your current personality style: You are philosophical. "
-        "Connect concepts across domains. Use Socratic framing by default. "
-        "Reference the arc of the user's learning journey."
-    ),
-    6: (
-        "Your current personality style: You are sparse and precise. "
-        "Speak only when the contribution is meaningful. Maximum 2 sentences for simple questions. "
-        "Treat the user as a peer learner, not a student."
-    ),
-}
-
-
 SPECIES_PERSONALITY_HINTS: dict[str, str] = {
     "spiral": (
         "You think in cycles: every return is a step further out. "
@@ -695,11 +663,11 @@ SPECIES_PERSONALITY_HINTS: dict[str, str] = {
     ),
     "owl": (
         "You carry the quiet wisdom of a scholar. "
-        "You prefer depth over speed, and you gently guide the user toward understanding rather than just answers."
+        "You prefer depth over speed: you make sure the user understands why, not just what."
     ),
     "fox": (
         "You are sharp, curious, and socially perceptive. "
-        "You often spot the angle others miss, and you ask questions that make the user rethink their assumptions."
+        "You often spot the angle others miss, and you point it out."
     ),
     "cat": (
         "You are creative and independent-minded. "
@@ -1411,8 +1379,7 @@ async def _call_fal_animation(image_url: str, motion_prompt: str, seed: int = 0)
 def _build_system_prompt(
     user: dict,
     knowledge_access: bool,
-    conciseness: str = "balanced",
-    tone: str = "friendly",
+    style: CompanionStyle = CompanionStyle(),
     screen_context: Optional[ScreenContextPayload] = None,
     stage: int = 1,
     language: str = 'en',
@@ -1446,49 +1413,6 @@ def _build_system_prompt(
         "hobby":    "deepen a personal passion",
     }
     goal_description = study_goal_map.get(study_goal, "learn effectively")
-
-    # ── Conciseness directive ──────────────────────────────────────────────
-    conciseness_rules = {
-        "concise": (
-            "RESPONSE LENGTH: Be extremely brief. 1–2 sentences maximum per reply. "
-            "Skip all preamble, headers, and bullet lists unless absolutely essential. "
-            "Every word must earn its place."
-        ),
-        "balanced": (
-            "RESPONSE LENGTH: Keep replies concise but complete — 2–4 sentences for simple questions, "
-            "a short paragraph or bullet list for complex ones. Never pad your answer."
-        ),
-        "detailed": (
-            "RESPONSE LENGTH: The user wants thorough explanations. "
-            "Use structured replies with clear sections, examples, and analogies. "
-            "Anticipate follow-up questions and address them proactively."
-        ),
-    }
-    conciseness_directive = conciseness_rules.get(conciseness, conciseness_rules["balanced"])
-
-    # ── Tone directive ─────────────────────────────────────────────────────
-    tone_rules = {
-        "friendly": (
-            "TONE: Warm, encouraging, and conversational. Use the user's first name naturally. "
-            "Celebrate small wins. Add occasional light humor or emoji where it feels natural."
-        ),
-        "professional": (
-            "TONE: Polished and precise. Communicate like a knowledgeable academic tutor. "
-            "No emoji, no filler words. Focus on clarity and accuracy above all."
-        ),
-        "strict": (
-            "TONE: Direct and firm. If the user has cards due or goals falling behind, say it plainly. "
-            "Do not soften feedback. Prioritize accountability over comfort. "
-            "Celebrate real achievements only — no empty encouragement."
-        ),
-        "socratic": (
-            "TONE: Never give the answer directly. Always respond to factual questions with a guiding question "
-            "that helps the user arrive at the answer themselves. "
-            "Only confirm or correct after they have attempted an answer. "
-            "Exception: for progress/stats queries, still state the facts clearly."
-        ),
-    }
-    tone_directive = tone_rules.get(tone, tone_rules["friendly"])
 
     tool_instructions = ""
     if knowledge_access:
@@ -1543,15 +1467,12 @@ ABOUT THE LEARNER:
 - Their main study focus is {primary_topic}; their goal is to {goal_description}.
 {interests_rule}
 
-STYLE DIRECTIVES:
-{conciseness_directive}
-{tone_directive}
+STYLE DIRECTIVES (the learner's settings):
+{style_section(style, stage)}
 
 {SMALL_TALK_RULES}
 BEHAVIORAL RULES:
 - You are encouraging but honest — never give empty praise.
-- If the learner is struggling with a concept, use one concrete analogy.
-- React naturally: celebrate milestones, gently nudge after inactivity.
 
 {TUTOR_RULES}
 {LANGUAGE_TUTOR_RULES if _is_language_subject(screen_context, study_goal) else ""}
@@ -1561,11 +1482,9 @@ BEHAVIORAL RULES:
 {EXAMPLE_FORMAT_RULES}
 {tool_instructions}"""
 
-    personality_block = STAGE_PERSONALITY.get(stage, STAGE_PERSONALITY[1])
     return (
         identity_block
         + base_prompt
-        + f"\n\n{personality_block}"
         + _build_language_directive(language)
         # Last, nearest the question: what this conversation is about.
         + _build_context_injection(screen_context, rag_book_context=rag_book_context)
@@ -3067,7 +2986,7 @@ async def get_agent_state(
     messages_used: int = agent_data.get("messages_used_this_month", 0)
     preferred_name = user.get("username", "Learner")
 
-    knowledge_access, proactive_nudging, _, __ = _get_agent_prefs(user)
+    knowledge_access, proactive_nudging, _ = _get_agent_prefs(user)
 
     prefs: dict = user.get("preferences", {}).get("agent", {})
     agent_roaming_enabled: bool = bool(prefs.get("roaming_enabled", True))
@@ -3319,7 +3238,7 @@ async def get_proactive_nudge(
     if not user:
         return NudgeResponse(has_nudge=False)
 
-    knowledge_access, proactive_nudging, _, __ = _get_agent_prefs(user)
+    knowledge_access, proactive_nudging, _ = _get_agent_prefs(user)
 
     # Both must be on for a nudge to trigger
     if not knowledge_access or not proactive_nudging:
@@ -3785,7 +3704,7 @@ async def chat(
         ]
 
     # Privacy gate: check knowledge access preference
-    knowledge_access, _, conciseness, tone = _get_agent_prefs(user)
+    knowledge_access, _, style = _get_agent_prefs(user)
 
     # Build system prompt (includes knowledge access, style directives, screen context, and stage)
     agent_data = user.get("agent", {})
@@ -3813,8 +3732,7 @@ async def chat(
     system_prompt = _build_system_prompt(
         user,
         knowledge_access,
-        conciseness,
-        tone,
+        style,
         screen_context=body.context,
         stage=current_stage,
         language=body.language,
