@@ -22,7 +22,8 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.auth.firebase_auth import get_firebase_user
-from app.config.database import ai_quiz_sessions_collection, cards_collection, decks_collection, quiz_sessions_collection, study_sessions_collection
+from app.config.database import ai_quiz_sessions_collection, cards_collection, decks_collection, quiz_sessions_collection, study_sessions_collection, users_collection
+from app.services.companion_style import feedback_style_line, resolve_style
 from app.core.limiter import limiter
 from app.core.llm_timeouts import bounded_groq
 from app.models.quiz import (
@@ -187,6 +188,17 @@ async def _build_question(
     )
 
 
+async def _learner_style_line(user_id: str) -> str:
+    """The learner's tone and reply length for quiz feedback (CHAT-016, ADR-056 §6)."""
+    user = await users_collection.find_one({"_id": ObjectId(user_id)}, {"preferences.agent": 1})
+    return feedback_style_line(resolve_style((user or {}).get("preferences", {}).get("agent", {})))
+
+
+def _style_section(style_line: str) -> str:
+    """The style block for an evaluation prompt; empty when no learner style is known."""
+    return f"LEARNER'S STYLE (within the feedback rules below):\n{style_line}\n\n" if style_line else ""
+
+
 async def _evaluate_answer(
     card: dict,
     question_text: str,
@@ -195,6 +207,7 @@ async def _evaluate_answer(
     attempt_number: int,
     client: Groq,
     conversation_history: list[ConversationMessage] | None = None,
+    style_line: str = "",
 ) -> dict:
     """
     Call Claude to evaluate a student's answer.
@@ -231,7 +244,7 @@ EVALUATION RULES:
 - Mark INCORRECT only when the answer is factually or conceptually wrong.
 - For multiple_choice: only accept the correct option.
 
-FEEDBACK RULES:
+{_style_section(style_line)}FEEDBACK RULES:
 - Never open with filler ("Great job!", "Let's explore", "Don't worry", "That's okay").
 - Correct: one sentence confirmation + one optional insight relevant to the domain.
 - Incorrect/partial: state what the correct answer actually IS, explain what it means in domain context, and briefly contrast it with what the student said.
@@ -578,6 +591,7 @@ async def _evaluate_ai_answer(
     conversation_history: list[ConversationMessage] | None = None,
     language: str = "en",
     rubric: str = "",
+    style_line: str = "",
 ) -> dict:
     """
     Evaluate a user's answer against an AI quiz question's correct answer.
@@ -623,7 +637,7 @@ EVALUATION RULES:
 6. INCORRECT: only when the answer is factually or conceptually wrong — not just differently expressed.
 7. MULTIPLE CHOICE: accept only the correct option.
 
-FEEDBACK RULES:
+{_style_section(style_line)}FEEDBACK RULES:
 - Never open with filler ("Great job!", "Let's explore", "Don't worry", "Nice try").
 - Correct: one sentence confirmation + one optional domain-relevant insight.
 - Incorrect/partial: state what the correct answer IS, explain what it means in the domain context, and contrast with what the student said.
@@ -812,6 +826,7 @@ async def _handle_ai_quiz_answer(
             conversation_history=body.conversation_history,
             language=ai_session.get("language", "en"),
             rubric=current_question.get("rubric", ""),
+            style_line=await _learner_style_line(user_id),
         )
 
     response_type: str = eval_result["response_type"]
@@ -1034,6 +1049,7 @@ async def submit_quiz_answer(
             attempt_number=body.attempt_number,
             client=client,
             conversation_history=body.conversation_history,
+            style_line=await _learner_style_line(user_id),
         )
 
     response_type: str = eval_result["response_type"]
