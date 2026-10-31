@@ -188,6 +188,17 @@ async def _select_session_cards(
     return new_cards_raw, review_cards_raw
 
 
+def _session_order(new_cards: list, review_cards: list) -> list:
+    """Reviews first, most overdue first, then new cards (STUDY-008, ADR-057 §1).
+
+    A learner who stops early has kept what they were about to forget before
+    meeting anything new. Reviews from several decks (the daily review) are
+    merged by `next_review`, not left deck by deck.
+    """
+    reviews = sorted(review_cards, key=lambda c: c.get("next_review") or datetime.min)
+    return reviews + list(new_cards)
+
+
 def _get_deck_budget(deck_doc: dict) -> tuple[int, int]:
     """Return (new_per_day, max_reviews_per_day) from a deck document.
 
@@ -900,13 +911,15 @@ async def get_daily_review_cards(
         all_new.extend(new_raw)
         all_review.extend(review_raw)
 
+    # Most overdue first across decks, so a limit keeps the cards most at risk.
+    all_review = _session_order([], all_review)
     if limit is not None and len(all_new) + len(all_review) > limit:
         # Due first, then new, on the pool already selected and stamped above.
         keep_review = all_review[:limit]
         keep_new = all_new[: max(0, limit - len(keep_review))]
         all_review, all_new = keep_review, keep_new
 
-    cards = all_new + all_review
+    cards = _session_order(all_new, all_review)
     for c in cards:
         c["_id"] = str(c["_id"])
         if c.get("deck_id"):
@@ -1402,7 +1415,7 @@ async def list_study_cards(
             narrow={"tags": {"$in": tags}} if tags else None,
         )
 
-        cards = new_cards_raw + review_cards_raw
+        cards = _session_order(new_cards_raw, review_cards_raw)
         for c in cards:
             c["_id"] = str(c["_id"])
             if c.get("deck_id"):

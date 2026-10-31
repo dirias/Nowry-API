@@ -245,7 +245,8 @@ async def test_daily_review_limit_keeps_due_first_and_never_widens_the_selection
     assert full.json()["total"] == 7
     body = capped.json()
     assert body["total"] == 5
-    assert [c["title"] for c in body["cards"]] == ["c1", "c4", "c5", "c6", "c7"], "all four due cards, then one new; session order unchanged"
+    # Reviews first, then new (STUDY-008, ADR-057 §1).
+    assert [c["title"] for c in body["cards"]] == ["c4", "c5", "c6", "c7", "c1"], "all four due cards, then one new"
     assert calls[0]["narrow"] is None
     assert calls[1]["narrow"] == {"tags": {"$in": ["verbs"]}}, "tags narrow the pool the budgets draw from"
 
