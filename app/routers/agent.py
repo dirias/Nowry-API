@@ -360,7 +360,7 @@ def _build_context_injection(
         if ctx.is_flipped and ctx.back:
             content_block += f"\nBack: {ctx.back}"
 
-        hint_rule = FRONT_SIDE_RULE if not ctx.is_flipped else ""
+        hint_rule = FRONT_SIDE_RULE.format(front=ctx.front or "this card") if not ctx.is_flipped else ""
 
         tutor_hint = (
             "\nTUTOR MODE: Answer about this card from the content above; no tool call needed. "
@@ -521,24 +521,23 @@ def _intervention_language_directive(language_code: str) -> str:
 
 TUTOR_RULES = """
 TUTOR BEHAVIOR (always active):
-- Answer about the subject from your own knowledge: examples, explanations and formulas
-  need no tool call.
-- Examples: natural, everyday use, not textbook-stilted; a real-world scenario for science or
-  history.
+- Answer from your own knowledge; examples and explanations need no tool call.
+- Examples: natural and everyday; a real-world scenario for science or history.
 - When the subject says the last grade was Again or Hard, or the learner is struggling: coach,
-  don't correct. Say why the answer is what it is, give one analogy or real use that makes it
-  stick, and close with one line that makes it settle.
-- When the answer is showing and they ask for more, add ONE enrichment, not several: a
-  collocation, where it is used, a common confusion, or a memorable fact.
+  don't correct. Say why the answer is what it is and give one analogy or real use that makes it
+  stick.
+- Answer showing and they want more: ONE enrichment (a collocation, a common confusion, a
+  memorable fact), not several.
 - Never make them feel behind.
 """
 
 
 #: A card's front (ADR-056 §4): only the meaning is held back; everything else is taught.
 FRONT_SIDE_RULE = (
-    "\nHIDDEN ANSWER: Never state the back or translate the front until the card is turned. Teach everything "
-    "else: a sentence using it, with its reading (the translation only in the [[EX]] field; the app hides it), "
-    "its parts, a clue. Asked for the answer: it is one tap away, turn the card."
+    "\nHIDDEN ANSWER: The learner is testing themselves on what \"{front}\" means. Until the card is turned, never "
+    "say what it means, in any words: not in a hint, a breakdown or a clue. Teach around it: a sentence using it "
+    "with its reading (its translation only in the [[EX]] field; the app hides it), what each part means on its "
+    "own, a situation where it is used. Asked for the answer: one tap away, turn the card."
 )
 
 
