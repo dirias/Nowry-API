@@ -32,6 +32,8 @@ from app.config.subscription_plans import AI_USAGE_LIMITS, FREE_PER_CALL, SUBSCR
 APP = Path(__file__).resolve().parents[1] / "app"
 USER = "507f1f77bcf86cd799439011"
 NOW = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+#: A usage window still open whenever the suite runs; a real date here expired on 2026-11-01 and broke CI.
+OPEN_UNTIL = datetime(2099, 1, 1, tzinfo=timezone.utc)
 
 
 # ── 1. The table ─────────────────────────────────────────────────────────────
@@ -69,7 +71,7 @@ def _users(sub, updated=None):
 async def test_a_call_under_the_ceiling_is_counted_conditionally():
     from app.auth import dependencies
 
-    users = _users({"tier": "free", "ai_usage_count": 3, "ai_usage_reset_date": datetime(2026, 11, 1, tzinfo=timezone.utc)},
+    users = _users({"tier": "free", "ai_usage_count": 3, "ai_usage_reset_date": OPEN_UNTIL},
                    updated={"_id": ObjectId(USER), "subscription": {"tier": "free", "ai_usage_count": 4}})
     with patch.object(dependencies, "users_collection", users):
         user = await dependencies.track_ai_usage({"user_id": USER})
@@ -83,14 +85,14 @@ async def test_a_call_under_the_ceiling_is_counted_conditionally():
 async def test_a_call_past_the_ceiling_is_refused_and_not_counted():
     from app.auth import dependencies
 
-    users = _users({"tier": "free", "ai_usage_count": 50, "ai_usage_reset_date": datetime(2026, 11, 1, tzinfo=timezone.utc)}, updated=None)
+    users = _users({"tier": "free", "ai_usage_count": 50, "ai_usage_reset_date": OPEN_UNTIL}, updated=None)
     with patch.object(dependencies, "users_collection", users):
         with pytest.raises(HTTPException) as raised:
             await dependencies.track_ai_usage({"user_id": USER})
     assert raised.value.status_code == 429
     assert raised.value.detail["code"] == dependencies.AI_LIMIT_REACHED_CODE
     assert raised.value.detail["limit"] == 50
-    assert raised.value.detail["resets_at"].startswith("2026-11-01")
+    assert raised.value.detail["resets_at"].startswith("2099-01-01")
 
 
 @pytest.mark.asyncio
@@ -110,7 +112,7 @@ async def test_the_window_rolls_when_its_end_has_passed():
 async def test_no_ceiling_means_no_condition():
     from app.auth import dependencies
 
-    users = _users({"tier": "pro", "ai_usage_count": 5000, "ai_usage_reset_date": datetime(2026, 11, 1, tzinfo=timezone.utc)},
+    users = _users({"tier": "pro", "ai_usage_count": 5000, "ai_usage_reset_date": OPEN_UNTIL},
                    updated={"_id": ObjectId(USER), "subscription": {"tier": "pro"}})
     with patch.object(dependencies, "users_collection", users), patch.dict(dependencies.__dict__, {}):
         with patch("app.config.subscription_plans.AI_USAGE_LIMITS", {**AI_USAGE_LIMITS, SubscriptionTier.PRO: -1}):
