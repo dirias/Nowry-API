@@ -2330,7 +2330,14 @@ class InterventionRequest(BaseModel):
     streak_count: Optional[int] = None
     # --- Phase 3 new fields ---
     session_duration_minutes: Optional[int] = None   # for session_summary LLM context
-    days_since_last_session: Optional[int] = None    # for re_engagement (client hint)
+    days_since_last_session: Optional[int] = None    # for re_engagement, and the summary's break (END-004)
+    # --- The session's end (ADR-060 §4, END-004): the signals, not the count.
+    # One line per family or card as the screen reads it, with its mark
+    # ("験 family · 5 slipped · fast & wrong"), in the learner's language; the
+    # score as the screen shows it. The model is told the screen already shows
+    # the numbers, and answers NONE when the lines say nothing beyond them. ---
+    session_signal_lines: Optional[list[str]] = Field(default=None, max_length=8)
+    session_score: Optional[int] = Field(default=None, ge=0, le=100)
 
     @model_validator(mode='after')
     def check_required_fields(self) -> 'InterventionRequest':
@@ -2409,31 +2416,21 @@ def _build_wrong_answer_message(body: InterventionRequest) -> str:
 
 def _build_session_summary_message(body: InterventionRequest) -> str:
     """
-    Rule-based diagnostic. No praise. No exclamation points. Max 2 sentences.
+    Rule-based note for the session's end. No praise, no exclamation points,
+    at most 2 sentences, and never a number the screen already shows
+    (ADR-060 §4): the count, the minutes and the score are the object's.
+
+    The first signal line is the one thing worth a sentence; without lines,
+    the card that slipped most is named; without either there is nothing to
+    add to the rows, and an empty string is how "nothing" is said.
     """
-    total: int = body.session_total_cards if body.session_total_cards is not None else 1
-    wrong: int = body.session_wrong_count or 0
+    lines = [line.strip() for line in (body.session_signal_lines or []) if line and line.strip()]
+    if lines:
+        return f"{lines[0]} is the one to sit with. Five minutes on it before the next session."
     missed_front: str = (body.most_missed_card_front or "").strip()
-
-    if wrong == 0:
-        return f"You completed {total} cards without any needing extra practice this session."
-
-    error_rate: float = wrong / total
-
-    if missed_front and wrong >= 2:
-        return (
-            f"{missed_front} needs the most attention from this session. "
-            "That card is worth revisiting before your next review."
-        )
-    if error_rate >= 0.4:
-        return (
-            f"{wrong} of {total} cards need more practice. "
-            "Review the core material for this deck before the next session."
-        )
-    return (
-        f"{wrong} of {total} cards need more practice from this session. "
-        "The cards needing attention were spread across different concepts — no single bottleneck stands out."
-    )
+    if missed_front and (body.session_wrong_count or 0) > 0:
+        return f"{missed_front} needs the most attention from this session. Worth revisiting before the next review."
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -2554,16 +2551,19 @@ _INTERVENTION_PROMPT_TEMPLATES: dict[str, str] = {
         "Do not say 'the correct answer is' — show the concept instead."
     ),
     "session_summary": (
-        "The learner just finished a study session.\n"
-        "Total cards reviewed: {total_cards}\n"
-        "Cards needing more practice: {needs_practice_count}\n"
-        "Card needing the most attention, front: {most_attention_front}\n"
+        "The learner just finished a study session. The screen already shows the count of cards, "
+        "the minutes, the score and the rows below; do not repeat any of those numbers.\n"
+        "Score, percent held: {score}\n"
+        "Days since the previous session: {days_away}\n"
+        "What needs attention, as the screen reads it (one line per family or card, with its signal):\n"
+        "{signal_lines}\n"
         "Card needing the most attention, back: {most_attention_back}\n"
-        "Session duration in minutes: {duration_minutes}\n"
         "Deck name: {deck_name}\n\n"
-        "Write a 1-2 sentence diagnostic summary. If needs_practice_count is 0, state that cleanly. "
-        "If most_attention_front is non-empty, name it specifically as the card needing attention. "
-        "Do not use the word 'great' or any praise word."
+        "Write at most 2 sentences that say what the signals imply for this learner and one concrete move. "
+        "A fast slip means confident about something untrue; a slow answer means held by effort; "
+        "a lapse means a card once learned has fallen; asked means the companion was consulted before grading. "
+        "Reference the cards or families by name. Do not use the word 'great' or any praise word. "
+        "If the lines say nothing beyond that cards were answered, reply with exactly: NONE"
     ),
     "pre_session_framing": (
         "The learner is about to start a study session.\n"
@@ -2633,11 +2633,16 @@ async def _fetch_intervention_context(
             pass
 
     elif event_type == "session_summary":
-        ctx["total_cards"] = body.session_total_cards or 0
-        ctx["needs_practice_count"] = body.session_wrong_count or 0
-        ctx["most_attention_front"] = (body.most_missed_card_front or "None").strip()
+        # The signals, not the count (ADR-060 §4). The lines are the screen's
+        # own rows in the learner's language; a client that sends none gets
+        # the one fact the old payload carried, the card that slipped most.
+        lines = [line.strip() for line in (body.session_signal_lines or []) if line and line.strip()]
+        if not lines and body.most_missed_card_front:
+            lines = [body.most_missed_card_front.strip()]
+        ctx["signal_lines"] = "\n".join(lines) if lines else "None"
+        ctx["score"] = body.session_score if body.session_score is not None else "None"
+        ctx["days_away"] = body.days_since_last_session if body.days_since_last_session is not None else "None"
         ctx["most_attention_back"] = "None"
-        ctx["duration_minutes"] = body.session_duration_minutes or 0
         ctx["deck_name"] = _deck_name_for_prompt(body.deck_name)
         try:
             if body.most_missed_card_id:
@@ -2751,6 +2756,10 @@ async def _generate_intervention_message(
             ),
             timeout=10.0,
         )
+        # The model may decline: a note that would only restate the screen is
+        # no note (ADR-060 §4). Nothing falls back; silence is the answer.
+        if (raw or "").strip().strip(".").strip().upper() == "NONE":
+            return ""
         # Hard length guard: max 2 sentences
         sentences = [s.strip() for s in raw.replace("!", ".").split(".") if s.strip()]
         result: str = ". ".join(sentences[:2]).strip()

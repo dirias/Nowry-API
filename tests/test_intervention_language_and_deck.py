@@ -106,11 +106,10 @@ async def test_the_model_is_told_which_language_to_answer_in():
         await _generate_intervention_message(
             "session_summary",
             {
-                "total_cards": 2,
-                "needs_practice_count": 0,
-                "most_attention_front": "None",
+                "score": 100,
+                "days_away": "None",
+                "signal_lines": "None",
                 "most_attention_back": "None",
-                "duration_minutes": 0,
                 "deck_name": "Unknown",
             },
             lambda body: "fallback",
