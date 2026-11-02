@@ -45,6 +45,7 @@ quiz_sessions_collection = db["quiz_sessions"]
 ai_quiz_sessions_collection = db["ai_quiz_sessions"]
 # Permanent session history — never expires, indexed for analytics
 study_sessions_collection = db["study_sessions"]
+attempts_collection = db["card_attempts"]  # one row per graded showing (ADR-059)
 # Stripe webhook idempotency — deduplicates events, TTL 30 days
 stripe_processed_events_collection = db["stripe_processed_events"]
 
@@ -326,6 +327,21 @@ async def create_indexes():
         name="study_sessions_client_session",
         unique=True,
         partialFilterExpression={"client_session_id": {"$type": "string"}},
+    )
+
+    # card_attempts: the ledger (ADR-059 §1). Read by session and by card,
+    # newest first; the deck read feeds the learner's own median think time.
+    await attempts_collection.create_index(
+        [("user_id", 1), ("client_session_id", 1), ("graded_at", 1)],
+        name="card_attempts_session",
+    )
+    await attempts_collection.create_index(
+        [("user_id", 1), ("card_id", 1), ("graded_at", -1)],
+        name="card_attempts_card",
+    )
+    await attempts_collection.create_index(
+        [("user_id", 1), ("deck_id", 1), ("graded_at", -1)],
+        name="card_attempts_deck",
     )
 
     # ── Soft-delete TTL indexes (30-day retention) ──────────────────────────

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
@@ -38,6 +38,8 @@ from app.services.rest import (
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.utils.logger import get_logger
 from app.auth.firebase_auth import get_firebase_user
+from app.models.attempts import AttemptBody
+from app.services.attempts import record_attempt
 
 from app.auth.dependencies import require_ownership
 
@@ -1699,6 +1701,7 @@ async def review_card(
     id: str,
     grade: str = Query(..., pattern="^(again|hard|good|easy)$"),
     mode: str = Query("study", pattern="^(study|browse)$"),
+    attempt: Optional[AttemptBody] = Body(None),
     collection: Collection = Depends(get_cards_collection),
     card: dict = Depends(require_ownership(get_cards_collection, "id")),
     user: dict = Depends(get_firebase_user),
@@ -1710,12 +1713,27 @@ async def review_card(
     - **mode**: Active session mode (study, browse). Only `study` may
       grade a card and mutate its SM-2 schedule; `browse` is rejected
       with 403 before any write.
+    - **attempt** (body, optional): the attempt behind the grade (ADR-059).
+      Every grade appends one row to the ledger with the card's state
+      before it changed. `showing: practice` is a practice showing
+      (ADR-057 §2): the row is written and nothing else moves.
     """
     if mode != "study":
         raise HTTPException(
             status_code=403,
             detail="Reviews cannot be graded in Browse mode.",
         )
+
+    user_id = user.get("user_id")
+
+    if attempt is not None and attempt.showing == "practice":
+        # The schedule was set by the first answer; this showing is the
+        # learner's own second look. Recorded, not scheduled, not rewarded.
+        try:
+            await record_attempt(user_id, card, grade, attempt, None)
+        except Exception as ledger_err:
+            logger.warning(f"attempt ledger write failed (practice) for card {id}: {ledger_err}")
+        return {"message": "Practice showing recorded", "sm2_data": None, "xp": None}
 
     try:
         from app.utils.sm2 import calculate_next_review
@@ -1758,6 +1776,15 @@ async def review_card(
             }
         await collection.update_one({"_id": ObjectId(id)}, update)
 
+        # The ledger row (ADR-059 §1), from the card as it was BEFORE the
+        # update above. Never fatal: the grade has landed; the row is a
+        # record of it, and a missing record must not turn into a retry that
+        # grades the card twice.
+        try:
+            await record_attempt(user_id, card, grade, attempt, sm2_result)
+        except Exception as ledger_err:
+            logger.warning(f"attempt ledger write failed for card {id}: {ledger_err}")
+
         # Award XP for reviewing a card — genuinely fire-and-forget: the SM-2
         # update above already committed, so a grant_xp failure must never
         # turn an already-persisted review into a client-facing 500 (which
@@ -1769,7 +1796,6 @@ async def review_card(
         # card — was also the only way the user was never told about it. On
         # failure the xp block stays None and the client keeps its last known
         # progress rather than snapping a progress bar to zero.
-        user_id = user.get("user_id")
         xp_result: Optional[dict] = None
         try:
             xp_result = await grant_xp(user_id, XP_PER_CARD_REVIEW)

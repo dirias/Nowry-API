@@ -15,11 +15,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import decks_collection, study_cards_collection, study_sessions_collection
 from app.models.study_sessions import LogSessionRequest, StudySessionRecord, StudySessionsResponse
+from app.models.attempts import AttemptAfter, AttemptBefore, AttemptHelp, AttemptRecord, SessionAttemptsResponse
+from app.services.attempts import deck_median_think_ms, session_attempts
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -251,7 +253,7 @@ async def list_study_sessions(
         # A record written before the server named them is completed the first
         # time it is read, and the result kept, so no migration has to be run
         # against any of the three databases (ADR-058 §1).
-        if doc.get("session_type") == "srs_review":
+        if doc.get("session_type") in ("srs_review", "drill"):
             missing = await _name_record(user_id, doc)
             if missing:
                 doc.update(missing)
@@ -260,3 +262,79 @@ async def list_study_sessions(
 
     logger.info(f"[study_sessions] Listed {len(sessions)}/{total} sessions for user={user_id}")
     return StudySessionsResponse(sessions=sessions, total=total)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/study-sessions/{session_id}/attempts  — the ledger behind one session (ADR-059)
+# ---------------------------------------------------------------------------
+
+
+def _attempt_record(row: dict) -> AttemptRecord:
+    after = row.get("after")
+    return AttemptRecord(
+        id=str(row["_id"]),
+        card_id=row.get("card_id", ""),
+        card_title=row.get("card_title"),
+        deck_id=row.get("deck_id"),
+        tags=row.get("tags") or [],
+        card_type=row.get("card_type") or "flashcard",
+        grade=row.get("grade", "again"),
+        evaluation=row.get("evaluation", "incorrect"),
+        showing=row.get("showing") or "scheduled",
+        side=row.get("side"),
+        think_ms=row.get("think_ms"),
+        judge_ms=row.get("judge_ms"),
+        confidence=row.get("confidence"),
+        chosen_option=row.get("chosen_option"),
+        help=AttemptHelp(**(row.get("help") or {})),
+        before=AttemptBefore(**(row.get("before") or {})),
+        after=AttemptAfter(**after) if after else None,
+        position=row.get("position"),
+        total=row.get("total"),
+        scope=row.get("scope"),
+        client=row.get("client"),
+        graded_at=row.get("graded_at", datetime.now(timezone.utc)),
+    )
+
+
+@router.get("/{session_id}/attempts", response_model=SessionAttemptsResponse)
+async def get_session_attempts(
+    session_id: str,
+    current_user: dict = Depends(get_firebase_user),
+) -> SessionAttemptsResponse:
+    """
+    The attempt rows behind one finished session, oldest first, with the
+    learner's own median think time for the deck and how many days before
+    this session the previous one ended. A session logged before the ledger
+    existed has no rows: the clients keep their flat list for it.
+    """
+    user_id: str = current_user.get("user_id", "")
+    if not ObjectId.is_valid(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    session = await study_sessions_collection.find_one(
+        {"_id": ObjectId(session_id), "user_id": user_id, "deleted_at": None},
+        {"client_session_id": 1, "deck_id": 1, "started_at": 1, "completed_at": 1},
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    client_session_id = session.get("client_session_id")
+    rows = await session_attempts(user_id, client_session_id) if client_session_id else []
+    median_ms = await deck_median_think_ms(user_id, session.get("deck_id")) if rows else None
+
+    started = session.get("started_at") or session.get("completed_at")
+    previous = await study_sessions_collection.find_one(
+        {"user_id": user_id, "deleted_at": None, "completed_at": {"$lt": started}},
+        {"completed_at": 1},
+        sort=[("completed_at", -1)],
+    ) if started else None
+    days_since_previous = None
+    if previous and previous.get("completed_at") and started:
+        gap = started.replace(tzinfo=None) - previous["completed_at"].replace(tzinfo=None)
+        days_since_previous = max(0, gap.days)
+
+    return SessionAttemptsResponse(
+        attempts=[_attempt_record(r) for r in rows],
+        median_think_ms=median_ms,
+        days_since_previous=days_since_previous,
+    )
