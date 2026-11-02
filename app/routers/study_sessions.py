@@ -18,13 +18,116 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, Query
 
 from app.auth.firebase_auth import get_firebase_user
-from app.config.database import study_sessions_collection
+from app.config.database import decks_collection, study_cards_collection, study_sessions_collection
 from app.models.study_sessions import LogSessionRequest, StudySessionRecord, StudySessionsResponse
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["study-sessions"])
+
+
+# ---------------------------------------------------------------------------
+# Naming a record (ADR-058 §1)
+# ---------------------------------------------------------------------------
+
+
+def _object_ids(values: list[str | None]) -> list[ObjectId]:
+    """The ObjectIds among `values`; anything that is not one is skipped."""
+    out: list[ObjectId] = []
+    for value in values:
+        if value and ObjectId.is_valid(str(value)):
+            out.append(ObjectId(str(value)))
+    return out
+
+
+async def _deck_names(user_id: str, deck_ids: list[str | None]) -> dict[str, str]:
+    """Deck id (as a string) → name, for this user's decks among `deck_ids`."""
+    oids = _object_ids(deck_ids)
+    if not oids:
+        return {}
+    decks = await decks_collection.find(
+        {"_id": {"$in": oids}, "user_id": user_id},
+        {"name": 1},
+    ).to_list(length=len(oids))
+    return {str(d["_id"]): d.get("name") for d in decks if d.get("name")}
+
+
+async def _decks_of_cards(user_id: str, card_ids: list[str]) -> list[str]:
+    """The distinct deck ids the cards belong to, in first-seen order."""
+    oids = _object_ids(card_ids)
+    if not oids:
+        return []
+    cards = await study_cards_collection.find(
+        {"_id": {"$in": oids}, "user_id": user_id},
+        {"deck_id": 1},
+    ).to_list(length=len(oids))
+    seen: list[str] = []
+    for card in cards:
+        deck_id = card.get("deck_id")
+        if deck_id and str(deck_id) not in seen:
+            seen.append(str(deck_id))
+    return seen
+
+
+async def _name_record(user_id: str, doc: dict) -> dict:
+    """
+    The fields a record needs to name itself, resolved from the data.
+
+    Both clients used to read the deck's name off the first card and no cards
+    route embeds a deck, so every record carried `deck_name: None` and every
+    row read "Unknown topic". The server has the decks; it names the record.
+
+    A deck session → `deck_name`. A cross-deck session (no `deck_id`) →
+    `deck_count` and `deck_names`, read from the graded cards' decks. Returns
+    only what is missing, so a caller can write exactly that back.
+    """
+    deck_id = doc.get("deck_id")
+    if deck_id and ObjectId.is_valid(str(deck_id)):
+        if doc.get("deck_name"):
+            return {}
+        names = await _deck_names(user_id, [deck_id])
+        name = names.get(str(deck_id))
+        return {"deck_name": name} if name else {}
+
+    if doc.get("deck_count") is not None:
+        return {}
+    card_ids = [c.get("card_id") for c in doc.get("cards", []) if c.get("card_id")]
+    deck_ids = await _decks_of_cards(user_id, card_ids)
+    names = await _deck_names(user_id, deck_ids)
+    missing: dict = {
+        "deck_count": len(deck_ids),
+        "deck_names": [names[d] for d in deck_ids if d in names],
+    }
+    # What the clients used to send for a daily review: the phone its route
+    # sentinel as the deck id, the web an English literal as the name. Neither
+    # is a deck, and a title string is not the client's to ship (ADR-058 §1).
+    if deck_id:
+        missing["deck_id"] = None
+    if doc.get("deck_name"):
+        missing["deck_name"] = None
+    return missing
+
+
+def _record(doc: dict) -> StudySessionRecord:
+    return StudySessionRecord(
+        id=str(doc["_id"]),
+        session_type=doc.get("session_type", "ai_quiz"),
+        topic=doc.get("topic"),
+        deck_id=doc.get("deck_id"),
+        deck_name=doc.get("deck_name"),
+        deck_count=doc.get("deck_count"),
+        deck_names=doc.get("deck_names") or [],
+        total_cards=doc.get("total_cards", 0),
+        correct=doc.get("correct", 0),
+        partial=doc.get("partial", 0),
+        incorrect=doc.get("incorrect", 0),
+        score_percentage=doc.get("score_percentage", 0),
+        duration_seconds=doc.get("duration_seconds", 0),
+        cards=doc.get("cards", []),
+        started_at=doc.get("started_at", doc.get("completed_at", datetime.now(timezone.utc))),
+        completed_at=doc.get("completed_at", datetime.now(timezone.utc)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +154,21 @@ async def log_study_session(
       easy  → correct
     """
     user_id: str = current_user.get("user_id", "")
+
+    # The phone's outbox is at-least-once: a log the server wrote but whose
+    # response timed out is sent again. Same client id, same session (ADR-058 §2).
+    if body.client_session_id:
+        existing = await study_sessions_collection.find_one(
+            {"user_id": user_id, "client_session_id": body.client_session_id},
+            {"score_percentage": 1},
+        )
+        if existing:
+            logger.info(f"[study_sessions] SRS repeat: user={user_id}, client_session_id={body.client_session_id}")
+            return {
+                "logged": True,
+                "score_percentage": existing.get("score_percentage", 0),
+                "session_id": str(existing["_id"]),
+            }
 
     cards_data: list[dict] = [
         {
@@ -87,10 +205,14 @@ async def log_study_session(
         "started_at": body.started_at,
         "completed_at": now,
     }
+    if body.client_session_id:
+        doc["client_session_id"] = body.client_session_id
+    # The record names itself here, not in the client (ADR-058 §1).
+    doc.update(await _name_record(user_id, doc))
 
     inserted = await study_sessions_collection.insert_one(doc)
     logger.info(
-        f"[study_sessions] SRS logged: user={user_id}, deck={body.deck_name!r}, "
+        f"[study_sessions] SRS logged: user={user_id}, deck={doc.get('deck_name')!r}, "
         f"cards={total}, score={score_percentage}%, duration={duration_seconds}s"
     )
     # The id travels back so a study block can record the session it ran (PLAN-005).
@@ -126,24 +248,15 @@ async def list_study_sessions(
 
     sessions: list[StudySessionRecord] = []
     for doc in raw_docs:
-        sessions.append(
-            StudySessionRecord(
-                id=str(doc["_id"]),
-                session_type=doc.get("session_type", "ai_quiz"),
-                topic=doc.get("topic"),
-                deck_id=doc.get("deck_id"),
-                deck_name=doc.get("deck_name"),
-                total_cards=doc.get("total_cards", 0),
-                correct=doc.get("correct", 0),
-                partial=doc.get("partial", 0),
-                incorrect=doc.get("incorrect", 0),
-                score_percentage=doc.get("score_percentage", 0),
-                duration_seconds=doc.get("duration_seconds", 0),
-                cards=doc.get("cards", []),
-                started_at=doc.get("started_at", doc.get("completed_at", datetime.now(timezone.utc))),
-                completed_at=doc.get("completed_at", datetime.now(timezone.utc)),
-            )
-        )
+        # A record written before the server named them is completed the first
+        # time it is read, and the result kept, so no migration has to be run
+        # against any of the three databases (ADR-058 §1).
+        if doc.get("session_type") == "srs_review":
+            missing = await _name_record(user_id, doc)
+            if missing:
+                doc.update(missing)
+                await study_sessions_collection.update_one({"_id": doc["_id"]}, {"$set": missing})
+        sessions.append(_record(doc))
 
     logger.info(f"[study_sessions] Listed {len(sessions)}/{total} sessions for user={user_id}")
     return StudySessionsResponse(sessions=sessions, total=total)

@@ -316,6 +316,17 @@ async def create_indexes():
         name="study_sessions_user_history",
     )
     await study_sessions_collection.create_index("session_type")
+    # One record per client session: a log the server wrote but whose response
+    # was lost is sent again by the phone's outbox (ADR-058 §2). Partial, not
+    # sparse: a sparse compound index still indexes a row whose user_id is set
+    # and whose client_session_id is null, so every record written before
+    # clients minted an id became one duplicate key and startup failed.
+    await study_sessions_collection.create_index(
+        [("user_id", 1), ("client_session_id", 1)],
+        name="study_sessions_client_session",
+        unique=True,
+        partialFilterExpression={"client_session_id": {"$type": "string"}},
+    )
 
     # ── Soft-delete TTL indexes (30-day retention) ──────────────────────────
     _RETENTION_SECONDS = 2592000  # 30 days: 60 * 60 * 24 * 30

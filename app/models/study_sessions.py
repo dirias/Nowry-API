@@ -45,9 +45,12 @@ class LogSessionRequest(BaseModel):
     """
     session_type: str = "srs_review"
     deck_id: str | None = None          # None for daily-review cross-deck sessions
-    deck_name: str | None = None
+    deck_name: str | None = None        # Optional: the server resolves it from deck_id (ADR-058 §1)
     started_at: datetime
     cards: list[LoggedCard]
+    # Minted by the client when the session starts and kept across a resume. A
+    # repeat for the same user is the same session, not a second one (ADR-058 §2).
+    client_session_id: str | None = None
 
 
 class StudySessionRecord(BaseModel):
@@ -57,6 +60,8 @@ class StudySessionRecord(BaseModel):
     topic: str | None = None            # AI quiz: topic string
     deck_id: str | None = None          # Deck quiz: deck ObjectId string
     deck_name: str | None = None        # Deck quiz: human-readable name
+    deck_count: int | None = None       # Cross-deck review: how many decks it drew from (ADR-058 §1)
+    deck_names: list[str] = []          # Cross-deck review: those decks' names
     total_cards: int
     correct: int
     partial: int
