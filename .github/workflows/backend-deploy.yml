@@ -90,7 +90,7 @@ jobs:
           python scripts/check_pip_audit_severity.py pip-audit-report.json
 
       - name: Test suite
-        run: pytest tests/ -q --durations=10
+        run: pytest tests/ -q --durations=10 --cov=app --cov-report=json:coverage.json
         # The whole suite, blocking (QA-001, ADR-049). It needs no secrets, no
         # network and no Mongo: every collection is a mock and a test that
         # reaches a real service is a bug in the test. pytest and
@@ -98,6 +98,11 @@ jobs:
         # guards (test_dependencies, test_bounded_queries,
         # test_check_pip_audit_severity, test_study_cards_review_mode) run as
         # part of it.
+
+      - name: Coverage floor
+        # The floor only rises (QA-025, ADR-049 amended): it is today's measured
+        # figure, and a package that slips below it goes red here.
+        run: python scripts/check_coverage_floor.py coverage.json
 
       - name: Lint (flake8 — critical errors only)
         run: |
