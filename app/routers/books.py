@@ -22,6 +22,7 @@ def ensure_document_within_ceiling(word_count: int) -> None:
         raise HTTPException(status_code=413, detail={"code": DOCUMENT_TOO_LONG_CODE, "limit": limit, "words": word_count})
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
+from app.utils import media_ledger
 from app.utils.logger import get_logger
 from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
@@ -157,12 +158,17 @@ async def edit_book(
 @router.delete("/delete/{book_id}", summary="Soft delete a book by ID", status_code=204)
 async def delete_book(
     book_id: str,
+    background_tasks: BackgroundTasks,
     books_collection: Collection = Depends(get_books_collection),
     book: dict = Depends(require_ownership(get_books_collection, "book_id")),
 ):
     """
     Soft delete a book (sets deleted_at timestamp).
     Also auto-unpublishes if the book was public.
+
+    A book has no restore route, so its soft delete is final for the writer and
+    its images go with it (ADR-062 point 2): the sweep runs after the response,
+    best effort and logged, and never fails the deletion itself.
     """
     now = datetime.now(timezone.utc)
 
@@ -182,6 +188,7 @@ async def delete_book(
 
         if result.modified_count > 0:
             logger.info(f"Book soft-deleted successfully: {book_id}")
+            background_tasks.add_task(media_ledger.sweep_book, book_id)
             return None
 
     except Exception as e:

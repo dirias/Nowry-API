@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 stub_if_missing("langfuse", "langfuse.langchain")
 sys.modules.setdefault("app.models.agent_models", MagicMock())
 
+from fastapi import BackgroundTasks
 import pytest
 
 
@@ -152,7 +153,7 @@ async def test_account_deletion_removes_the_user_s_device_tokens(mock_firebase_u
          patch("app.routers.users.blackboards_collection", make_collection()), \
          patch("app.routers.users.device_tokens_collection", devices):
 
-        await delete_account(current_user=mock_firebase_user)
+        await delete_account(BackgroundTasks(), current_user=mock_firebase_user)
 
     (query,) = devices.delete_many.call_args.args
     assert query == {"user_id": mock_firebase_user["user_id"]}

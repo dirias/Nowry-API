@@ -71,6 +71,11 @@ content_forks_collection = db["content_forks"]
 # a place a notification could be sent.
 device_tokens_collection = db["device_tokens"]
 
+# The media ledger (ADR-062 point 1): one row per stored image — owner, book,
+# storage id, bytes, format, size, when. Deletion and the monthly count read
+# it; the app never lists the bucket to learn what it owns.
+media_collection = db["media"]
+
 #: Index names for curated official browse (ADR-004). Named so deployment can
 #: verify them, and so the verification step below can report a missing one.
 CURATED_BROWSE_INDEX = "decks_curated_browse"
@@ -414,5 +419,10 @@ async def create_indexes():
 
     # The beta waitlist upserts by email (ADR-038); the index makes that the key.
     await waitlist_collection.create_index("email", unique=True, name="waitlist_email")
+
+    # The media ledger (ADR-062): the monthly count reads an owner's rows by
+    # date; a book's deletion reads its rows by book.
+    await media_collection.create_index([("user_id", 1), ("created_at", -1)], name="media_owner_date")
+    await media_collection.create_index("book_id", name="media_book")
 
     logger.info("Database indexes created successfully.")

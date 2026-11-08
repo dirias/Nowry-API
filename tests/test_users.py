@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 stub_if_missing("langfuse", "langfuse.langchain")
 sys.modules.setdefault("app.models.agent_models", MagicMock())
 
+from fastapi import BackgroundTasks
 import pytest
 
 
@@ -86,7 +87,7 @@ async def test_delete_account_cascades_blackboards(mock_firebase_user):
          patch("app.routers.users.device_tokens_collection", make_collection()), \
          patch("app.routers.users.blackboards_collection", mock_blackboards):
 
-        await delete_account(current_user=mock_firebase_user)
+        await delete_account(BackgroundTasks(), current_user=mock_firebase_user)
 
     calls = mock_blackboards.update_many.call_args_list
     assert len(calls) == 2, "expected exactly the owned-board and collaborator cascades"

@@ -3,7 +3,7 @@ Storage abstraction layer for image uploads.
 Supports Cloudinary with easy migration to S3.
 """
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 
 #: The folder every user upload and the delete guard live under (MEDIA-001,
@@ -48,6 +48,17 @@ class StorageBackend(ABC):
     async def delete(self, public_id: str) -> bool:
         """Delete file from storage"""
         pass
+
+    async def delete_many(self, public_ids: List[str]) -> int:
+        """Delete several files; returns how many storage confirmed gone.
+
+        The default deletes one by one; a backend with a bulk call overrides it.
+        """
+        removed = 0
+        for public_id in public_ids:
+            if await self.delete(public_id):
+                removed += 1
+        return removed
     
     @abstractmethod
     def get_thumbnail_url(self, public_id: str, width: int = 200, height: int = 200) -> str:
@@ -146,6 +157,26 @@ class CloudinaryStorage(StorageBackend):
             functools.partial(self.cloudinary.uploader.destroy, public_id),
         )
         return result.get('result') == 'ok'
+
+    #: Cloudinary's Admin API takes at most 100 public ids per call.
+    DELETE_BATCH = 100
+
+    async def delete_many(self, public_ids: List[str]) -> int:
+        """Delete in batches through the Admin API — in a thread executor, like the rest."""
+        import asyncio
+        import functools
+        import cloudinary.api
+
+        loop = asyncio.get_event_loop()
+        removed = 0
+        for start in range(0, len(public_ids), self.DELETE_BATCH):
+            batch = public_ids[start:start + self.DELETE_BATCH]
+            result = await loop.run_in_executor(
+                None,
+                functools.partial(cloudinary.api.delete_resources, batch, resource_type="image"),
+            )
+            removed += sum(1 for state in (result.get("deleted") or {}).values() if state == "deleted")
+        return removed
     
     def get_thumbnail_url(self, public_id: str, width: int = 200, height: int = 200) -> str:
         """Generate Cloudinary transformation URL"""

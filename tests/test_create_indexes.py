@@ -72,3 +72,9 @@ def test_the_session_log_and_the_attempt_ledger_are_indexed(indexes):
     attempts = indexes["by"]["card_attempts"]
     assert _keys(attempts)["card_attempts_session"] == [("user_id", 1), ("client_session_id", 1), ("graded_at", 1)]
     assert _keys(attempts)["card_attempts_card"] == [("user_id", 1), ("card_id", 1), ("graded_at", -1)]
+
+
+def test_the_media_ledger_is_read_by_owner_and_date_and_by_book(indexes):
+    media = _keys(indexes["by"]["media"])
+    assert media["media_owner_date"] == [("user_id", 1), ("created_at", -1)]
+    assert media["media_book"] == [("book_id", 1)]

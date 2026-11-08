@@ -4,7 +4,7 @@ Handles user profile management, settings, and preferences
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File, status
 from fastapi.responses import JSONResponse
 from pymongo.collection import Collection
 from bson import ObjectId
@@ -17,6 +17,7 @@ import base64
 import secrets
 import asyncio
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, validator
+from app.utils import media_ledger
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -1124,10 +1125,17 @@ async def disable_2fa(current_user: dict = Depends(get_firebase_user)):
 
 
 @router.delete("/account", response_model=AccountDeleteResponse)
-async def delete_account(current_user: dict = Depends(get_firebase_user)):
+async def delete_account(
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_firebase_user),
+):
     """
     Soft delete user account and all associated data.
     Data can be recovered within 30 days before permanent deletion.
+
+    The account's images are not recoverable content: every media ledger row
+    of the account is swept from storage after the response (ADR-062 point 2),
+    orphans from before the ledger included, best effort and logged.
 
     Order per D-08: MongoDB soft-deletes are committed FIRST, then Firebase
     credentials are revoked. Firebase deletion failure is caught and logged
@@ -1286,6 +1294,9 @@ async def delete_account(current_user: dict = Depends(get_firebase_user)):
     # address, not content: leaving one for the recovery window would leave a
     # deleted account reachable by a notification.
     await device_tokens_collection.delete_many({"user_id": user_id})
+
+    # Stored images — every ledger row of the account, swept after the response.
+    background_tasks.add_task(media_ledger.sweep_user, user_id)
 
     # 3. Revoke Firebase credentials AFTER all MongoDB soft-deletes (D-08)
     if firebase_uid:
