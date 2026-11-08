@@ -51,6 +51,7 @@ SUBSCRIPTION_PLANS = {
             "agent_messages_per_month": 50,   # 50 "Knowledge Sparks"
             "document_words": 200_000,        # one ceiling per document, every tier
             "tts_chars_per_month": 0,         # read-aloud is Plus and Pro
+            "images_per_month": 200,          # images stored into documents (ADR-062)
         },
     },
     SubscriptionTier.PLUS: {
@@ -72,6 +73,7 @@ SUBSCRIPTION_PLANS = {
             "agent_messages_per_month": -1,   # Unlimited
             "document_words": 200_000,
             "tts_chars_per_month": 1_000_000, # fair use
+            "images_per_month": 2000,
         },
     },
     SubscriptionTier.PRO: {
@@ -93,6 +95,7 @@ SUBSCRIPTION_PLANS = {
             "agent_messages_per_month": -1,   # Unlimited
             "document_words": 200_000,
             "tts_chars_per_month": 1_000_000, # fair use
+            "images_per_month": -1,           # unlimited
         },
     },
 }

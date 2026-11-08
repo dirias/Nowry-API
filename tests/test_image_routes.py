@@ -166,6 +166,71 @@ def test_deleting_the_account_sweeps_every_image_it_owns_orphans_included(world,
     assert [r["public_id"] for r in _ledger(world)] == [their_image]
 
 
+# ── MEDIA-004: bounded read, honest statuses, a monthly limit ───────────────
+
+def test_an_oversize_upload_is_413_before_it_is_stored(world, storage, book):
+    with patch("app.routers.image_upload.MAX_FILE_SIZE", 1024):
+        response = _upload(world, book, content=PNG + b"\x00" * 4096)
+    assert response.status_code == 413
+    assert storage.uploads == [] and _ledger(world) == []
+
+
+@pytest.mark.parametrize("name, content, content_type", [
+    ("notes.txt", b"hello there", "text/plain"),
+    ("notes.txt", PNG, "image/png"),
+    ("pic.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>" + b" " * 32, "image/png"),
+    ("pic.jpg", b"\x89PNX" + b"\x00" * 32, "image/jpeg"),
+])
+def test_what_is_not_an_image_by_type_or_bytes_is_415(world, storage, book, name, content, content_type):
+    response = _upload(world, book, content=content, name=name, content_type=content_type)
+    assert response.status_code == 415, response.text
+    assert storage.uploads == [] and _ledger(world) == []
+
+
+@pytest.mark.parametrize("name, content, content_type", [
+    ("pic.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 32, "image/jpeg"),
+    ("pic.gif", b"GIF89a" + b"\x00" * 32, "image/gif"),
+    ("pic.webp", b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 32, "image/webp"),
+])
+def test_every_accepted_format_is_recognised_by_its_bytes(world, storage, book, name, content, content_type):
+    assert _upload(world, book, content=content, name=name, content_type=content_type).status_code == 200
+
+
+def test_the_plans_monthly_count_is_enforced_from_the_ledger(world, storage, book):
+    from datetime import datetime, timedelta, timezone
+    user = world.current["user"]["user_id"]
+    world.run(world.raw["users"].update_one({"_id": world.uid}, {"$set": {"subscription.tier": "free"}}))
+    now = datetime.now(timezone.utc)
+    rows = [{"user_id": user, "book_id": book, "public_id": f"old/{n}", "created_at": now - timedelta(minutes=1)}
+            for n in range(199)]
+    rows += [{"user_id": user, "book_id": book, "public_id": f"last-month/{n}", "created_at": now - timedelta(days=40)}
+             for n in range(5)]
+    rows += [{"user_id": "someone-else", "book_id": "x", "public_id": f"theirs/{n}", "created_at": now} for n in range(5)]
+    world.run(world.raw["media"].insert_many(rows))
+
+    assert _upload(world, book).status_code == 200
+    refused = _upload(world, book)
+    assert refused.status_code == 402 and refused.json()["detail"] == "image_limit_reached"
+    assert len(storage.uploads) == 1
+
+    world.run(world.raw["users"].update_one({"_id": world.uid}, {"$set": {"subscription.tier": "pro"}}))
+    assert _upload(world, book).status_code == 200
+
+
+def test_a_storage_failure_is_502_without_the_backends_message(world, storage, book):
+    with patch.object(storage, "upload", side_effect=RuntimeError("cloudinary says: quota exceeded for cloud dxyz")):
+        response = _upload(world, book)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "image_storage_unavailable"}
+    assert _ledger(world) == []
+
+    public_id = _upload(world, book).json()["public_id"]
+    with patch.object(storage, "delete", side_effect=RuntimeError("cloudinary says: 500")):
+        response = world.http.delete(f"/image/delete/{public_id}")
+    assert response.status_code == 502 and response.json() == {"detail": "image_storage_unavailable"}
+    assert len(_ledger(world)) == 1
+
+
 def test_a_storage_failure_during_a_sweep_keeps_the_rows_and_the_deletion_succeeds(world, storage, book):
     _upload(world, book)
     with patch.object(storage, "delete_many", side_effect=RuntimeError("cloud down")):

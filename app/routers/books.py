@@ -24,6 +24,7 @@ from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils import media_ledger
 from app.utils.logger import get_logger
+from app.utils.uploads import read_bounded_upload
 from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
@@ -346,24 +347,11 @@ async def get_book_by_id(
 
 
 BOOK_IMPORT_MAX_BYTES: int = int(os.getenv("BOOK_IMPORT_MAX_BYTES", str(25 * 1024 * 1024)))
-_IMPORT_READ_CHUNK: int = 1024 * 1024
 
 
 async def _read_bounded_upload(file: UploadFile) -> bytes:
     """The upload's bytes, or 413 as soon as they pass `BOOK_IMPORT_MAX_BYTES`."""
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await file.read(_IMPORT_READ_CHUNK)
-        if not chunk:
-            return b"".join(chunks)
-        total += len(chunk)
-        if total > BOOK_IMPORT_MAX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File exceeds the {BOOK_IMPORT_MAX_BYTES // (1024 * 1024)} MB limit.",
-            )
-        chunks.append(chunk)
+    return await read_bounded_upload(file, BOOK_IMPORT_MAX_BYTES)
 
 
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
