@@ -318,7 +318,10 @@ async def update_deck(
         logger.error(f"Error updating deck: {e}")
         raise HTTPException(status_code=400, detail="Update failed")
 
-    updated_deck = await collection.find_one({"_id": existing_deck["_id"]})
+    # `require_ownership` hands the deck over with its `_id` already a string;
+    # the lookup needs the ObjectId or it finds nothing and this answered 500
+    # (found by QA-018: every rename through PATCH /decks/{id} failed).
+    updated_deck = await collection.find_one({"_id": ObjectId(existing_deck["_id"])})
     updated_deck["_id"] = str(updated_deck["_id"])
     if updated_deck.get("user_id"):
         updated_deck["user_id"] = str(updated_deck["user_id"])
