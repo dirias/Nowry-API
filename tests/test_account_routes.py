@@ -6,7 +6,6 @@ change that accepts the wrong current one, a deletion that leaves public
 content behind. Each route runs here over the fake world against the
 documents the API itself writes.
 """
-import base64
 from unittest.mock import patch
 
 import bcrypt
@@ -87,15 +86,64 @@ def test_notification_preferences_are_written_field_by_field(world):
 
 # ── avatar ──────────────────────────────────────────────────────────────────
 
+class _FakeStorage:
+    """Answers like Cloudinary and records what was asked (MEDIA-006: the avatar is a file)."""
+
+    def __init__(self):
+        self.uploads, self.deleted = [], []
+
+    async def upload(self, file_content, filename, folder="", **options):
+        self.uploads.append({"folder": folder, "options": options, "bytes": len(file_content)})
+        public_id = f"{folder}/{options.get('public_id', 'img')}"
+        return {"url": f"http://cdn.test/{public_id}", "secure_url": f"https://cdn.test/{public_id}?v={len(self.uploads)}",
+                "public_id": public_id, "width": 256, "height": 256, "format": "png", "bytes": len(file_content)}
+
+    async def delete_many(self, public_ids):
+        self.deleted.extend(public_ids)
+        return len(public_ids)
+
+    def get_thumbnail_url(self, public_id, width=200, height=200):
+        return f"https://cdn.test/thumb/{public_id}"
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
 def test_the_avatar_must_be_a_small_image(world):
-    not_image = world.http.post("/users/avatar", files={"file": ("a.txt", b"hello", "text/plain")})
-    assert not_image.status_code == 400
-    too_big = world.http.post("/users/avatar", files={"file": ("a.png", b"\x89PNG" + b"0" * (2 * 1024 * 1024), "image/png")})
-    assert too_big.status_code == 400
-    ok = world.http.post("/users/avatar", files={"file": ("a.png", b"\x89PNG1234", "image/png")})
-    assert ok.status_code == 200, ok.text
-    expected = "data:image/png;base64," + base64.b64encode(b"\x89PNG1234").decode()
-    assert ok.json()["avatar_url"] == expected and _user(world)["avatar_url"] == expected
+    fake = _FakeStorage()
+    with patch("app.routers.users.get_storage_backend", return_value=fake):
+        assert world.http.post("/users/avatar", files={"file": ("a.txt", b"hello", "text/plain")}).status_code == 415
+        assert world.http.post("/users/avatar", files={"file": ("a.png", b"hello" * 8, "image/png")}).status_code == 415
+        too_big = world.http.post("/users/avatar", files={"file": ("a.png", PNG + b"0" * (2 * 1024 * 1024), "image/png")})
+        assert too_big.status_code == 413
+    assert fake.uploads == [] and _user(world).get("avatar_url") is None
+
+
+def test_the_avatar_is_stored_as_one_file_per_account_and_goes_with_it(world):
+    fake = _FakeStorage()
+    user = world.current["user"]["user_id"]
+    with patch("app.routers.users.get_storage_backend", return_value=fake), \
+            patch("app.utils.media_ledger.get_storage_backend", return_value=fake):
+        ok = world.http.post("/users/avatar", files={"file": ("a.png", PNG, "image/png")})
+        assert ok.status_code == 200, ok.text
+        url = ok.json()["avatar_url"]
+        assert url == f"https://cdn.test/nowry/{user}/avatar?v=1" and _user(world)["avatar_url"] == url
+        assert fake.uploads[0]["folder"] == f"nowry/{user}"
+        assert fake.uploads[0]["options"]["public_id"] == "avatar" and fake.uploads[0]["options"]["overwrite"] is True
+
+        again = world.http.post("/users/avatar", files={"file": ("b.png", PNG, "image/png")})
+        assert again.status_code == 200 and _user(world)["avatar_url"] == again.json()["avatar_url"]
+        rows = world.run(world.raw["media"].find({"user_id": user}).to_list(length=10))
+        assert len(rows) == 1 and rows[0]["book_id"] is None and rows[0]["public_id"] == f"nowry/{user}/avatar"
+
+        with patch.object(fake, "upload", side_effect=RuntimeError("cloud says no")):
+            down = world.http.post("/users/avatar", files={"file": ("c.png", PNG, "image/png")})
+        assert down.status_code == 502 and down.json() == {"detail": "image_storage_unavailable"}
+
+        with patch("firebase_admin.auth.revoke_refresh_tokens"), patch("firebase_admin.auth.delete_user"):
+            assert world.http.delete("/users/account").status_code == 200
+    assert fake.deleted == [f"nowry/{user}/avatar"]
+    assert world.run(world.raw["media"].count_documents({"user_id": user})) == 0
 
 
 # ── delete ──────────────────────────────────────────────────────────────────

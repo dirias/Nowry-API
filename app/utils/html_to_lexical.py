@@ -9,6 +9,15 @@ from html import unescape
 from html.parser import HTMLParser
 
 
+def _dimension(value) -> "int | None":
+    """A width or height attribute as an int, or None when absent or not a number."""
+    try:
+        number = int(float(str(value).strip().rstrip("px")))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 class HTMLToLexicalConverter(HTMLParser):
     """
     Converts HTML to Lexical JSON structure
@@ -63,6 +72,42 @@ class HTMLToLexicalConverter(HTMLParser):
                 self.current_paragraph['children'].append({
                     "type": "linebreak"
                 })
+        elif tag == 'img':
+            self._add_image(dict(attrs))
+
+    def _flush_paragraph(self):
+        """Close the open block, keeping what it holds, and reopen an empty one of the same kind."""
+        block = self.current_paragraph
+        if not block:
+            return
+        if block['children']:
+            if self.list_stack:
+                self.list_stack[-1]['children'].append(block)
+            else:
+                self.nodes.append(block)
+        self.current_paragraph = {key: value for key, value in block.items() if key != 'children'}
+        self.current_paragraph['children'] = []
+
+    def _add_image(self, attrs):
+        """An `<img>` becomes a root-level image node (ADR-062 point 5).
+
+        A marker nothing stored (no `src`) and an inlined picture (a data URL)
+        are both dropped: a document holds stored URLs only.
+        """
+        src = (attrs.get('src') or '').strip()
+        if not src or src.lower().startswith('data:'):
+            return
+        self._flush_paragraph()
+        self.nodes.append({
+            "type": "image",
+            "src": src,
+            "altText": attrs.get('alt') or '',
+            "width": _dimension(attrs.get('width')),
+            "height": _dimension(attrs.get('height')),
+            "alignment": "center",
+            "maxWidth": 600,
+            "version": 1,
+        })
     
     def handle_endtag(self, tag):
         """Handle closing HTML tags"""

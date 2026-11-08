@@ -5,18 +5,68 @@ Preserves formatting by converting to HTML which can be imported into Lexical ed
 
 import fitz  # PyMuPDF
 import mammoth
-from typing import List, Dict
+from typing import Dict, List, Optional, Tuple
 import re
 import html
-import base64
+
+# ── pictures ────────────────────────────────────────────────────────────────
+#
+# A picture an importer finds is handed back as bytes beside the HTML, never
+# inlined (ADR-062 point 5): the HTML carries a marker, `<img data-media="n">`,
+# and the route stores the bytes and puts the stored URL where the marker was.
+# A marker nothing replaced is dropped by `place_media`, so a data URL can
+# never enter a document through an import.
+
+_MARKER = re.compile(r'<img\b[^>]*\bdata-media="(\d+)"[^>]*/?>', re.IGNORECASE)
+_ALT = re.compile(r'\balt="([^"]*)"')
+DEFAULT_ALT = "Imported image"
 
 
-def extract_formatted_text_from_pdf(file_content: bytes) -> List[Dict[str, str]]:
+def media_marker(index: int, alt: str = DEFAULT_ALT) -> str:
+    """The HTML placeholder for picture `index` of the import."""
+    return f'<img data-media="{index}" alt="{html.escape(alt or DEFAULT_ALT, quote=True)}">'
+
+
+def _picture(media: List[Dict], data: bytes, ext: str, width: Optional[int], height: Optional[int], alt: str) -> int:
+    """Add a picture to the import's media list and return its marker index."""
+    media.append({"index": len(media) + 1, "bytes": data, "ext": (ext or "png").lower().lstrip("."),
+                  "width": width, "height": height, "alt": alt or DEFAULT_ALT})
+    return media[-1]["index"]
+
+
+def place_media(html_content: str, placements: Dict[int, Dict]) -> str:
+    """Replace each marker with its stored image, or drop it when nothing was stored.
+
+    `placements` maps a marker index to `{"url", "width", "height"}`.
+    """
+    def replace(match: "re.Match") -> str:
+        placed = placements.get(int(match.group(1)))
+        if not placed or not placed.get("url"):
+            return ""
+        alt_match = _ALT.search(match.group(0))
+        alt = alt_match.group(1) if alt_match else html.escape(DEFAULT_ALT, quote=True)
+        size = "".join(f' {name}="{int(placed[name])}"' for name in ("width", "height") if placed.get(name))
+        return f'<img src="{html.escape(placed["url"], quote=True)}"{size} alt="{alt}">'
+
+    return _MARKER.sub(replace, html_content)
+
+
+def strip_media_markers(html_content: str) -> str:
+    """The HTML without its picture markers — for a preview, which stores nothing."""
+    return place_media(html_content, {})
+
+
+def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Dict]] = None) -> List[Dict[str, str]]:
     """
     Extract text from PDF preserving formatting AND multi-column layouts
     Detects academic paper 2-column formats and preserves them
     Returns HTML content per page with quality metrics
+
+    Pictures are appended to `media` as bytes and marked in the HTML (see
+    `media_marker`); a caller that passes no list gets the markers alone.
     """
+    if media is None:
+        media = []
     try:
         import io
 
@@ -53,23 +103,13 @@ def extract_formatted_text_from_pdf(file_content: bytes) -> List[Dict[str, str]]
                 if block.get("type") == 0:  # Text block
                     # Determine column (logic handled below)
                     pass
-                elif block.get("type") == 1:  # Image block
-                    try:
-                        image_bytes = doc.extract_image(block["xref"])[
-                            "image"
-                        ]  # Use xref for better image extraction
-                        if image_bytes:
-                            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-                            ext = doc.extract_image(block["xref"])[
-                                "ext"
-                            ]  # Get extension from xref
-                            # Create a pre-formatted HTML string for this block
-                            block["custom_html"] = (
-                                f'<img src="data:image/{ext};base64,{img_b64}" alt="Imported Image" class="pdf-image" style="max-width: 100%; height: auto; display: block; margin: 10px 0;" />'
-                            )
-                    except Exception as img_err:
-                        print(f"Error processing image: {img_err}")
+                elif block.get("type") == 1:  # Image block — the dict carries the bytes
+                    image_bytes = block.get("image")
+                    if not image_bytes:
                         continue
+                    index = _picture(media, image_bytes, block.get("ext", "png"),
+                                     block.get("width"), block.get("height"), DEFAULT_ALT)
+                    block["custom_html"] = media_marker(index)
                 else:
                     continue  # Skip other types
 
@@ -273,18 +313,36 @@ def extract_text_from_pdf_fallback(file_content: bytes) -> List[Dict[str, str]]:
         return []
 
 
-def extract_formatted_text_from_docx(file_content: bytes) -> List[Dict[str, str]]:
+def _docx_picture_handler(media: List[Dict]):
+    """A mammoth image converter that keeps the bytes and leaves a marker in the HTML."""
+    def handle(image) -> Dict[str, str]:
+        with image.open() as handle_:
+            data = handle_.read()
+        ext = (image.content_type or "image/png").split("/")[-1].replace("jpeg", "jpg")
+        index = _picture(media, data, ext, None, None, image.alt_text or DEFAULT_ALT)
+        return {"data-media": str(index), "alt": image.alt_text or DEFAULT_ALT}
+
+    return mammoth.images.img_element(handle)
+
+
+def extract_formatted_text_from_docx(file_content: bytes, media: Optional[List[Dict]] = None) -> List[Dict[str, str]]:
     """
     Extract text from DOCX preserving formatting using mammoth
     Converts to HTML which preserves bold, italic, headings, lists, etc.
+
+    Pictures are appended to `media` as bytes and marked in the HTML (see
+    `media_marker`); a caller that passes no list gets the markers alone.
     """
+    if media is None:
+        media = []
     try:
         import io
 
         docx_file = io.BytesIO(file_content)
 
-        # Convert DOCX to HTML using mammoth (preserves formatting)
-        result = mammoth.convert_to_html(docx_file)
+        # Convert DOCX to HTML using mammoth (preserves formatting); pictures
+        # come out as bytes beside it, never as data URIs (ADR-062 point 5).
+        result = mammoth.convert_to_html(docx_file, convert_image=_docx_picture_handler(media))
         html_content = result.value
 
         # Split into pages (by page breaks or content length)
@@ -406,18 +464,33 @@ def extract_formatted_text_from_txt(file_content: bytes) -> List[Dict[str, str]]
         return []
 
 
+def process_uploaded_file_with_media(filename: str, file_content: bytes) -> Tuple[List[Dict[str, str]], List[Dict]]:
+    """
+    Process uploaded file: the pages with preserved formatting, and the pictures.
+
+    Each picture is `{"index", "bytes", "ext", "width", "height", "alt"}`; its
+    place in the pages' HTML is the marker `media_marker(index)`.
+    """
+    file_ext = filename.lower().split(".")[-1]
+    media: List[Dict] = []
+
+    if file_ext == "pdf":
+        pages = extract_formatted_text_from_pdf(file_content, media)
+    elif file_ext in ["docx", "doc"]:
+        pages = extract_formatted_text_from_docx(file_content, media)
+    elif file_ext == "txt":
+        pages = extract_formatted_text_from_txt(file_content)
+    else:
+        pages = []
+
+    if pages:
+        pages[0].setdefault("extraction_metadata", {})["pictures"] = len(media)
+    return pages, media
+
+
 def process_uploaded_file(filename: str, file_content: bytes) -> List[Dict[str, str]]:
     """
     Process uploaded file and extract pages with preserved formatting
-    Returns list of pages with HTML content
+    Returns list of pages with HTML content (pictures as markers, see above)
     """
-    file_ext = filename.lower().split(".")[-1]
-
-    if file_ext == "pdf":
-        return extract_formatted_text_from_pdf(file_content)
-    elif file_ext in ["docx", "doc"]:
-        return extract_formatted_text_from_docx(file_content)
-    elif file_ext == "txt":
-        return extract_formatted_text_from_txt(file_content)
-    else:
-        return []
+    return process_uploaded_file_with_media(filename, file_content)[0]

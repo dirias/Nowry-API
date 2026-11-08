@@ -13,12 +13,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Literal, Optional, List
 import bcrypt
-import base64
+import os
 import secrets
 import asyncio
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, validator
 from app.utils import media_ledger
 from app.utils.logger import get_logger
+from app.utils.storage import get_storage_backend, media_root
+from app.utils.uploads import read_bounded_upload, sniff_image_format
 
 logger = get_logger(__name__)
 
@@ -618,33 +620,53 @@ async def patch_user_profile(
     )
 
 
+AVATAR_MAX_BYTES = 2 * 1024 * 1024
+
+
 @router.post("/avatar", response_model=AvatarUploadResponse)
 async def upload_avatar(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_firebase_user),
 ):
-    """Upload user avatar"""
+    """Store the avatar as a file under `{root}/{user}/avatar` and keep its URL (ADR-062 point 5).
+
+    One object per account, overwritten on each upload; its ledger row has no
+    book, so the account's deletion sweeps it. Avatars stored before this as
+    data URLs keep working: the field is a URL either way.
+    """
     user_id = current_user.get("user_id")
 
-    # Validate file type
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="File must be an image")
+    contents = await read_bounded_upload(file, AVATAR_MAX_BYTES)
+    if sniff_image_format(contents[:16]) is None:
+        raise HTTPException(status_code=415, detail="File must be an image")
 
-    # Validate file size (2MB max)
-    contents = await file.read()
-    if len(contents) > 2 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File size must be less than 2MB")
+    try:
+        result = await get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary")).upload(
+            file_content=contents,
+            filename=file.filename or "avatar",
+            folder=f"{media_root()}/{user_id}",
+            public_id="avatar",
+            overwrite=True,
+            invalidate=True,
+            quality="auto",
+            fetch_format="auto",
+        )
+    except Exception:
+        logger.error("Avatar storage failed for user %s", user_id, exc_info=True)
+        raise HTTPException(status_code=502, detail="image_storage_unavailable")
 
-    # Store as base64 (in production, use S3/Cloud Storage)
-    base64_image = base64.b64encode(contents).decode("utf-8")
-    avatar_url = f"data:{file.content_type};base64,{base64_image}"
-
-    # Update user
+    avatar_url = result["secure_url"]
+    await media_ledger.record(
+        user_id=user_id, book_id=None, public_id=result["public_id"], url=avatar_url,
+        bytes_=result.get("bytes"), format_=result.get("format"),
+        width=result.get("width"), height=result.get("height"),
+    )
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
         {"$set": {"avatar_url": avatar_url, "updated_at": datetime.now(timezone.utc)}},
     )
-
     return {"message": "Avatar uploaded successfully", "avatar_url": avatar_url}
 
 

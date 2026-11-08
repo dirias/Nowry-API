@@ -24,6 +24,7 @@ from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils import media_ledger
 from app.utils.logger import get_logger
+from app.utils.storage import get_storage_backend, media_root
 from app.utils.uploads import read_bounded_upload
 from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
@@ -354,6 +355,45 @@ async def _read_bounded_upload(file: UploadFile) -> bytes:
     return await read_bounded_upload(file, BOOK_IMPORT_MAX_BYTES)
 
 
+async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> dict:
+    """Store an import's pictures under the new book and write their ledger rows.
+
+    Returns marker index → `{"url", "width", "height"}` for `place_media`. A
+    picture that cannot be stored is dropped with a log line, never inlined
+    (ADR-062 point 5); the import itself goes on.
+    """
+    if not pictures:
+        return {}
+    try:
+        storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
+    except Exception:
+        logger.error("Import pictures for book %s dropped: no storage backend", book_id, exc_info=True)
+        return {}
+    folder = f"{media_root()}/{user_id}/{book_id}"
+    placed: dict = {}
+    for picture in pictures:
+        try:
+            result = await storage.upload(
+                file_content=picture["bytes"],
+                filename=f"import-{picture['index']}.{picture['ext']}",
+                folder=folder,
+                quality="auto",
+                fetch_format="auto",
+            )
+        except Exception:
+            logger.warning("Import picture %s for book %s could not be stored; dropped",
+                           picture["index"], book_id, exc_info=True)
+            continue
+        width = result.get("width") or picture.get("width")
+        height = result.get("height") or picture.get("height")
+        await media_ledger.record(
+            user_id=user_id, book_id=book_id, public_id=result["public_id"], url=result["secure_url"],
+            bytes_=result.get("bytes"), format_=result.get("format"), width=width, height=height,
+        )
+        placed[picture["index"]] = {"url": result["secure_url"], "width": width, "height": height}
+    return placed
+
+
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
 async def import_book_from_file(
     file: UploadFile = File(...),
@@ -371,15 +411,15 @@ async def import_book_from_file(
 
     Preserves formatting, multi-column layouts, and provides quality metrics.
     """
-    from app.utils.file_import import process_uploaded_file
+    from app.utils.file_import import place_media, process_uploaded_file_with_media, strip_media_markers
 
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
     # before a parser sees it, as the .apkg import does (QA-008).
     file_content = await _read_bounded_upload(file)
     filename = file.filename or ""
 
-    # Extract pages from file
-    extracted_pages = process_uploaded_file(filename, file_content)
+    # Extract pages from file; its pictures come back as bytes beside the HTML (ADR-062 point 5)
+    extracted_pages, pictures = process_uploaded_file_with_media(filename, file_content)
 
     if not extracted_pages:
         raise HTTPException(
@@ -431,10 +471,10 @@ async def import_book_from_file(
                     "page_number": p.get("page_number"),
                     "title": p.get("title"),
                     "content_preview": (
-                        p.get("content", "")[:5000] + "..."
+                        strip_media_markers(p.get("content", ""))[:5000] + "..."
                         if len(p.get("content", "")) > 5000
-                        else p.get("content", "")
-                    ),  # Show full page
+                        else strip_media_markers(p.get("content", ""))
+                    ),  # Show full page; a preview stores no picture
                     "word_count": p.get("word_count"),
                     "has_columns": p.get("has_columns", False),
                     "quality_score": p.get("quality_score", 0),
@@ -454,8 +494,13 @@ async def import_book_from_file(
     from app.utils.html_to_lexical import html_to_lexical_json
     import json
     
-    # Combine all pages into single HTML
-    combined_html = "\n".join([p.get("content", "") for p in extracted_pages])
+    # The book's id is minted here so its pictures can be stored under its
+    # folder before the document exists (ADR-062 point 2).
+    book_oid = ObjectId()
+    placements = await _store_import_pictures(pictures, current_user.get("user_id"), str(book_oid))
+
+    # Combine all pages into single HTML, each picture now a stored URL
+    combined_html = place_media("\n".join([p.get("content", "") for p in extracted_pages]), placements)
     
     # Convert HTML to Lexical JSON
     try:
@@ -469,6 +514,7 @@ async def import_book_from_file(
         full_content = json.dumps(lexical_json)
 
     new_book = Book(
+        id=book_oid,
         title=book_title,
         author=username,
         user_id=current_user.get("user_id"),
@@ -483,10 +529,11 @@ async def import_book_from_file(
         **document_stats(parse_lexical(full_content), full_content),
     )
 
-    # Exclude 'id' so MongoDB generates a proper ObjectId, identifying this as a new document
-    book_dict = new_book.model_dump(by_alias=True, exclude={'id'})
-    result = await books_collection.insert_one(book_dict)
-    book_id = str(result.inserted_id)
+    # Inserted under the id minted above, the one its pictures are stored under
+    book_dict = new_book.model_dump(by_alias=True)
+    book_dict["_id"] = book_oid
+    await books_collection.insert_one(book_dict)
+    book_id = str(book_oid)
 
     # Return the book info
     return {
