@@ -6,6 +6,16 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 import os
 
+#: The folder every user upload and the delete guard live under (MEDIA-001,
+#: ADR-062 point 3). Read at call time so each environment — and each test —
+#: gets its own root; the companion's generated assets keep `nowry/`.
+DEFAULT_MEDIA_ROOT = "nowry"
+
+
+def media_root() -> str:
+    """The environment's root folder for user uploads, `nowry` unless `MEDIA_ROOT_FOLDER` says otherwise."""
+    return os.getenv("MEDIA_ROOT_FOLDER", "").strip().strip("/") or DEFAULT_MEDIA_ROOT
+
 
 class StorageBackend(ABC):
     """Abstract base class for storage backends"""

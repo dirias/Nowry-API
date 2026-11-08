@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from app.auth.firebase_auth import get_firebase_user
-from app.utils.storage import get_storage_backend
+from app.utils.storage import get_storage_backend, media_root
 from app.utils.logger import get_logger
 from typing import Dict, Any
 import os
@@ -74,9 +74,9 @@ async def upload_image(
         # Get storage backend
         storage = get_storage_backend(os.getenv("STORAGE_BACKEND", "cloudinary"))
         
-        # Organize in folders: nowry/{user_id}/{book_id}/
+        # Organize in folders: {root}/{user_id}/{book_id}/ (MEDIA-001)
         user_id = current_user.get("user_id")
-        folder = f"nowry/{user_id}"
+        folder = f"{media_root()}/{user_id}"
         if book_id:
             folder += f"/{book_id}"
         
@@ -119,7 +119,7 @@ async def delete_image(
     user_id = current_user.get("user_id")
 
     # Security Fix: Prevent IDOR by asserting the image being deleted belongs solely to the mapped User ID folder
-    if not public_id.startswith(f"nowry/{user_id}/"):
+    if not public_id.startswith(f"{media_root()}/{user_id}/"):
         raise HTTPException(
             status_code=403, detail="Not authorized to delete this image."
         )
