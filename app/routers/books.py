@@ -338,6 +338,27 @@ async def get_book_by_id(
     return book
 
 
+BOOK_IMPORT_MAX_BYTES: int = int(os.getenv("BOOK_IMPORT_MAX_BYTES", str(25 * 1024 * 1024)))
+_IMPORT_READ_CHUNK: int = 1024 * 1024
+
+
+async def _read_bounded_upload(file: UploadFile) -> bytes:
+    """The upload's bytes, or 413 as soon as they pass `BOOK_IMPORT_MAX_BYTES`."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_IMPORT_READ_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > BOOK_IMPORT_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds the {BOOK_IMPORT_MAX_BYTES // (1024 * 1024)} MB limit.",
+            )
+        chunks.append(chunk)
+
+
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
 async def import_book_from_file(
     file: UploadFile = File(...),
@@ -357,9 +378,10 @@ async def import_book_from_file(
     """
     from app.utils.file_import import process_uploaded_file
 
-    # Read file content
-    file_content = await file.read()
-    filename = file.filename
+    # The upload's bytes, bounded (QA-019): a file past the cap is refused
+    # before a parser sees it, as the .apkg import does (QA-008).
+    file_content = await _read_bounded_upload(file)
+    filename = file.filename or ""
 
     # Extract pages from file
     extracted_pages = process_uploaded_file(filename, file_content)
