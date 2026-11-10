@@ -41,6 +41,7 @@ python-json-logger>=2.0.7
 PyPDF2
 pymupdf
 mammoth
+charset-normalizer>=3.3  # the import reads a text file in the encoding it was saved in (IMPORT-006)
 bcrypt
 feedparser
 

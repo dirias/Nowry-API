@@ -126,7 +126,9 @@ async def test_no_ceiling_means_no_condition():
 def test_no_book_count_cap_remains():
     source = (APP / "routers" / "books.py").read_text()
     assert "Book limit reached" not in source
-    assert source.count("ensure_document_within_ceiling(stats[\"word_count\"])") == 2
+    # create, edit and the import (IMPORT-003): every way a document is written checks the ceiling
+    assert source.count("ensure_document_within_ceiling(stats[\"word_count\"])") == 3
+    assert "ensure_document_within_ceiling(_import_word_count(extracted_pages))" in source
 
 
 def test_a_document_past_the_ceiling_is_413():

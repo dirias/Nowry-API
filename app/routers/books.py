@@ -350,6 +350,10 @@ async def get_book_by_id(
 BOOK_IMPORT_MAX_BYTES: int = int(os.getenv("BOOK_IMPORT_MAX_BYTES", str(25 * 1024 * 1024)))
 
 
+#: How many of an import's pictures are stored at once.
+IMPORT_PICTURE_CONCURRENCY: int = int(os.getenv("IMPORT_PICTURE_CONCURRENCY", "4"))
+
+
 async def _read_bounded_upload(file: UploadFile) -> bytes:
     """The upload's bytes, or 413 as soon as they pass `BOOK_IMPORT_MAX_BYTES`."""
     return await read_bounded_upload(file, BOOK_IMPORT_MAX_BYTES)
@@ -370,28 +374,49 @@ async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> 
         logger.error("Import pictures for book %s dropped: no storage backend", book_id, exc_info=True)
         return {}
     folder = f"{media_root()}/{user_id}/{book_id}"
-    placed: dict = {}
-    for picture in pictures:
-        try:
-            result = await storage.upload(
-                file_content=picture["bytes"],
-                filename=f"import-{picture['index']}.{picture['ext']}",
-                folder=folder,
-                quality="auto",
-                fetch_format="auto",
+    gate = asyncio.Semaphore(IMPORT_PICTURE_CONCURRENCY)
+
+    async def store(picture: dict) -> Optional[tuple]:
+        """One picture stored and ledgered: (marker index, placement), or None when it was dropped."""
+        async with gate:
+            try:
+                result = await storage.upload(
+                    file_content=picture["bytes"],
+                    filename=f"import-{picture['index']}.{picture['ext']}",
+                    folder=folder,
+                    quality="auto",
+                    fetch_format="auto",
+                )
+            except Exception:
+                logger.warning("Import picture %s for book %s could not be stored; dropped",
+                               picture["index"], book_id, exc_info=True)
+                return None
+            width = result.get("width") or picture.get("width")
+            height = result.get("height") or picture.get("height")
+            await media_ledger.record(
+                user_id=user_id, book_id=book_id, public_id=result["public_id"], url=result["secure_url"],
+                bytes_=result.get("bytes"), format_=result.get("format"), width=width, height=height,
             )
-        except Exception:
-            logger.warning("Import picture %s for book %s could not be stored; dropped",
-                           picture["index"], book_id, exc_info=True)
-            continue
-        width = result.get("width") or picture.get("width")
-        height = result.get("height") or picture.get("height")
-        await media_ledger.record(
-            user_id=user_id, book_id=book_id, public_id=result["public_id"], url=result["secure_url"],
-            bytes_=result.get("bytes"), format_=result.get("format"), width=width, height=height,
-        )
-        placed[picture["index"]] = {"url": result["secure_url"], "width": width, "height": height}
-    return placed
+            return picture["index"], {"url": result["secure_url"], "width": width, "height": height}
+
+    # Stored a few at a time, not one after another: a document with two dozen
+    # pictures used to outlast the client's patience and be imported twice (IMPORT-004).
+    stored = await asyncio.gather(*(store(picture) for picture in pictures))
+    return dict(entry for entry in stored if entry)
+
+
+def _import_word_count(extracted_pages: list) -> int:
+    """The words the import would save, counted the way a save counts them (pictures add none)."""
+    from app.utils.file_import import strip_media_markers
+    from app.utils.html_to_lexical import html_to_lexical_json
+    import json
+
+    html_content = strip_media_markers("\n".join(p.get("content", "") for p in extracted_pages))
+    try:
+        content = json.dumps(html_to_lexical_json(html_content))
+    except Exception:
+        return 0  # the save path has its own fallback converter and counts again
+    return int(document_stats(parse_lexical(content), content)["word_count"])
 
 
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
@@ -411,20 +436,36 @@ async def import_book_from_file(
 
     Preserves formatting, multi-column layouts, and provides quality metrics.
     """
-    from app.utils.file_import import place_media, process_uploaded_file_with_media, strip_media_markers
+    from app.utils.file_import import (
+        IMPORT_TOO_LARGE, place_media, process_uploaded_file_with_media, refusal_code, strip_media_markers,
+    )
 
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
-    # before a parser sees it, as the .apkg import does (QA-008).
-    file_content = await _read_bounded_upload(file)
+    # before a parser sees it, as the .apkg import does (QA-008). The refusal
+    # carries a code and the limit, so the client says it in its own language.
+    try:
+        file_content = await _read_bounded_upload(file)
+    except HTTPException as refused:
+        if refused.status_code != 413:
+            raise
+        raise HTTPException(
+            status_code=413,
+            detail={"code": IMPORT_TOO_LARGE, "limit_mb": BOOK_IMPORT_MAX_BYTES // (1024 * 1024)},
+        )
     filename = file.filename or ""
 
     # Extract pages from file; its pictures come back as bytes beside the HTML (ADR-062 point 5)
     extracted_pages, pictures = process_uploaded_file_with_media(filename, file_content)
 
     if not extracted_pages:
-        raise HTTPException(
-            status_code=400, detail="Failed to extract content from file"
-        )
+        # Which of the reasons it was (IMPORT-007): wrong type, old .doc, empty,
+        # password-protected, or unreadable.
+        raise HTTPException(status_code=400, detail={"code": refusal_code(filename, file_content)})
+
+    # ADR-041: the ceiling is per document, however the document arrives. An
+    # import past it is refused here, in the preview and in the save, before a
+    # picture is stored: accepted, it could never be saved again (IMPORT-003).
+    ensure_document_within_ceiling(_import_word_count(extracted_pages))
 
     # Create book title from filename or use provided title
     book_title = title if title and title.strip() else filename.rsplit(".", 1)[0]
@@ -513,6 +554,9 @@ async def import_book_from_file(
         lexical_json = simple_html_to_lexical(combined_html)
         full_content = json.dumps(lexical_json)
 
+    stats = document_stats(parse_lexical(full_content), full_content)
+    ensure_document_within_ceiling(stats["word_count"])  # the fallback converter's count, if it ran
+
     new_book = Book(
         id=book_oid,
         title=book_title,
@@ -526,7 +570,7 @@ async def import_book_from_file(
         cover_color="#4A90E2",
         source="imported",
         page_count=len(extracted_pages),
-        **document_stats(parse_lexical(full_content), full_content),
+        **stats,
     )
 
     # Inserted under the id minted above, the one its pictures are stored under

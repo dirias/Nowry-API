@@ -294,3 +294,389 @@ def test_a_preview_stores_nothing_and_shows_no_marker(world):
     assert body["metadata"]["pictures"] == 1
     assert "data-media" not in body["sample_pages"][0]["content_preview"]
     assert fake.uploads == [] and world.run(world.raw["media"].count_documents({})) == 0
+
+
+# ── IMPORT-001..004: an import loses nothing and can be saved again ─────────
+
+def _walk(node):
+    yield node
+    for child in node.get("children", []):
+        yield from _walk(child)
+
+
+def _text(node) -> str:
+    return " ".join(n["text"] for n in _walk(node) if n.get("type") == "text")
+
+
+def test_every_node_the_converter_emits_carries_the_fields_the_editor_reads():
+    """IMPORT-001: a list item without `indent` made the editor stop parsing at the first list."""
+    root = html_to_lexical_json("<h2>Organelles</h2><p>Intro <b>bold</b></p><ul><li>Nucleus</li><li>Ribosome</li></ul>")["root"]
+    for node in _walk(root):
+        assert node.get("version") == 1, node
+        if node["type"] in ("paragraph", "heading", "list", "listitem"):
+            assert isinstance(node["indent"], int) and node["format"] == "" and "direction" in node, node
+        if node["type"] == "listitem":
+            assert isinstance(node["value"], int) and node["value"] >= 1
+        if node["type"] == "list":
+            assert node["tag"] in ("ul", "ol") and node["start"] == 1
+    assert [n["value"] for n in root["children"][2]["children"]] == [1, 2]
+
+
+def test_an_item_with_a_nested_list_keeps_its_own_text_and_wraps_the_list():
+    """IMPORT-001: 'Mitochondrion' used to vanish, and the nested list sat bare inside its parent."""
+    root = html_to_lexical_json(
+        "<ul><li>Nucleus</li><li>Mitochondrion<ul><li>Cristae</li><li>Matrix</li></ul></li><li>Ribosome</li></ul>"
+    )["root"]
+    (outer,) = root["children"]
+    rows = outer["children"]
+    assert [_text(row) for row in rows] == ["Nucleus", "Mitochondrion", "Cristae Matrix", "Ribosome"]
+    wrapper = rows[2]
+    assert [child["type"] for child in wrapper["children"]] == ["list"]
+    assert all(child["type"] == "listitem" for child in outer["children"])
+    assert [item["indent"] for item in wrapper["children"][0]["children"]] == [1, 1]
+    assert [row["value"] for row in rows if row is not wrapper] == [1, 2, 3]
+
+
+def test_a_paragraph_inside_a_list_item_is_the_items_text():
+    """IMPORT-001: a footnote's `<li><p>…</p></li>` lost its text."""
+    root = html_to_lexical_json('<ol><li id="footnote-1"><p>The note itself.</p></li></ol><p>After.</p>')["root"]
+    assert _text(root["children"][0]) == "The note itself."
+    assert root["children"][1]["type"] == "paragraph"
+
+
+def test_the_page_splitter_returns_every_character_it_was_given():
+    """IMPORT-002: text between two inline runs of a paragraph, and a list's closing tag, were dropped."""
+    from app.utils.file_import import split_html_into_pages
+    html_content = ("<p>The cell is the <strong>basic unit</strong> of <em>life</em>. Truly.</p>"
+                    "<ul><li>Nucleus<ul><li>Envelope</li></ul></li></ul>"
+                    '<p><img data-media="1" alt="x" /></p><table><tr><td><p>cell</p></td></tr></table>')
+    for max_chars in (5, 40, 3000):
+        assert "".join(split_html_into_pages(html_content, max_chars)) == html_content
+    assert len(split_html_into_pages(html_content, 5)) == 3  # the picture has no text, so it rides with the table
+
+
+def _docx_with_runs() -> bytes:
+    body = ('<w:p><w:r><w:t xml:space="preserve">The cell is the </w:t></w:r>'
+            '<w:r><w:rPr><w:b/></w:rPr><w:t>basic unit</w:t></w:r>'
+            '<w:r><w:t xml:space="preserve"> of </w:t></w:r>'
+            '<w:r><w:rPr><w:i/></w:rPr><w:t>life</w:t></w:r>'
+            '<w:r><w:t>, everywhere.</w:t></w:r></w:p>')
+    return _replace_document_body(docx_bytes(("x",)), body)
+
+
+def _replace_document_body(archive_bytes: bytes, body: str) -> bytes:
+    source = zipfile.ZipFile(io.BytesIO(archive_bytes))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in source.namelist():
+            data = source.read(name)
+            if name == "word/document.xml":
+                data = data.decode().replace("<w:p><w:r><w:t>x</w:t></w:r></w:p>", body).encode()
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+def test_a_docx_paragraph_keeps_the_plain_text_between_its_formatted_runs(world):
+    """IMPORT-002, end to end: the words outside bold and italic arrive in the saved document."""
+    response = _upload(world, "cell.docx", _docx_with_runs())
+    assert response.status_code == 200, response.text
+    stored = world.run(world.raw["books"].find_one({}))
+    text = _text(json.loads(stored["full_content"])["root"])
+    for piece in ("The cell is the", "basic unit", "of", "life", ", everywhere."):
+        assert piece in text, text
+
+
+@pytest.mark.parametrize("form", [{"preview": "true"}, {}])
+def test_an_import_past_the_word_ceiling_is_refused_with_the_code(world, form):
+    """IMPORT-003 / ADR-041: accepted, the document could never be saved again."""
+    storage = FakeStorage()
+    with patch("app.routers.books.SUBSCRIPTION_PLANS", {"free": {"limits": {"document_words": 50}}}), \
+            patch("app.routers.books.SubscriptionTier") as tier, \
+            patch("app.routers.books.get_storage_backend", return_value=storage):
+        tier.FREE = "free"
+        response = _upload(world, "long.txt", txt_bytes(), **form)
+    assert response.status_code == 413, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "document_too_long" and detail["limit"] == 50 and detail["words"] > 50
+    assert world.run(world.raw["books"].count_documents({})) == 0 and storage.uploads == []
+
+
+def test_an_import_under_the_ceiling_is_saved_with_its_word_count(world):
+    response = _upload(world, "mito.txt", txt_bytes())
+    assert response.status_code == 200, response.text
+    assert world.run(world.raw["books"].find_one({}))["word_count"] > 100
+
+
+def test_import_pictures_are_stored_several_at_a_time_and_each_keeps_its_place(world):
+    """IMPORT-004: one after another, two dozen pictures outlasted the client's timeout."""
+    import asyncio
+    from app.routers import books as books_router
+
+    class SlowStorage(FakeStorage):
+        running = peak = 0
+
+        async def upload(self, file_content, filename, folder="", **options):
+            SlowStorage.running += 1
+            SlowStorage.peak = max(SlowStorage.peak, SlowStorage.running)
+            await asyncio.sleep(0.01)
+            SlowStorage.running -= 1
+            index = int(filename.split("-")[1].split(".")[0])
+            return {"secure_url": f"https://cdn.test/{folder}/{index}.png", "public_id": f"{folder}/{index}",
+                    "width": 10, "height": 10, "format": "png", "bytes": len(file_content)}
+
+    pictures = [{"index": n, "bytes": png_bytes(), "ext": "png", "width": 1, "height": 1} for n in range(1, 13)]
+    with patch("app.routers.books.get_storage_backend", return_value=SlowStorage()):
+        placed = world.run(books_router._store_import_pictures(pictures, world.current["user"]["user_id"], "b" * 24))
+    assert sorted(placed) == list(range(1, 13))
+    assert all(placed[n]["url"].endswith(f"/{n}.png") for n in placed)
+    assert 1 < SlowStorage.peak <= books_router.IMPORT_PICTURE_CONCURRENCY
+    assert world.run(world.raw["media"].count_documents({})) == 12
+
+
+# ── IMPORT-006/007: any common encoding is read, and a refusal says why ─────
+
+SPANISH = "Tema 3: La célula\n\nAño, niño, pingüino, ¿qué? ¡ánimo! Señor Núñez."
+JAPANESE = "日本語のノート\n\n細胞は生命の基本単位です。漢字、ひらがな、カタカナ。"
+
+
+@pytest.mark.parametrize("label, data, expected", [
+    ("utf-8", SPANISH.encode("utf-8"), SPANISH),
+    ("utf-8 with a mark", b"\xef\xbb\xbf" + SPANISH.encode("utf-8"), SPANISH),
+    ("windows-1252", SPANISH.encode("cp1252"), SPANISH),
+    ("windows-1252 curly quotes", "He said “hello” — it’s fine. Café, naïve.".encode("cp1252"),
+     "He said “hello” — it’s fine. Café, naïve."),
+    ("utf-16 with a mark", SPANISH.encode("utf-16"), SPANISH),
+    ("utf-16 without a mark", SPANISH.encode("utf-16-le"), SPANISH),
+    ("shift-jis", JAPANESE.encode("shift_jis"), JAPANESE),
+])
+def test_a_text_file_is_read_in_the_encoding_it_was_saved_in(label, data, expected):
+    from app.utils.file_import import decode_text
+    assert decode_text(data) == expected, label
+
+
+@pytest.mark.parametrize("data", [b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x40", bytes(range(256)) * 8])
+def test_bytes_that_are_not_text_are_not_decoded_as_text(data):
+    from app.utils.file_import import decode_text
+    assert decode_text(data) is None
+
+
+def test_a_windows_text_file_is_imported_with_its_accents(world):
+    response = _upload(world, "apuntes.txt", SPANISH.encode("cp1252"))
+    assert response.status_code == 200, response.text
+    stored = world.run(world.raw["books"].find_one({}))
+    assert "pingüino" in stored["full_content"] or "ping\\u00fcino" in stored["full_content"]
+    assert "﻿" not in json.loads(stored["full_content"])["root"]["children"][0]["children"][0]["text"]
+
+
+def _encrypted_pdf() -> bytes:
+    import fitz
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), PARAGRAPH, fontsize=11)
+    return doc.tobytes(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw="secret", owner_pw="owner")
+
+
+def _blank_pdf() -> bytes:
+    import fitz
+    doc = fitz.open()
+    doc.new_page()
+    return doc.tobytes()
+
+
+@pytest.mark.parametrize("name, content, code", [
+    ("notes.md", b"# Title\n\ntext", "import_unsupported_type"),
+    ("book.epub", b"PK\x03\x04", "import_unsupported_type"),
+    ("no-extension", b"some text", "import_unsupported_type"),
+    ("old.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "import_legacy_doc"),
+    ("empty.txt", b"", "import_empty"),
+    ("spaces.txt", b"  \n\n \n", "import_empty"),
+    ("blank.pdf", _blank_pdf(), "import_empty"),
+    ("locked.pdf", _encrypted_pdf(), "import_password_protected"),
+    ("broken.pdf", b"%PDF-1.4 nope", "import_unreadable"),
+    ("broken.docx", b"PK\x03\x04 not a docx", "import_unreadable"),
+    ("photo.txt", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "import_unreadable"),
+])
+def test_a_refused_import_says_which_reason_it_was(world, name, content, code):
+    """IMPORT-007: every cause used to be one English sentence."""
+    for form in ({"preview": "true"}, {}):
+        response = _upload(world, name, content, **form)
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == {"code": code}
+    assert world.run(world.raw["books"].count_documents({})) == 0
+
+
+def test_an_oversize_import_is_refused_with_a_code_and_the_limit(world):
+    with patch("app.routers.books.BOOK_IMPORT_MAX_BYTES", 2 * 1024 * 1024):
+        response = _upload(world, "big.txt", b"x" * (3 * 1024 * 1024))
+    assert response.status_code == 413
+    assert response.json()["detail"] == {"code": "import_too_large", "limit_mb": 2}
+
+
+# ── IMPORT-009..012: formatting, structure and lines survive the import ─────
+
+def _first(root, node_type):
+    return next(node for node in _walk(root) if node.get("type") == node_type)
+
+
+def test_formatting_is_lexicals_bitmask_not_a_list_of_names():
+    """IMPORT-009: `["bold"]` read as no formatting at all in the editor and on the phone."""
+    root = html_to_lexical_json(
+        "<p><strong>b</strong> <em>i</em> <u>u</u> <s>s</s> <code>c</code> <sub>x</sub> <sup>y</sup> "
+        "<strong><em>bi</em></strong></p>"
+    )["root"]
+    formats = {node["text"].strip(): node["format"] for node in _walk(root) if node.get("type") == "text" and node["text"].strip()}
+    assert formats == {"b": 1, "i": 2, "u": 8, "s": 4, "c": 16, "x": 32, "y": 64, "bi": 3}
+
+
+def test_the_space_around_a_formatted_run_is_kept_and_only_the_ends_are_trimmed():
+    """IMPORT-010: every text node was stripped, so 'is the **unit** of' read 'is theunitof'."""
+    root = html_to_lexical_json("<p>  The cell is the <strong>basic unit</strong> of   <em>life</em> .\n</p>")["root"]
+    (paragraph,) = root["children"]
+    assert "".join(node["text"] for node in paragraph["children"]) == "The cell is the basic unit of life ."
+    root = html_to_lexical_json("<p><strong>Bold words</strong> <em>and italics</em></p>")["root"]
+    assert "".join(node["text"] for node in root["children"][0]["children"]) == "Bold words and italics"
+
+
+def test_a_table_becomes_a_table_with_rows_cells_and_headers():
+    root = html_to_lexical_json(
+        "<table><thead><tr><th><p>Organelle</p></th><th>Role</th></tr></thead>"
+        "<tbody><tr><td><p>Nucleus</p></td><td></td></tr></tbody></table><p>After</p>"
+    )["root"]
+    table, after = root["children"]
+    assert table["type"] == "table" and after["type"] == "paragraph"
+    assert [[cell["headerState"] for cell in row["children"]] for row in table["children"]] == [[1, 1], [0, 0]]
+    assert [[_text(cell) for cell in row["children"]] for row in table["children"]] == [["Organelle", "Role"], ["Nucleus", ""]]
+    for row in table["children"]:
+        assert row["type"] == "tablerow"
+        for cell in row["children"]:
+            assert cell["type"] == "tablecell" and cell["colSpan"] == 1 and cell["rowSpan"] == 1
+            assert cell["children"] and cell["children"][0]["type"] == "paragraph"  # never an empty cell
+
+
+def test_a_link_keeps_its_address_and_a_bookmark_is_only_its_text():
+    root = html_to_lexical_json(
+        '<p>See <a href="https://example.com/a">the page</a>, note<sup><a href="#fn1">[1]</a></sup> '
+        '<a href="javascript:alert(1)">x</a><a id="anchor"></a>.</p>'
+    )["root"]
+    links = [node for node in _walk(root) if node.get("type") == "link"]
+    assert [(link["url"], _text(link)) for link in links] == [("https://example.com/a", "the page")]
+    assert "[1]" in _text(root) and "javascript" not in json.dumps(root)
+
+
+def test_a_quote_and_a_code_block_keep_their_kind():
+    root = html_to_lexical_json("<blockquote><p>A quotation.</p></blockquote><pre>a = 1\n  b = 2</pre><p>x</p>")["root"]
+    quote, code, paragraph = root["children"]
+    assert quote["type"] == "quote" and _text(quote) == "A quotation."
+    assert code["type"] == "code"
+    assert [(n["type"], n.get("text")) for n in code["children"]] == [("text", "a = 1"), ("linebreak", None), ("text", "  b = 2")]
+    assert paragraph["type"] == "paragraph"
+
+
+def _pdf_of(draw) -> bytes:
+    import fitz
+    doc = fitz.open()
+    draw(doc)
+    return doc.tobytes()
+
+
+def _html_of_pdf(draw) -> str:
+    return "\n".join(page["content"] for page in process_uploaded_file("notes.pdf", _pdf_of(draw)))
+
+
+def test_pdf_lines_that_start_with_a_bullet_or_a_number_are_lists():
+    """IMPORT-011: they were one paragraph, '· A · B · C'."""
+    def draw(doc):
+        page = doc.new_page()
+        page.insert_text((72, 100), "Organelles of the cell:", fontsize=11)
+        for index, item in enumerate(["- Nucleus: holds the DNA", "- Mitochondrion: makes ATP", "- Ribosome"]):
+            page.insert_text((90, 130 + 15 * index), item, fontsize=11)
+        for index, item in enumerate(["First step", "Second step"]):
+            page.insert_text((90, 200 + 15 * index), f"{index + 1}. {item}", fontsize=11)
+        page.insert_text((72, 260), "1. A numbered heading", fontsize=19)
+    content = _html_of_pdf(draw)
+    assert "<ul><li>Nucleus: holds the DNA</li><li>Mitochondrion: makes ATP</li><li>Ribosome</li></ul>" in content
+    assert "<ol><li>First step</li><li>Second step</li></ol>" in content
+    assert "<h2>1. A numbered heading</h2>" in content
+    root = html_to_lexical_json(content)["root"]
+    assert [node["listType"] for node in root["children"] if node["type"] == "list"] == ["bullet", "number"]
+
+
+def test_pdf_lines_of_one_paragraph_join_as_a_reader_would_join_them():
+    """IMPORT-011: a word cut at the line end is one word; Japanese lines join without a space."""
+    def draw(doc):
+        page = doc.new_page()
+        page.insert_text((72, 100), "A word cut by a hyphen at the end of the li-\nne joins, and a plain line\nbreak is a space.", fontsize=11)
+        page.insert_text((72, 200), "細胞は生命の基本単位です。\n二行目のテキスト。", fontsize=11, fontname="japan")
+    content = _html_of_pdf(draw)
+    assert "at the end of the line joins, and a plain line break is a space." in content
+    assert "細胞は生命の基本単位です。二行目のテキスト。" in content
+
+
+def test_pdf_running_headers_and_footers_are_left_out_but_body_text_is_not():
+    def draw(doc):
+        for number in range(1, 5):
+            page = doc.new_page()
+            page.insert_text((72, 40), "Biology notes — chapter 3", fontsize=8)
+            page.insert_text((72, 100), f"Body of page {number}. " + PARAGRAPH, fontsize=11)
+            page.insert_text((72, 815), f"Page {number} of 4", fontsize=8)
+    pages = process_uploaded_file("notes.pdf", _pdf_of(draw))
+    content = "\n".join(page["content"] for page in pages)
+    assert "Biology notes" not in content and "of 4" not in content
+    assert all(f"Body of page {n}." in content for n in range(1, 5))
+    single = process_uploaded_file("one.pdf", _pdf_of(lambda doc: doc.new_page().insert_text((72, 40), "A title in the margin", fontsize=8)))
+    assert "A title in the margin" in single[0]["content"]  # one page: nothing repeats, nothing is dropped
+
+
+def test_a_ruled_pdf_table_is_a_table():
+    def draw(doc):
+        import fitz
+        page = doc.new_page()
+        page.insert_text((72, 80), "Before the table.", fontsize=11)
+        rows = [("Organelle", "Role", "Size"), ("Nucleus", "DNA", "6 um"), ("Ribosome", "Proteins", "25 nm")]
+        for r, row in enumerate(rows):
+            for c, cell in enumerate(row):
+                page.insert_text((76 + c * 150, 120 + r * 17), cell, fontsize=11)
+                page.draw_rect(fitz.Rect(72 + c * 150, 108 + r * 17, 222 + c * 150, 125 + r * 17), width=0.5)
+        page.insert_text((72, 200), "After the table.", fontsize=11)
+    content = _html_of_pdf(draw)
+    root = html_to_lexical_json(content)["root"]
+    table = _first(root, "table")
+    assert [[_text(cell) for cell in row["children"]] for row in table["children"]] == [
+        ["Organelle", "Role", "Size"], ["Nucleus", "DNA", "6 um"], ["Ribosome", "Proteins", "25 nm"]]
+    kinds = [node["type"] for node in root["children"]]
+    assert kinds == ["paragraph", "table", "paragraph"] and content.count("Nucleus") == 1
+
+
+def _txt_html(text: str) -> str:
+    return "".join(page["content"] for page in process_uploaded_file("notes.txt", text.encode()))
+
+
+def test_a_text_file_with_windows_line_endings_keeps_its_paragraphs():
+    """IMPORT-012: `\\r\\n\\r\\n` was not a paragraph break, so the whole file was one paragraph."""
+    assert _txt_html("First paragraph.\r\n\r\nSecond paragraph.\r\n") == "<p>First paragraph.</p><p>Second paragraph.</p>"
+    assert _txt_html("Old Mac.\r\rSecond.") == "<p>Old Mac.</p><p>Second.</p>"
+
+
+def test_text_lines_are_lines_and_marked_lines_are_lists_and_headings():
+    content = _txt_html(
+        "# Topic 3\n\nOrganelles:\n- Nucleus\n- Ribosome\n  makes proteins\n\n1. First\n2) Second\n\n"
+        "Line one\nline two\n\n#hashtag is not a heading\n\n<b>literal</b> & more"
+    )
+    assert content == (
+        "<h1>Topic 3</h1><p>Organelles:</p><ul><li>Nucleus</li><li>Ribosome makes proteins</li></ul>"
+        "<ol><li>First</li><li>Second</li></ol><p>Line one<br>line two</p><p>#hashtag is not a heading</p>"
+        "<p>&lt;b&gt;literal&lt;/b&gt; &amp; more</p>"
+    )
+    root = html_to_lexical_json(content)["root"]
+    assert [node["type"] for node in root["children"]] == ["heading", "paragraph", "list", "list", "paragraph", "paragraph", "paragraph"]
+    line_pair = root["children"][4]["children"]
+    assert [node["type"] for node in line_pair] == ["text", "linebreak", "text"] and line_pair[2]["text"] == "line two"
+    assert _text(root["children"][6]) == "<b>literal</b> & more"
+
+
+def test_hard_wrapped_prose_is_joined_back_into_a_paragraph():
+    wrapped = ("The mitochondrion is the organelle that produces most of the cell's supply of\n"
+               "adenosine triphosphate, which is then used as a source of chemical energy by nearly\n"
+               "every process in the cell, including growth and move-\nment of the cell itself.")
+    assert _txt_html(wrapped) == ("<p>The mitochondrion is the organelle that produces most of the cell&#x27;s supply of "
+                                  "adenosine triphosphate, which is then used as a source of chemical energy by nearly "
+                                  "every process in the cell, including growth and movement of the cell itself.</p>")
