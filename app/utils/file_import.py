@@ -869,8 +869,31 @@ def process_uploaded_file_with_media(filename: str, file_content: bytes) -> Tupl
         pages = []
 
     if pages:
-        pages[0].setdefault("extraction_metadata", {})["pictures"] = len(media)
+        _count_pages(pages)
+        metadata = pages[0].setdefault("extraction_metadata", {})
+        metadata.setdefault("total_pages", len(pages))
+        metadata.setdefault("total_words", sum(p["word_count"] for p in pages))
+        metadata.setdefault("total_chars", sum(p["char_count"] for p in pages))
+        metadata.setdefault("multi_column_pages", 0)
+        metadata["pictures"] = len(media)
     return pages, media
+
+
+_ANY_TAG = re.compile(r"<[^>]+>")
+
+
+def _count_pages(pages: List[Dict]) -> None:
+    """Give every page its word and character count.
+
+    Only the PDF reader counted, so a preview of a text or Word file said
+    "0 words" of a document it had just read (IMPORT-013).
+    """
+    for page in pages:
+        if "word_count" in page and "char_count" in page:
+            continue
+        text = html.unescape(_ANY_TAG.sub(" ", page.get("content", "")))
+        page.setdefault("word_count", len(text.split()))
+        page.setdefault("char_count", len(" ".join(text.split())))
 
 
 def process_uploaded_file(filename: str, file_content: bytes) -> List[Dict[str, str]]:

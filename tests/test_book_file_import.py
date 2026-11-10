@@ -680,3 +680,35 @@ def test_hard_wrapped_prose_is_joined_back_into_a_paragraph():
     assert _txt_html(wrapped) == ("<p>The mitochondrion is the organelle that produces most of the cell&#x27;s supply of "
                                   "adenosine triphosphate, which is then used as a source of chemical energy by nearly "
                                   "every process in the cell, including growth and movement of the cell itself.</p>")
+
+
+# ── IMPORT-013: the preview says facts ──────────────────────────────────────
+
+@pytest.mark.parametrize("name, content", [("mito.txt", txt_bytes()), ("mito.docx", docx_bytes()), ("mito.pdf", pdf_bytes(2))])
+def test_a_preview_counts_the_words_of_every_kind_of_file_and_warns_of_nothing(world, name, content):
+    """Only the PDF reader counted, so a text or Word preview said 0 words and 'low word count'."""
+    body = _upload(world, name, content, preview="true").json()
+    assert body["facts"]["words"] > 10 and body["facts"]["pages"] == body["total_pages"]
+    assert body["facts"]["pictures"] == 0 and body["facts"]["scanned"] is False
+    assert body["quality_summary"]["total_words"] == body["facts"]["words"]
+    assert all(page["word_count"] > 0 for page in body["sample_pages"])
+    assert body["warnings"] == [] and body["info"] is None
+
+
+def test_a_preview_of_a_scan_says_it_is_one(world):
+    import fitz
+    doc = fitz.open()
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 30), False)
+    pixmap.set_rect(pixmap.irect, (200, 40, 40))
+    for _ in range(2):
+        page = doc.new_page()
+        page.insert_image(page.rect, pixmap=pixmap)
+    facts = _upload(world, "scan.pdf", doc.tobytes(), preview="true").json()["facts"]
+    assert facts == {"pages": 2, "words": 0, "pictures": 2, "scanned": True}
+
+
+def test_a_preview_carries_the_first_pages_only_and_still_says_how_many_there_are(world):
+    with patch("app.routers.books.PREVIEW_PAGE_LIMIT", 3):
+        body = _upload(world, "long.pdf", pdf_bytes(7), preview="true").json()
+    assert body["total_pages"] == 7 and body["facts"]["pages"] == 7
+    assert [page["page_number"] for page in body["sample_pages"]] == [1, 2, 3]

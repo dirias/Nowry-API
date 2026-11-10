@@ -350,6 +350,9 @@ async def get_book_by_id(
 BOOK_IMPORT_MAX_BYTES: int = int(os.getenv("BOOK_IMPORT_MAX_BYTES", str(25 * 1024 * 1024)))
 
 
+#: How many pages a preview carries.
+PREVIEW_PAGE_LIMIT: int = 20
+
 #: How many of an import's pictures are stored at once.
 IMPORT_PICTURE_CONCURRENCY: int = int(os.getenv("IMPORT_PICTURE_CONCURRENCY", "4"))
 
@@ -473,21 +476,24 @@ async def import_book_from_file(
     # Get extraction metadata
     metadata = extracted_pages[0].get("extraction_metadata", {})
 
-    # Calculate quality warnings
-    warnings = []
-    avg_words_per_page = (
-        metadata.get("total_words", 0) / len(extracted_pages) if extracted_pages else 0
-    )
-
-    if avg_words_per_page < 100:
-        warnings.append("Low word count detected - extraction may be incomplete")
-
-    if metadata.get("multi_column_pages", 0) > 0:
-        info_msg = (
-            f"{metadata['multi_column_pages']} pages have 2-column layout (preserved)"
-        )
-    else:
-        info_msg = "Single column layout detected"
+    # What the file holds, as facts the client words itself (IMPORT-013). The
+    # old "low word count" warning fired on every text and Word file, because
+    # only the PDF reader counted words, and on any slide deck; "N pages have
+    # 2-column layout (preserved)" promised a layout the document does not keep.
+    # Both are gone: `warnings` and `info` stay in the answer, empty, for a
+    # client that still reads them.
+    warnings: list = []
+    info_msg = None
+    total_words = int(metadata.get("total_words", 0))
+    facts = {
+        "pages": len(extracted_pages),
+        "words": total_words,
+        "pictures": len(pictures),
+        # Pages that are pictures and no text: a scan. It imports, but there is
+        # nothing in it to make cards from, and the reader should hear that first.
+        "scanned": total_words == 0 and len(pictures) > 0,
+    }
+    avg_words_per_page = total_words / len(extracted_pages) if extracted_pages else 0
 
     # PREVIEW MODE: Return extraction data for validation
     if preview:
@@ -496,6 +502,7 @@ async def import_book_from_file(
             "title": book_title,
             "total_pages": len(extracted_pages),
             "metadata": metadata,
+            "facts": facts,
             "info": info_msg,
             "warnings": warnings,
             "file_info": {
@@ -520,7 +527,9 @@ async def import_book_from_file(
                     "has_columns": p.get("has_columns", False),
                     "quality_score": p.get("quality_score", 0),
                 }
-                for p in extracted_pages  # ALL pages for preview
+                # The first pages only: a preview is a look, and every page of
+                # a 500-page file was megabytes the reader never paged through.
+                for p in extracted_pages[:PREVIEW_PAGE_LIMIT]
             ],
             "quality_summary": {
                 "total_words": metadata.get("total_words", 0),
