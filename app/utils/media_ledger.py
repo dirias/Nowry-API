@@ -25,6 +25,9 @@ from app.utils.storage import get_storage_backend
 
 logger = get_logger(__name__)
 
+#: The `origin` of a ledger row written for a picture that came with an imported file.
+ORIGIN_IMPORT = "import"
+
 #: A sweep reads at most this many rows at once; a book or an account with
 #: more is swept in rounds until the ledger is empty for it.
 SWEEP_PAGE = 500
@@ -44,6 +47,7 @@ async def record(
     format_: Optional[str],
     width: Optional[int],
     height: Optional[int],
+    origin: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Write one row for a stored image and return it.
 
@@ -62,6 +66,10 @@ async def record(
         "height": height,
         "created_at": datetime.now(timezone.utc),
     }
+    if origin:
+        # How the image came to be stored. "import" is what the monthly count
+        # leaves out (ADR-067): a file's pictures are not the reader's uploads.
+        row["origin"] = origin
     await media_collection.update_one(
         {"public_id": public_id},
         # A storage id written again is wanted again: whatever marked it for removal no longer holds.
@@ -101,9 +109,13 @@ def month_start(now: Optional[datetime] = None) -> datetime:
 
 
 async def count_this_month(user_id: str) -> int:
-    """How many images the account stored since the month began — the plan's unit."""
+    """How many images the account uploaded since the month began — the plan's unit.
+
+    Pictures that arrived inside an imported file are not counted (ADR-067):
+    importing is free, and an import has its own ceiling per document.
+    """
     return await media_collection.count_documents(
-        {"user_id": user_id, "created_at": {"$gte": month_start()}}
+        {"user_id": user_id, "created_at": {"$gte": month_start()}, "origin": {"$ne": ORIGIN_IMPORT}}
     )
 
 

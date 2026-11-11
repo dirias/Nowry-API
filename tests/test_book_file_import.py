@@ -704,7 +704,8 @@ def test_a_preview_of_a_scan_says_it_is_one(world):
         page = doc.new_page()
         page.insert_image(page.rect, pixmap=pixmap)
     facts = _upload(world, "scan.pdf", doc.tobytes(), preview="true").json()["facts"]
-    assert facts == {"pages": 2, "words": 0, "pictures": 2, "scanned": True, "damaged": False}
+    assert facts == {"pages": 2, "words": 0, "pictures": 2, "pictures_kept": 2, "picture_limit": 100,
+                     "scanned": True, "damaged": False}
 
 
 def test_a_preview_carries_the_first_pages_only_and_still_says_how_many_there_are(world):
@@ -949,3 +950,59 @@ def test_the_preview_and_the_saved_document_agree_on_the_word_count(world):
     assert _upload(world, "notes.pdf", data).status_code == 200
     stored = world.run(world.raw["books"].find_one({}))
     assert preview["facts"]["words"] == stored["word_count"] == preview["quality_summary"]["total_words"]
+
+
+# ── IMPORT-029 / ADR-067: an import's pictures are free of the month and capped per document ──
+
+def _pdf_with_pictures(count: int) -> bytes:
+    import fitz
+    doc = fitz.open()
+    for n in range(count):
+        page = doc.new_page()
+        page.insert_text((72, 80), f"Page {n + 1} of the handout, with its own picture.", fontsize=11)
+        pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 20 + n, 12), False)
+        pixmap.set_rect(pixmap.irect, (10 * n % 255, 80, 160))
+        page.insert_image(fitz.Rect(72, 100, 272, 220), pixmap=pixmap)
+    return doc.tobytes()
+
+
+def test_an_import_over_the_picture_ceiling_keeps_the_first_ones_and_all_the_text(world):
+    storage = FakeStorage()
+    data = _pdf_with_pictures(5)
+    with patch("app.routers.books.get_storage_backend", return_value=storage), \
+            patch("app.utils.file_import.IMPORT_PICTURES_PER_DOCUMENT", 3):
+        facts = _upload(world, "handout.pdf", data, preview="true").json()["facts"]
+        assert (facts["pictures"], facts["pictures_kept"], facts["picture_limit"]) == (5, 3, 3)
+        assert _upload(world, "handout.pdf", data).status_code == 200
+    stored = world.run(world.raw["books"].find_one({}))
+    root = json.loads(stored["full_content"])["root"]
+    assert sum(1 for node in _walk(root) if node.get("type") == "image") == 3 and len(storage.uploads) == 3
+    assert all(f"Page {n} of the handout" in _text(root) for n in range(1, 6))
+    assert "data-media" not in stored["full_content"]
+
+
+def test_an_import_at_the_ceiling_keeps_every_picture(world):
+    storage = FakeStorage()
+    with patch("app.routers.books.get_storage_backend", return_value=storage), \
+            patch("app.utils.file_import.IMPORT_PICTURES_PER_DOCUMENT", 3):
+        facts = _upload(world, "three.pdf", _pdf_with_pictures(3), preview="true").json()["facts"]
+    assert (facts["pictures"], facts["pictures_kept"]) == (3, 3)
+
+
+def test_import_pictures_are_ledgered_as_imports_and_not_counted_in_the_month(world):
+    from app.utils import media_ledger
+    storage = FakeStorage()
+    uid = world.current["user"]["user_id"]
+    with patch("app.routers.books.get_storage_backend", return_value=storage):
+        assert _upload(world, "handout.pdf", _pdf_with_pictures(4)).status_code == 200
+    rows = world.run(world.raw["media"].find({}).to_list(length=20))
+    assert len(rows) == 4 and all(row["origin"] == "import" and row["book_id"] for row in rows)
+    assert world.run(media_ledger.count_this_month(uid)) == 0
+    world.run(media_ledger.record(user_id=uid, book_id="b", public_id="root/u/b/own", url="u", bytes_=1,
+                                  format_="png", width=1, height=1))
+    assert world.run(media_ledger.count_this_month(uid)) == 1  # the reader's own upload still counts
+
+
+def test_the_default_ceiling_is_one_named_number():
+    from app.utils import file_import
+    assert file_import.IMPORT_PICTURES_PER_DOCUMENT == 100

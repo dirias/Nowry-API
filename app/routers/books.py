@@ -451,6 +451,7 @@ async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> 
             await media_ledger.record(
                 user_id=user_id, book_id=book_id, public_id=result["public_id"], url=result["secure_url"],
                 bytes_=result.get("bytes"), format_=result.get("format"), width=width, height=height,
+                origin=media_ledger.ORIGIN_IMPORT,
             )
             return picture["index"], {"url": result["secure_url"], "width": width, "height": height}
 
@@ -512,7 +513,7 @@ async def import_book_from_file(
     Preserves formatting, multi-column layouts, and provides quality metrics.
     """
     from app.utils.file_import import (
-        IMPORT_TOO_LARGE, place_media, process_uploaded_file_with_media, refusal_code, strip_media_markers,
+        IMPORT_PICTURES_PER_DOCUMENT, IMPORT_TOO_LARGE, place_media, process_uploaded_file_with_media, refusal_code, strip_media_markers,
     )
 
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
@@ -531,6 +532,11 @@ async def import_book_from_file(
 
     # Extract pages from file; its pictures come back as bytes beside the HTML (ADR-062 point 5)
     extracted_pages, pictures = process_uploaded_file_with_media(filename, file_content)
+    # ADR-067: an import keeps the first IMPORT_PICTURES_PER_DOCUMENT pictures. The
+    # text is imported whole; the markers of the pictures left out are dropped
+    # with them, and the preview says how many will be kept.
+    pictures_found = len(pictures)
+    pictures = pictures[:IMPORT_PICTURES_PER_DOCUMENT]
 
     if not extracted_pages:
         # Which of the reasons it was (IMPORT-007): wrong type, old .doc, empty,
@@ -571,10 +577,12 @@ async def import_book_from_file(
     facts = {
         "pages": len(extracted_pages),
         "words": total_words,
-        "pictures": len(pictures),
+        "pictures": pictures_found,
+        "pictures_kept": len(pictures),
+        "picture_limit": IMPORT_PICTURES_PER_DOCUMENT,
         # Pages that are pictures and no text: a scan. It imports, but there is
         # nothing in it to make cards from, and the reader should hear that first.
-        "scanned": total_words == 0 and len(pictures) > 0,
+        "scanned": total_words == 0 and pictures_found > 0,
         # The file was broken and only what could be rebuilt was read (IMPORT-021).
         "damaged": bool(metadata.get("damaged")),
     }

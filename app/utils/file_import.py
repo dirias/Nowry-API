@@ -8,6 +8,7 @@ import mammoth
 from typing import Dict, List, Optional, Tuple
 import codecs
 import logging
+import os
 import unicodedata
 import re
 import html
@@ -23,6 +24,11 @@ logger = logging.getLogger(__name__)
 # and the route stores the bytes and puts the stored URL where the marker was.
 # A marker nothing replaced is dropped by `place_media`, so a data URL can
 # never enter a document through an import.
+
+#: The most pictures one import keeps (ADR-067). A default, not a law: it bounds
+#: what a single file can put in storage now that an import's pictures are free
+#: of the monthly count, and it is expected to move with what storage costs.
+IMPORT_PICTURES_PER_DOCUMENT: int = int(os.getenv("IMPORT_PICTURES_PER_DOCUMENT", "100"))
 
 _MARKER = re.compile(r'<img\b[^>]*\bdata-media="(\d+)"[^>]*/?>', re.IGNORECASE)
 _ALT = re.compile(r'\balt="([^"]*)"')
