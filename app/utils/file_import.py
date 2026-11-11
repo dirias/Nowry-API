@@ -71,7 +71,7 @@ def strip_media_markers(html_content: str) -> str:
 # one word, Japanese lines join without a space, a line repeated in the margin
 # of the pages is a running header or footer, and ruled cells are a table.
 
-_BULLET = re.compile(r"^\s*([•·▪◦●○■□‣⁃∙➢➤✓✔\-–—\*])\s+(?=\S)")
+_BULLET = re.compile(r"^\s*(?:([•·▪◦●○■□‣⁃∙➢➤✓✔\-–—\*])\s+|([・◆◇])\s*)(?=\S)")
 _NUMBERED = re.compile(r"^\s*(\d{1,2})[.)]\s+(?=\S)")
 _DIGITS = re.compile(r"\d+")
 _MARGIN_BAND = 0.07  # the top and bottom share of a page where running lines live (59 pt of A4:
@@ -869,7 +869,10 @@ def decode_text(data: bytes) -> Optional[str]:
 # it Markdown.
 
 _TXT_HEADING = re.compile(r"^(#{1,6})\s+(\S.*?)\s*#*\s*$")
-_TXT_BULLET = re.compile(r"^\s*[-*•·▪◦‣]\s+(\S.*)$")
+# A dash or an asterisk is a bullet only with a space after it ("-5" and "*bold*"
+# are not). The East Asian bullets are bullets with or without one: "・核" is
+# how a Japanese list is typed.
+_TXT_BULLET = re.compile(r"^\s*(?:[-*•·▪◦‣]\s+|[・●○■□◆◇]\s*)(\S.*)$")
 _TXT_NUMBERED = re.compile(r"^\s*\d{1,3}[.)]\s+(\S.*)$")
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n+")
 _WRAP_MIN_LENGTH = 45   # hard-wrapped prose has long lines…
@@ -892,8 +895,41 @@ def _unwrap(lines: List[str]) -> str:
     return text
 
 
+_NBSP = "\u00a0"
+_TAB_WIDTH = 4
+_CONTROL = re.compile("[\x00-\x08\x0b\x0e-\x1f\x7f]")
+
+
+def _keep_spacing(line: str) -> str:
+    """A line as HTML that keeps what the writer aligned: its indent, and its tabs.
+
+    HTML collapses spaces and drops a leading run, which flattened pasted code
+    and outlines. A leading run and every tab become no-break spaces, which a
+    browser and the editor keep.
+    """
+    body = line.lstrip(" \t")
+    indent = line[:len(line) - len(body)].replace("\t", " " * _TAB_WIDTH)
+    return _NBSP * len(indent) + html.escape(body).replace("\t", _NBSP * _TAB_WIDTH)
+
+
+def _tab_table(lines: List[str]) -> Optional[str]:
+    """The lines as a table, if every one of them has the same number of tab-separated cells (two or more)."""
+    rows = [line.split("\t") for line in lines]
+    if len(rows) < 2 or len(rows[0]) < 2 or any(len(row) != len(rows[0]) for row in rows):
+        return None
+    body = "".join(
+        "<tr>" + "".join(f"<td><p>{html.escape(cell.strip())}</p></td>" for cell in row) + "</tr>" for row in rows
+    )
+    return f"<table>{body}</table>"
+
+
 def _text_paragraph_to_html(paragraph: str) -> str:
-    """One blank-line-delimited paragraph as headings, lists and lines."""
+    """One blank-line-delimited paragraph as headings, lists, a table, or lines."""
+    lines = [raw.rstrip() for raw in paragraph.split("\n") if raw.strip()]
+    table = _tab_table(lines)
+    if table:
+        return table
+
     out: List[str] = []
     plain: List[str] = []
     open_list: Optional[str] = None
@@ -901,10 +937,11 @@ def _text_paragraph_to_html(paragraph: str) -> str:
     def close_plain() -> None:
         if not plain:
             return
-        if _is_hard_wrapped(plain):
-            out.append(f"<p>{html.escape(_unwrap(plain))}</p>")
+        stripped = [line.strip() for line in plain]
+        if _is_hard_wrapped(stripped):
+            out.append(f"<p>{html.escape(_unwrap(stripped))}</p>")
         else:
-            out.append("<p>" + "<br>".join(html.escape(line) for line in plain) + "</p>")
+            out.append("<p>" + "<br>".join(_keep_spacing(line) for line in plain) + "</p>")
         plain.clear()
 
     def close_list() -> None:
@@ -913,10 +950,7 @@ def _text_paragraph_to_html(paragraph: str) -> str:
             out.append(f"</{open_list}>")
             open_list = None
 
-    for raw in paragraph.split("\n"):
-        line = raw.rstrip()
-        if not line.strip():
-            continue
+    for line in lines:
         heading = _TXT_HEADING.match(line)
         bullet = _TXT_BULLET.match(line)
         numbered = _TXT_NUMBERED.match(line)
@@ -933,12 +967,12 @@ def _text_paragraph_to_html(paragraph: str) -> str:
                 out.append(f"<{kind}>")
                 open_list = kind
             out.append(f"<li>{html.escape((bullet or numbered).group(1))}</li>")
-        elif open_list and raw[:1] in (" ", "\t") and out and out[-1].endswith("</li>"):
+        elif open_list and line[:1] in (" ", "\t") and out and out[-1].endswith("</li>"):
             # an indented line under a list row continues that row
             out[-1] = out[-1][:-5] + " " + html.escape(line.strip()) + "</li>"
         else:
             close_list()
-            plain.append(line.strip())
+            plain.append(line)
     close_plain()
     close_list()
     return "".join(out)
@@ -954,6 +988,9 @@ def extract_formatted_text_from_txt(file_content: bytes) -> List[Dict[str, str]]
         if text is None:
             return []
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # A form feed is a page break, which here is a paragraph break; the other
+        # control characters (a stray NUL from a bad export) are not text.
+        text = _CONTROL.sub("", text.replace("\f", "\n\n"))
 
         paragraphs = [p.strip("\n") for p in _PARAGRAPH_BREAK.split(text) if p.strip()]
 

@@ -882,3 +882,43 @@ def test_presentation_forms_from_a_pdf_become_the_letters_they_stand_for():
     line = _pdf_line({"spans": [{"text": shaped, "size": 11, "flags": 0}], "bbox": [0, 0, 1, 1]})
     assert line["text"] == "الخلية هي الوحدة"
     assert _fold_presentation_forms("שׁוֹ") == "שׁוֹ"  # Hebrew shin with dot, vav with holam
+
+
+# ── IMPORT-025: what a text file's writer aligned or marked is kept ─────────
+
+NBSP = " "
+
+
+def test_east_asian_bullets_are_list_marks_with_or_without_a_space():
+    content = _txt_html("主な細胞小器官:\n・核:DNAを含む\n・ミトコンドリア\n● リボソーム")
+    assert content == "<p>主な細胞小器官:</p><ul><li>核:DNAを含む</li><li>ミトコンドリア</li><li>リボソーム</li></ul>"
+    assert _txt_html("*bold* and -5 degrees") == "<p>*bold* and -5 degrees</p>"  # a mark needs its space
+
+
+def test_indentation_and_tabs_survive_as_no_break_spaces_through_to_the_document():
+    content = _txt_html("def f(x):\n    return x + 1\n\tif x:")
+    assert content == f"<p>def f(x):<br>{NBSP * 4}return x + 1<br>{NBSP * 4}if x:</p>"
+    (paragraph,) = html_to_lexical_json(content)["root"]["children"]
+    texts = [node["text"] for node in paragraph["children"] if node["type"] == "text"]
+    assert texts == ["def f(x):", f"{NBSP * 4}return x + 1", f"{NBSP * 4}if x:"]
+
+
+def test_tab_separated_lines_are_a_table_and_ragged_ones_are_not():
+    table = _txt_html("Organelle\tRole\tSize\nNucleus\tDNA\t6 um")
+    root = html_to_lexical_json(table)["root"]
+    assert [[_text(c) for c in row["children"]] for row in _first(root, "table")["children"]] == [
+        ["Organelle", "Role", "Size"], ["Nucleus", "DNA", "6 um"]]
+    assert "<table>" not in _txt_html("a\tb\tc\nonly two\tcells")
+    assert "<table>" not in _txt_html("one\tline")
+
+
+def test_control_characters_are_not_text_and_a_form_feed_breaks_the_paragraph():
+    assert _txt_html("Before\x00\x00 after.\x0cNext page") == "<p>Before after.</p><p>Next page</p>"
+
+
+def test_a_pdf_line_starting_with_a_japanese_bullet_is_a_list_row():
+    def draw(doc):
+        page = doc.new_page()
+        for index, item in enumerate(["・核:DNAを含む", "・ミトコンドリア"]):
+            page.insert_text((90, 130 + 18 * index), item, fontsize=11, fontname="japan")
+    assert "<ul><li>核:DNAを含む</li><li>ミトコンドリア</li></ul>" in _html_of_pdf(draw)

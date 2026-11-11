@@ -45,7 +45,9 @@ FORMAT_BITS = {
 }
 
 HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
-_SPACE = re.compile(r"\s+")
+# The whitespace HTML collapses. Not `\s`: that includes the no-break space,
+# which is how an importer keeps an indent or a tab the writer meant.
+_SPACE = re.compile(r"[ \t\n\r\f\v]+")
 _SAFE_LINK = re.compile(r"^(https?://|mailto:)", re.IGNORECASE)
 
 
@@ -353,7 +355,7 @@ class HTMLToLexicalConverter(HTMLParser):
             self._add_code(data)
             return
         text = _SPACE.sub(" ", data)
-        if not text.strip() and self.current_paragraph is None:
+        if not text.strip(" ") and self.current_paragraph is None:
             return  # the line break between two blocks
         self._ensure_block()
         children = self._inline_target()
