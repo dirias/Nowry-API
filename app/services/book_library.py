@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from pymongo.collation import Collation
 
-from app.services import book_maintenance
+from app.services import book_search
 
 KINDS = ("all", "written", "imported")
 SORTS = ("edited", "title", "cards")
@@ -62,18 +62,18 @@ def _search_clauses(needle: str) -> list[dict]:
     Each folded word must begin one of the document's stored search terms —
     the suffixes of its title's words, and of an import's author — so the
     match ignores case, accents, width and kana, and is answered by the index
-    on `search_terms`. A document the maintenance pass has not reached yet has
-    no terms; until it does, it is matched the old way, on its title.
+    on `search_terms`. A document written before the terms existed has none;
+    it is matched on its title as before, until its title is next saved.
     """
     literal = {"$regex": re.escape(needle), "$options": "i"}
-    unreached = {"search_version": {"$exists": False},
-                 "$or": [{"title": literal}, {"source": "imported", "author": literal}]}
-    terms = book_maintenance.query_terms(needle)
+    terms = book_search.query_terms(needle)
     if not terms:
         # Nothing but punctuation was typed: only a title that contains exactly that can match.
         return [{"title": literal}]
     by_terms = {"$and": [{"search_terms": {"$regex": "^" + re.escape(term)}} for term in terms]}
-    return [by_terms, unreached]
+    without_terms = {"search_terms": {"$exists": False},
+                     "$or": [{"title": literal}, {"source": "imported", "author": literal}]}
+    return [by_terms, without_terms]
 
 
 def apply_title_collation(cursor: Any) -> Any:

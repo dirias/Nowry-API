@@ -439,11 +439,8 @@ async def create_indexes():
     # ADR-066: "has this reader imported this file before?" is one indexed lookup.
     await books_collection.create_index(
         [("user_id", 1), ("source_hash", 1)], name="books_source_hash", sparse=True)
-    # ADR-069: the library's search is a prefix match on a document's folded
-    # terms, answered here; and the maintenance pass finds what is behind.
+    # ADR-069: the library's search is a prefix match on a document's folded terms, answered here.
     await books_collection.create_index(
         [("user_id", 1), ("deleted_at", 1), ("search_terms", 1)], name="books_search_terms")
-    await books_collection.create_index(
-        [("stats_version", 1), ("search_version", 1)], name="books_maintenance")
 
     logger.info("Database indexes created successfully.")

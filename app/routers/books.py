@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, U
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book, BookLibraryPage, BookSummary
-from app.services import book_library, book_maintenance
+from app.services import book_library, book_search
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection
 from app.models.CardGenerationRequest import compute_effective_cap
@@ -73,9 +73,8 @@ async def create_book(
         stats = document_stats(parse_lexical(book_dict["full_content"]), book_dict["full_content"])
         ensure_document_within_ceiling(stats["word_count"])
         book_dict.update(stats)
-    # Stamped and searchable from its first write (ADR-069).
-    book_dict["stats_version"] = book_maintenance.STATS_VERSION
-    book_dict.update(book_maintenance.search_fields(book_dict.get("title"), book_dict.get("author"), book_dict.get("source")))
+    # Searchable from its first write (ADR-069).
+    book_dict.update(book_search.search_fields(book_dict.get("title"), book_dict.get("author"), book_dict.get("source")))
 
     new_book = await books_collection.insert_one(book_dict)
     book_id = str(new_book.inserted_id)
@@ -112,7 +111,7 @@ async def edit_book(
     # Remove immutable/system fields that shouldn't be updated by user.
     # forked_from is permanently set at fork time and must never be overwritten.
     fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from", "source", "page_count",
-                        "source_hash", "source_filename", "stats_version", "search_version", "search_terms"]
+                        "source_hash", "source_filename", "search_terms"]
     for field in fields_to_remove:
         update_data.pop(field, None)
 
@@ -123,22 +122,17 @@ async def edit_book(
         stats = document_stats(parse_lexical(content), content)
         ensure_document_within_ceiling(stats["word_count"])
         update_data.update(stats)
-        update_data["stats_version"] = book_maintenance.STATS_VERSION
 
     if not update_data:
         raise HTTPException(status_code=400, detail="No data provided for update")
 
     # A renamed document is found by its new name (ADR-069).
     if "title" in update_data or "author" in update_data:
-        update_data.update(book_maintenance.search_fields(
+        update_data.update(book_search.search_fields(
             update_data.get("title", existing_book.get("title")),
             update_data.get("author", existing_book.get("author")),
             existing_book.get("source"),
         ))
-    # An import from before ADR-067 keeps where it came from only inside the
-    # sentence in its summary. Before any edit can replace that sentence, the
-    # facts in it are written to their own fields (IMPORT-033).
-    update_data.update(book_maintenance.legacy_import_facts(existing_book))
 
     # docs/prd-books-library.md FR-001: a scroll is not an edit. The pointer fields update on
     # their own without bumping updated_at, so "edited Yesterday" keeps meaning edited.
@@ -334,14 +328,12 @@ async def _backfill_document_stats(books_collection: Collection, books: list[dic
     """Documents saved before the stats existed (BOOK-001/005) have no word or section count, and
     the library would draw them thin until their next save. Compute and store the stats for up to
     BACKFILL_PER_REQUEST such documents per list request — once each, then the row is true."""
-    # Missing, or counted under an older rule (ADR-064/069): the rows on screen
-    # are put right at once; the maintenance pass reaches the rest.
-    missing = [b for b in books
-               if b.get("word_count") is None or b.get("stats_version") != book_maintenance.STATS_VERSION][:BACKFILL_PER_REQUEST]
+    missing = [b for b in books if b.get("word_count") is None][:BACKFILL_PER_REQUEST]
     for book in missing:
         oid = ObjectId(book["_id"]) if ObjectId.is_valid(book["_id"]) else book["_id"]
         full = await books_collection.find_one({"_id": oid}, {"full_content": 1})
-        stats = book_maintenance.stats_fields((full or {}).get("full_content"))
+        content = (full or {}).get("full_content") or ""
+        stats = document_stats(parse_lexical(content), content)
         book.update(stats)
         await books_collection.update_one({"_id": oid}, {"$set": stats})
 
@@ -481,27 +473,6 @@ async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> 
 
 IMPORT_DUPLICATE_CODE = "import_duplicate"
 
-#: What a refusal says to a client that does not read codes (ADR-068): one
-#: plain sentence per code, in English, as the import always answered.
-_REFUSAL_TEXT = {
-    "import_unsupported_type": "This file type cannot be imported. Use a PDF, a Word .docx or a plain text file.",
-    "import_legacy_doc": "This is an old Word .doc file. Save it as .docx and import that.",
-    "import_empty": "This file has no text to import.",
-    "import_password_protected": "This file is password-protected. Remove the password and import it again.",
-    "import_unreadable": "This file could not be read. It may be damaged.",
-    "import_too_large": "File exceeds the {limit_mb} MB limit.",
-    DOCUMENT_TOO_LONG_CODE: "This document is over the {limit}-word limit. Split it into two.",
-}
-
-
-def _import_refusal(status_code: int, detail: dict, coded: bool) -> HTTPException:
-    """The refusal in the shape the client reads: the coded object, or its sentence."""
-    if coded or not isinstance(detail, dict):
-        return HTTPException(status_code=status_code, detail=detail)
-    template = _REFUSAL_TEXT.get(detail.get("code"), "Failed to extract content from file")
-    return HTTPException(status_code=status_code, detail=template.format(**detail))
-
-
 async def _existing_import(books_collection: Collection, user_id: str, source_hash: str) -> Optional[dict]:
     """The reader's live document made from the same file, newest first, or None."""
     rows = await books_collection.find(
@@ -539,10 +510,6 @@ async def import_book_from_file(
     # can ask the reader; "copy" imports it again. A client that says nothing is
     # one built before the question existed, and keeps its old behaviour.
     on_duplicate: str = Form("copy", pattern="^(ask|copy)$"),
-    # ADR-068: a refusal is a coded object only for a client that says it reads
-    # one. A client built before the codes renders `detail` as text, and an
-    # object there took its page down; it keeps getting a sentence.
-    error_format: str = Form("text", pattern="^(text|coded)$"),
     books_collection: Collection = Depends(get_books_collection),
     current_user: dict = Depends(get_firebase_user),
 ):
@@ -561,13 +528,15 @@ async def import_book_from_file(
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
     # before a parser sees it, as the .apkg import does (QA-008). The refusal
     # carries a code and the limit, so the client says it in its own language.
-    coded = error_format == "coded"
     try:
         file_content = await _read_bounded_upload(file)
     except HTTPException as refused:
         if refused.status_code != 413:
             raise
-        raise _import_refusal(413, {"code": IMPORT_TOO_LARGE, "limit_mb": BOOK_IMPORT_MAX_BYTES // (1024 * 1024)}, coded)
+        raise HTTPException(
+            status_code=413,
+            detail={"code": IMPORT_TOO_LARGE, "limit_mb": BOOK_IMPORT_MAX_BYTES // (1024 * 1024)},
+        )
     filename = file.filename or ""
 
     # Extract pages from file; its pictures come back as bytes beside the HTML (ADR-062 point 5)
@@ -581,16 +550,13 @@ async def import_book_from_file(
     if not extracted_pages:
         # Which of the reasons it was (IMPORT-007): wrong type, old .doc, empty,
         # password-protected, or unreadable.
-        raise _import_refusal(400, {"code": refusal_code(filename, file_content)}, coded)
+        raise HTTPException(status_code=400, detail={"code": refusal_code(filename, file_content)})
 
     # ADR-041: the ceiling is per document, however the document arrives. An
     # import past it is refused here, in the preview and in the save, before a
     # picture is stored: accepted, it could never be saved again (IMPORT-003).
     import_words = _import_word_count(extracted_pages)
-    try:
-        ensure_document_within_ceiling(import_words)
-    except HTTPException as refused:
-        raise _import_refusal(refused.status_code, refused.detail, coded)
+    ensure_document_within_ceiling(import_words)
 
     # ADR-066: the same bytes already imported by this reader? The preview says
     # so; a save that asked to be told is refused with the document it would copy.
@@ -701,10 +667,7 @@ async def import_book_from_file(
         full_content = json.dumps(lexical_json)
 
     stats = document_stats(parse_lexical(full_content), full_content)
-    try:
-        ensure_document_within_ceiling(stats["word_count"])  # the fallback converter's count, if it ran
-    except HTTPException as refused:
-        raise _import_refusal(refused.status_code, refused.detail, coded)
+    ensure_document_within_ceiling(stats["word_count"])  # the fallback converter's count, if it ran
 
     new_book = Book(
         id=book_oid,
@@ -728,8 +691,7 @@ async def import_book_from_file(
     # Inserted under the id minted above, the one its pictures are stored under
     book_dict = new_book.model_dump(by_alias=True)
     book_dict["_id"] = book_oid
-    book_dict["stats_version"] = book_maintenance.STATS_VERSION
-    book_dict.update(book_maintenance.search_fields(book_title, username, "imported"))
+    book_dict.update(book_search.search_fields(book_title, username, "imported"))
     await books_collection.insert_one(book_dict)
     book_id = str(book_oid)
 

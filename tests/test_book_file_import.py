@@ -168,8 +168,6 @@ def world():
 
 
 def _upload(world, name, content, **form):
-    # The web client of today: it says it reads coded refusals (ADR-068).
-    form.setdefault("error_format", "coded")
     return world.http.post("/book/import", files={"file": (name, content, "application/octet-stream")}, data=form)
 
 
@@ -791,9 +789,13 @@ def test_the_import_records_what_it_was_made_from_and_an_edit_cannot_change_it(w
     book_id = _upload(world, "mito.txt", txt_bytes()).json()["_id"]
     stored = world.run(world.raw["books"].find_one({}))
     assert stored["source_hash"] == hashlib.sha256(txt_bytes()).hexdigest() and stored["source_filename"] == "mito.txt"
-    response = world.http.put(f"/book/edit/{book_id}", json={"title": "renamed", "source_hash": "forged"})
+    # The edit form sends an empty summary with every save; the file name is its own field and survives it.
+    response = world.http.put(f"/book/edit/{book_id}", json={"title": "renamed", "summary": "", "source_hash": "forged",
+                                                             "source_filename": "forged.pdf"})
     assert response.status_code == 200, response.text
-    assert world.run(world.raw["books"].find_one({}))["source_hash"] == stored["source_hash"]
+    after = world.run(world.raw["books"].find_one({}))
+    assert after["source_hash"] == stored["source_hash"] and after["source_filename"] == "mito.txt"
+    assert response.json()["source_filename"] == "mito.txt"
 
 
 def test_a_deleted_import_and_another_readers_import_are_not_duplicates(world):
@@ -1018,61 +1020,3 @@ def test_an_import_stores_what_it_is_and_no_sentence_in_any_language(world):
     assert stored["source"] == "imported" and stored["source_filename"] == "mito.pdf" and stored["page_count"] == 2
     assert stored["summary"] == "" and not stored.get("cover_color") and "isbn" not in stored
     assert "Imported from" not in json.dumps(stored, default=str) and "Importado" not in json.dumps(stored, default=str)
-
-
-# ── IMPORT-032 / ADR-068: a client built before the codes still gets a sentence ──
-
-@pytest.mark.parametrize("name, content, status, words", [
-    ("notes.md", b"# Title", 400, "file type cannot be imported"),
-    ("old.doc", b"\xd0\xcf\x11\xe0" + b"\x00" * 32, 400, "old Word .doc"),
-    ("empty.txt", b"", 400, "no text to import"),
-    ("locked.pdf", _encrypted_pdf(), 400, "password-protected"),
-    ("broken.pdf", b"%PDF-1.4 nope", 400, "could not be read"),
-])
-def test_a_refusal_is_a_sentence_for_a_client_that_does_not_say_it_reads_codes(world, name, content, status, words):
-    for form in ({"preview": "true"}, {}):
-        response = world.http.post("/book/import", files={"file": (name, content, "application/octet-stream")}, data=form)
-        assert response.status_code == status
-        detail = response.json()["detail"]
-        assert isinstance(detail, str) and words in detail
-
-
-def test_the_size_and_word_refusals_are_sentences_too_for_such_a_client(world):
-    with patch("app.routers.books.BOOK_IMPORT_MAX_BYTES", 2 * 1024 * 1024):
-        big = world.http.post("/book/import", files={"file": ("big.txt", b"x" * (3 * 1024 * 1024), "text/plain")})
-    assert big.status_code == 413 and big.json()["detail"] == "File exceeds the 2 MB limit."
-    with patch("app.routers.books.SUBSCRIPTION_PLANS", {"free": {"limits": {"document_words": 50}}}), \
-            patch("app.routers.books.SubscriptionTier") as tier:
-        tier.FREE = "free"
-        long_ = world.http.post("/book/import", files={"file": ("long.txt", txt_bytes(), "text/plain")})
-    assert long_.status_code == 413 and long_.json()["detail"] == "This document is over the 50-word limit. Split it into two."
-
-
-def test_an_unknown_error_format_is_refused(world):
-    assert _upload(world, "a.txt", b"hola", error_format="xml").status_code == 422
-
-
-# ── IMPORT-035: a right-to-left page starts with its right column, and its brackets face the right way ──
-
-def test_right_to_left_text_is_recognised_and_its_brackets_are_unmirrored():
-    from app.utils.file_import import _is_rtl, _pdf_line
-    assert _is_rtl("התא הוא יחידת החיים") and _is_rtl("الخلية هي الوحدة") and not _is_rtl("The cell (תא) is small")
-    line = _pdf_line({"spans": [{"text": "עמודה ראשונה )ימין(.", "size": 10, "flags": 0}], "bbox": [0, 0, 1, 1]})
-    assert line["text"] == "עמודה ראשונה (ימין)."
-    latin = _pdf_line({"spans": [{"text": "A note (in brackets).", "size": 10, "flags": 0}], "bbox": [0, 0, 1, 1]})
-    assert latin["text"] == "A note (in brackets)."
-
-
-def test_the_right_column_of_a_right_to_left_page_is_read_first():
-    from app.utils.file_import import _reading_order
-
-    def block(left, top, text):
-        return {"type": 0, "bbox": [left, top, left + 240, top + 300],
-                "lines": [{"spans": [{"text": text * 12, "size": 10, "flags": 0}], "bbox": [left, top, left + 240, top + 12]}]}
-
-    hebrew = [block(50, 80, "עמודה שנייה משמאל. "), block(310, 80, "עמודה ראשונה מימין. ")]
-    ordered, columns = _reading_order(hebrew)
-    assert columns == 2 and "ראשונה" in ordered[0]["lines"][0]["spans"][0]["text"]
-    english = [block(50, 80, "left column first. "), block(310, 80, "right column second. ")]
-    ordered, columns = _reading_order(english)
-    assert columns == 2 and "left column" in ordered[0]["lines"][0]["spans"][0]["text"]

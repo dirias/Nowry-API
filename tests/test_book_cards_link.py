@@ -349,8 +349,7 @@ async def test_the_list_backfills_missing_stats_once_per_document():
     col = MagicMock()
     col.find_one = AsyncMock(return_value={"_id": BOOK_ID, "full_content": BOOK["full_content"]})
     col.update_one = AsyncMock()
-    rows = [{"_id": BOOK_ID, "title": "N3"},
-            {"_id": "x", "title": "Done", "word_count": 12, "section_count": 1, "stats_version": 2}]  # counted by today's rule
+    rows = [{"_id": BOOK_ID, "title": "N3"}, {"_id": "x", "title": "Done", "word_count": 12, "section_count": 1}]
     await _backfill_document_stats(col, rows)
     assert rows[0]["section_count"] == 2 and rows[0]["word_count"] > 0
     col.update_one.assert_awaited_once()

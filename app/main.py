@@ -26,7 +26,6 @@ import asyncio
 import logging
 from app.config.database import books_collection
 from app.utils import media_ledger
-from app.services import book_maintenance
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -112,13 +111,9 @@ async def lifespan(app: FastAPI):
     # ADR-065: images of deleted documents are removed by a reaper that keeps
     # trying, so a storage hiccup or a restart never leaves them stored for good.
     reaper = asyncio.create_task(media_ledger.reaper_loop(books_collection))
-    # ADR-069: documents whose stored counts or search terms were computed under an
-    # older rule are brought up to date in small batches, in the background.
-    maintenance = asyncio.create_task(book_maintenance.maintenance_loop(books_collection))
     yield
     # Shutdown
     reaper.cancel()
-    maintenance.cancel()
     await _flush_langfuse_queue()
 
 
