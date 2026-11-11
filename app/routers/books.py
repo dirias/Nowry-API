@@ -540,7 +540,8 @@ async def import_book_from_file(
     # ADR-041: the ceiling is per document, however the document arrives. An
     # import past it is refused here, in the preview and in the save, before a
     # picture is stored: accepted, it could never be saved again (IMPORT-003).
-    ensure_document_within_ceiling(_import_word_count(extracted_pages))
+    import_words = _import_word_count(extracted_pages)
+    ensure_document_within_ceiling(import_words)
 
     # ADR-066: the same bytes already imported by this reader? The preview says
     # so; a save that asked to be told is refused with the document it would copy.
@@ -563,7 +564,10 @@ async def import_book_from_file(
     # client that still reads them.
     warnings: list = []
     info_msg = None
-    total_words = int(metadata.get("total_words", 0))
+    # The count of the document as it will be saved, not of the page as it was
+    # extracted: list marks and running headers are gone by then, and the preview
+    # used to promise more words than the library then showed (IMPORT-027).
+    total_words = import_words
     facts = {
         "pages": len(extracted_pages),
         "words": total_words,
@@ -614,7 +618,7 @@ async def import_book_from_file(
                 for p in extracted_pages[:PREVIEW_PAGE_LIMIT]
             ],
             "quality_summary": {
-                "total_words": metadata.get("total_words", 0),
+                "total_words": total_words,
                 "total_chars": metadata.get("total_chars", 0),
                 "avg_words_per_page": int(avg_words_per_page),
                 "has_multi_column": metadata.get("multi_column_pages", 0) > 0,

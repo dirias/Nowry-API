@@ -128,7 +128,7 @@ def test_no_book_count_cap_remains():
     assert "Book limit reached" not in source
     # create, edit and the import (IMPORT-003): every way a document is written checks the ceiling
     assert source.count("ensure_document_within_ceiling(stats[\"word_count\"])") == 3
-    assert "ensure_document_within_ceiling(_import_word_count(extracted_pages))" in source
+    assert "ensure_document_within_ceiling(import_words)" in source and "import_words = _import_word_count(extracted_pages)" in source
 
 
 def test_a_document_past_the_ceiling_is_413():

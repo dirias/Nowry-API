@@ -922,3 +922,30 @@ def test_a_pdf_line_starting_with_a_japanese_bullet_is_a_list_row():
         for index, item in enumerate(["・核:DNAを含む", "・ミトコンドリア"]):
             page.insert_text((90, 130 + 18 * index), item, fontsize=11, fontname="japan")
     assert "<ul><li>核:DNAを含む</li><li>ミトコンドリア</li></ul>" in _html_of_pdf(draw)
+
+
+# ── IMPORT-026: a ligature is its letters ───────────────────────────────────
+
+def test_latin_ligatures_from_a_pdf_are_spelled_out():
+    from app.utils.file_import import _fold_presentation_forms
+    assert _fold_presentation_forms("su\ufb01cientemente, E\ufb03cient o\ufb03ce a\ufb00airs, \ufb02uir") == \
+        "suficientemente, Efficient office affairs, fluir"
+    assert _fold_presentation_forms("plain text, ½ and ² stay") == "plain text, ½ and ² stay"
+
+
+# ── IMPORT-027: the preview counts what will be saved ───────────────────────
+
+def test_the_preview_and_the_saved_document_agree_on_the_word_count(world):
+    def draw(doc):
+        for number in range(1, 5):
+            page = doc.new_page()
+            page.insert_text((72, 40), "Biology notes — chapter 3", fontsize=8)
+            page.insert_text((72, 100), f"Body of page {number}. " + PARAGRAPH, fontsize=11)
+            for index, item in enumerate(["- first item", "- second item"]):
+                page.insert_text((90, 130 + 15 * index), item, fontsize=11)
+            page.insert_text((72, 815), f"Page {number} of 4", fontsize=8)
+    data = _pdf_of(draw)
+    preview = _upload(world, "notes.pdf", data, preview="true").json()
+    assert _upload(world, "notes.pdf", data).status_code == 200
+    stored = world.run(world.raw["books"].find_one({}))
+    assert preview["facts"]["words"] == stored["word_count"] == preview["quality_summary"]["total_words"]
