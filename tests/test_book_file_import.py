@@ -870,3 +870,15 @@ def test_a_damaged_pdf_that_still_yields_pages_is_previewed_as_damaged(world):
     cut = whole[:-40]  # the cross-reference table's end is gone; the reader rebuilds it
     body = _upload(world, "cut.pdf", cut, preview="true").json()
     assert body["facts"]["damaged"] is True and body["facts"]["words"] > 10
+
+
+# ── IMPORT-024: Arabic and Hebrew letters from a PDF are letters ────────────
+
+def test_presentation_forms_from_a_pdf_become_the_letters_they_stand_for():
+    from app.utils.file_import import _fold_presentation_forms, _pdf_line
+    shaped = "ﺍﻟﺨﻠﻴﺔ ﻫﻲ ﺍﻟﻮﺣﺪﺓ"  # الخلية هي الوحدة, as glyph forms
+    assert _fold_presentation_forms(shaped) == "الخلية هي الوحدة"
+    assert _fold_presentation_forms("x² + H₂O ㎝ ｶﾀｶﾅ") == "x² + H₂O ㎝ ｶﾀｶﾅ"  # nothing else is normalised
+    line = _pdf_line({"spans": [{"text": shaped, "size": 11, "flags": 0}], "bbox": [0, 0, 1, 1]})
+    assert line["text"] == "الخلية هي الوحدة"
+    assert _fold_presentation_forms("שׁוֹ") == "שׁוֹ"  # Hebrew shin with dot, vav with holam

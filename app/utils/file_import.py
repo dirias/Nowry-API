@@ -8,6 +8,7 @@ import mammoth
 from typing import Dict, List, Optional, Tuple
 import codecs
 import logging
+import unicodedata
 import re
 import html
 
@@ -98,12 +99,28 @@ def _joint(previous: str, following: str) -> Tuple[str, str]:
     return previous, " "
 
 
+# A PDF stores the glyphs a font drew, and for Arabic and Hebrew those are
+# often "presentation forms": one code point per contextual shape of a letter
+# (initial, medial, final, isolated). They look right and are not the letters:
+# a search, a card answer or a read-aloud voice does not find "الخلية" in them.
+# Compatibility normalisation maps each form back to its letter. It is applied
+# to these blocks only — applied to everything it would also turn "²" into "2".
+_PRESENTATION_FORMS = re.compile("[\ufb1d-\ufb4f\ufb50-\ufdff\ufe70-\ufeff]+")
+
+
+def _fold_presentation_forms(text: str) -> str:
+    """Arabic and Hebrew presentation forms as the letters they stand for."""
+    if not _PRESENTATION_FORMS.search(text):
+        return text
+    return _PRESENTATION_FORMS.sub(lambda match: unicodedata.normalize("NFKC", match.group(0)), text)
+
+
 def _pdf_line(line: Dict) -> Optional[Dict]:
     """One line as `{"segments": [[text, flags]], "text", "size", "bbox"}`, or None when it is blank."""
     segments: List[List] = []
     sizes: Dict[float, int] = {}
     for span in line.get("spans", []):
-        text = span.get("text", "")
+        text = _fold_presentation_forms(span.get("text", ""))
         if not text:
             continue
         flags = span.get("flags", 0) & (16 | 2)
