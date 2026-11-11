@@ -1050,3 +1050,29 @@ def test_the_size_and_word_refusals_are_sentences_too_for_such_a_client(world):
 
 def test_an_unknown_error_format_is_refused(world):
     assert _upload(world, "a.txt", b"hola", error_format="xml").status_code == 422
+
+
+# ── IMPORT-035: a right-to-left page starts with its right column, and its brackets face the right way ──
+
+def test_right_to_left_text_is_recognised_and_its_brackets_are_unmirrored():
+    from app.utils.file_import import _is_rtl, _pdf_line
+    assert _is_rtl("התא הוא יחידת החיים") and _is_rtl("الخلية هي الوحدة") and not _is_rtl("The cell (תא) is small")
+    line = _pdf_line({"spans": [{"text": "עמודה ראשונה )ימין(.", "size": 10, "flags": 0}], "bbox": [0, 0, 1, 1]})
+    assert line["text"] == "עמודה ראשונה (ימין)."
+    latin = _pdf_line({"spans": [{"text": "A note (in brackets).", "size": 10, "flags": 0}], "bbox": [0, 0, 1, 1]})
+    assert latin["text"] == "A note (in brackets)."
+
+
+def test_the_right_column_of_a_right_to_left_page_is_read_first():
+    from app.utils.file_import import _reading_order
+
+    def block(left, top, text):
+        return {"type": 0, "bbox": [left, top, left + 240, top + 300],
+                "lines": [{"spans": [{"text": text * 12, "size": 10, "flags": 0}], "bbox": [left, top, left + 240, top + 12]}]}
+
+    hebrew = [block(50, 80, "עמודה שנייה משמאל. "), block(310, 80, "עמודה ראשונה מימין. ")]
+    ordered, columns = _reading_order(hebrew)
+    assert columns == 2 and "ראשונה" in ordered[0]["lines"][0]["spans"][0]["text"]
+    english = [block(50, 80, "left column first. "), block(310, 80, "right column second. ")]
+    ordered, columns = _reading_order(english)
+    assert columns == 2 and "left column" in ordered[0]["lines"][0]["spans"][0]["text"]

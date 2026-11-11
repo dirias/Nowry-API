@@ -123,6 +123,25 @@ def _fold_presentation_forms(text: str) -> str:
     return _PRESENTATION_FORMS.sub(lambda match: unicodedata.normalize("NFKC", match.group(0)), text)
 
 
+# ── right-to-left text ──────────────────────────────────────────────────────
+#
+# Hebrew and Arabic are read from the right: the rightmost column of a page is
+# the first one (IMPORT-035). And a PDF stores the bracket glyph that was drawn,
+# which in a right-to-left run is the mirror of the character that was typed:
+# "(שמאל)" comes out as ")שמאל(" unless the pair is swapped back.
+
+_RTL = re.compile("[\u0590-\u05ff\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb1d-\ufdff\ufe70-\ufeff]")
+_MIRRORED = str.maketrans("()[]{}<>«»", ")(][}{><»«")
+
+
+def _is_rtl(text: str) -> bool:
+    """True when most of the letters in `text` belong to a right-to-left script."""
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for char in letters if _RTL.match(char)) > len(letters) / 2
+
+
 def _pdf_line(line: Dict) -> Optional[Dict]:
     """One line as `{"segments": [[text, flags]], "text", "size", "bbox"}`, or None when it is blank."""
     segments: List[List] = []
@@ -141,6 +160,10 @@ def _pdf_line(line: Dict) -> Optional[Dict]:
     text = "".join(segment[0] for segment in segments)
     if not text.strip():
         return None
+    if _is_rtl(text):
+        for segment in segments:
+            segment[0] = segment[0].translate(_MIRRORED)
+        text = text.translate(_MIRRORED)
     return {"segments": segments, "text": text.strip(), "bbox": line.get("bbox", [0, 0, 0, 0]),
             "size": max(sizes, key=sizes.get) if sizes else 12}
 
@@ -366,12 +389,19 @@ def _band_of(block: Dict, bands: List[List[float]]) -> int:
     return min(range(len(bands)), key=lambda i: abs((bands[i][0] + bands[i][1]) / 2 - centre))
 
 
+def _blocks_are_rtl(blocks: List[Dict]) -> bool:
+    text = "".join(span.get("text", "") for block in blocks if block.get("type") == 0
+                   for line in block.get("lines", []) for span in line.get("spans", []))
+    return _is_rtl(text)
+
+
 def _reading_order(blocks: List[Dict]) -> Tuple[List[Dict], int]:
     """The blocks in reading order, and how many columns the page has.
 
     Blocks that span the columns (a title, a full-width figure) cut the page
     into zones; inside a zone each column is read top to bottom, left column
-    first. A page with one column is simply top to bottom.
+    first — right column first on a page of Hebrew or Arabic. A page with one
+    column is simply top to bottom.
     """
     by_top = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
     if len(by_top) < 2:
@@ -396,8 +426,13 @@ def _reading_order(blocks: List[Dict]) -> Tuple[List[Dict], int]:
     ordered: List[Dict] = []
     zone: List[Dict] = []
 
+    # A page of Hebrew or Arabic starts with its rightmost column.
+    column_order = list(range(len(bands)))
+    if _blocks_are_rtl(by_top):
+        column_order.reverse()
+
     def flush_zone() -> None:
-        for index in range(len(bands)):
+        for index in column_order:
             ordered.extend(b for b in zone if _band_of(b, bands) == index)
         zone.clear()
 
