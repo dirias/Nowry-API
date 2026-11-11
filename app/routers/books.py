@@ -613,7 +613,7 @@ async def import_book_from_file(
     Preserves formatting, multi-column layouts, and provides quality metrics.
     """
     from app.utils.file_import import (
-        IMPORT_PICTURES_PER_DOCUMENT, IMPORT_TOO_LARGE, refusal_code, strip_media_markers,
+        IMPORT_PICTURES_PER_DOCUMENT, IMPORT_TOO_LARGE, strip_media_markers,
     )
 
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
@@ -647,7 +647,7 @@ async def import_book_from_file(
     if not extracted_pages:
         # Which of the reasons it was (IMPORT-007): wrong type, old .doc, empty,
         # password-protected, or unreadable.
-        raise HTTPException(status_code=400, detail={"code": refusal_code(filename, file_content)})
+        raise HTTPException(status_code=400, detail={"code": parsed.refusal or import_parser.IMPORT_UNREADABLE})
 
     # ADR-041, ADR-071: the ceilings are per document, however the document
     # arrives. An import past either is refused here, in the preview and in the

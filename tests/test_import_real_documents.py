@@ -194,3 +194,31 @@ def test_a_document_with_neither_is_not_rewritten_and_one_with_a_doctype_is_left
     declared = _docx(f"<w:p><m:oMath>{_mr('x')}</m:oMath></w:p>", prolog='<!DOCTYPE d [<!ENTITY a "b">]>')
     assert file_import._with_unread_text(declared) is declared
     assert file_import._with_unread_text(b"not a zip") == b"not a zip"
+
+
+# ── IMPORT-048: the reason given is the reason; an extension is not trusted ──
+
+def test_a_word_file_the_reader_cannot_read_is_unreadable_not_empty():
+    from app.utils.file_import import refusal_code
+    nested = "".join("<w:tbl><w:tr><w:tc>" for _ in range(3000)) + _p("deep") + "".join("</w:tc></w:tr></w:tbl>" for _ in range(3000))
+    assert refusal_code("deep.docx", _docx(nested)) == "import_unreadable"
+    assert refusal_code("blank.docx", _docx("")) == "import_empty"
+
+
+def test_a_file_that_is_not_what_its_name_says_is_refused_as_unreadable():
+    import fitz
+    from app.utils.import_worker import read_file
+
+    png = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), 0).tobytes("png")
+    assert read_file("photo.pdf", png)["refusal"] == "import_unreadable"
+    assert read_file("notes.docx", b"%PDF-1.7 not a word file")["refusal"] == "import_unreadable"
+    assert file_import.wears_the_wrong_extension("ok.pdf", b"junk before\n%PDF-1.4 ...") is False
+    assert file_import.wears_the_wrong_extension("empty.pdf", b"") is False        # empty has its own sentence
+    assert file_import.wears_the_wrong_extension("notes.txt", b"\x89PNG") is False  # text is judged by its bytes elsewhere
+
+
+def test_the_reason_for_an_empty_answer_comes_back_with_it():
+    from app.utils.import_worker import read_file
+    assert read_file("empty.txt", b"")["refusal"] == "import_empty"
+    assert read_file("old.doc", b"\xd0\xcf\x11\xe0")["refusal"] == "import_legacy_doc"
+    assert "refusal" not in read_file("a.txt", b"some words here")

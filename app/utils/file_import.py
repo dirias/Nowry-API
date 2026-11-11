@@ -1450,13 +1450,36 @@ def _pdf_refusal(file_content: bytes) -> str:
 
 
 def _docx_refusal(file_content: bytes) -> str:
+    """Empty only when the reader read it and found nothing; a file it cannot read is unreadable (IMPORT-048)."""
     import io
     import zipfile
     try:
         with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
-            return IMPORT_EMPTY if "word/document.xml" in archive.namelist() else IMPORT_UNREADABLE
+            if "word/document.xml" not in archive.namelist():
+                return IMPORT_UNREADABLE
     except (zipfile.BadZipFile, OSError):
         return IMPORT_UNREADABLE
+    try:
+        mammoth.convert_to_html(io.BytesIO(file_content), convert_image=mammoth.images.img_element(lambda image: {}))
+    except Exception:
+        return IMPORT_UNREADABLE
+    return IMPORT_EMPTY
+
+
+#: What a file of each type starts with. An extension is what the file is called, not what it is:
+#: a picture named .pdf was imported as a one-page scan (IMPORT-048).
+_PDF_MARK = b"%PDF-"
+_ZIP_MARK = b"PK\x03\x04"
+
+
+def wears_the_wrong_extension(filename: str, file_content: bytes) -> bool:
+    """Whether a .pdf or .docx is plainly not one. A PDF may carry up to 1 KB before its mark."""
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if extension == "pdf":
+        return bool(file_content.strip()) and _PDF_MARK not in file_content[:1024]
+    if extension == "docx":
+        return bool(file_content.strip()) and not file_content.startswith(_ZIP_MARK)
+    return False
 
 
 def refusal_code(filename: str, file_content: bytes) -> str:

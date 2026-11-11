@@ -29,6 +29,7 @@ MEMORY_MB: int = int(os.getenv("IMPORT_PARSER_MEMORY_MB", "0"))
 CONCURRENCY: int = max(1, int(os.getenv("IMPORT_PARSER_CONCURRENCY", "2")))
 
 IMPORT_TOO_COMPLEX = "import_too_complex"
+IMPORT_UNREADABLE = "import_unreadable"
 
 _gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
 
@@ -43,6 +44,8 @@ class ParsedImport:
     pictures: List[Dict[str, Any]] = field(default_factory=list)
     words: int = 0
     content_bytes: int = 0
+    #: Why there are no pages, as a stable code; None when there are.
+    refusal: str | None = None
 
 
 def _gate_for_loop() -> asyncio.Semaphore:
@@ -87,8 +90,8 @@ async def parse(filename: str, file_content: bytes) -> ParsedImport:
         raise ImportTooComplex(filename)
     if "error" in answer:
         logger.error("Import of %r failed in the reader: %s", filename, answer["error"])
-        return ParsedImport()
-    return ParsedImport(answer["pages"], answer["pictures"], answer["words"], answer["content_bytes"])
+        return ParsedImport(refusal=IMPORT_UNREADABLE)
+    return ParsedImport(answer["pages"], answer["pictures"], answer["words"], answer["content_bytes"], answer.get("refusal"))
 
 
 async def to_lexical(html_content: str) -> str:

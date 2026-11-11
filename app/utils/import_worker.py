@@ -49,13 +49,19 @@ def _measure(pages: List[Dict[str, Any]]) -> Dict[str, int]:
 
 def read_file(filename: str, file_content: bytes) -> Dict[str, Any]:
     """Pages, pictures, word count and stored size of one uploaded file."""
-    from app.utils.file_import import process_uploaded_file_with_media
+    from app.utils.file_import import (
+        IMPORT_UNREADABLE, process_uploaded_file_with_media, refusal_code, wears_the_wrong_extension,
+    )
 
+    if wears_the_wrong_extension(filename, file_content):
+        return {"pages": [], "pictures": [], "words": 0, "content_bytes": 0, "refusal": IMPORT_UNREADABLE}
     if filename.lower().endswith(".docx") and archive_too_large(file_content):
         return {"too_complex": True}
     pages, pictures = process_uploaded_file_with_media(filename, file_content)
-    measured = _measure(pages) if pages else {"words": 0, "content_bytes": 0}
-    return {"pages": pages, "pictures": pictures, **measured}
+    if not pages:
+        # Why, decided here: finding out opens the file again, and a locked PDF takes seconds to say so.
+        return {"pages": [], "pictures": [], "words": 0, "content_bytes": 0, "refusal": refusal_code(filename, file_content)}
+    return {"pages": pages, "pictures": pictures, **_measure(pages)}
 
 
 def to_lexical(html_content: str) -> str:
