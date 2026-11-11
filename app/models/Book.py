@@ -40,6 +40,9 @@ class Book(BaseModel, SoftDeleteMixin):
     reading_position: Optional[int] = None  # active page, imports only
     # ADR-066: what an import was made from, so the same file is recognised next time.
     source_hash: Optional[str] = None      # SHA-256 of the imported file's bytes
+    # ADR-069: which rule the stored counts and search terms were computed with.
+    stats_version: Optional[int] = None
+    search_version: Optional[int] = None
     source_filename: Optional[str] = None
 
     is_public: bool = False

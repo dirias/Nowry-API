@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, U
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book, BookLibraryPage, BookSummary
-from app.services import book_library
+from app.services import book_library, book_maintenance
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection
 from app.models.CardGenerationRequest import compute_effective_cap
@@ -73,6 +73,9 @@ async def create_book(
         stats = document_stats(parse_lexical(book_dict["full_content"]), book_dict["full_content"])
         ensure_document_within_ceiling(stats["word_count"])
         book_dict.update(stats)
+    # Stamped and searchable from its first write (ADR-069).
+    book_dict["stats_version"] = book_maintenance.STATS_VERSION
+    book_dict.update(book_maintenance.search_fields(book_dict.get("title"), book_dict.get("author"), book_dict.get("source")))
 
     new_book = await books_collection.insert_one(book_dict)
     book_id = str(new_book.inserted_id)
@@ -109,7 +112,7 @@ async def edit_book(
     # Remove immutable/system fields that shouldn't be updated by user.
     # forked_from is permanently set at fork time and must never be overwritten.
     fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from", "source", "page_count",
-                        "source_hash", "source_filename"]
+                        "source_hash", "source_filename", "stats_version", "search_version", "search_terms"]
     for field in fields_to_remove:
         update_data.pop(field, None)
 
@@ -120,9 +123,22 @@ async def edit_book(
         stats = document_stats(parse_lexical(content), content)
         ensure_document_within_ceiling(stats["word_count"])
         update_data.update(stats)
-    
+        update_data["stats_version"] = book_maintenance.STATS_VERSION
+
     if not update_data:
         raise HTTPException(status_code=400, detail="No data provided for update")
+
+    # A renamed document is found by its new name (ADR-069).
+    if "title" in update_data or "author" in update_data:
+        update_data.update(book_maintenance.search_fields(
+            update_data.get("title", existing_book.get("title")),
+            update_data.get("author", existing_book.get("author")),
+            existing_book.get("source"),
+        ))
+    # An import from before ADR-067 keeps where it came from only inside the
+    # sentence in its summary. Before any edit can replace that sentence, the
+    # facts in it are written to their own fields (IMPORT-033).
+    update_data.update(book_maintenance.legacy_import_facts(existing_book))
 
     # docs/prd-books-library.md FR-001: a scroll is not an edit. The pointer fields update on
     # their own without bumping updated_at, so "edited Yesterday" keeps meaning edited.
@@ -318,12 +334,14 @@ async def _backfill_document_stats(books_collection: Collection, books: list[dic
     """Documents saved before the stats existed (BOOK-001/005) have no word or section count, and
     the library would draw them thin until their next save. Compute and store the stats for up to
     BACKFILL_PER_REQUEST such documents per list request — once each, then the row is true."""
-    missing = [b for b in books if b.get("word_count") is None][:BACKFILL_PER_REQUEST]
+    # Missing, or counted under an older rule (ADR-064/069): the rows on screen
+    # are put right at once; the maintenance pass reaches the rest.
+    missing = [b for b in books
+               if b.get("word_count") is None or b.get("stats_version") != book_maintenance.STATS_VERSION][:BACKFILL_PER_REQUEST]
     for book in missing:
         oid = ObjectId(book["_id"]) if ObjectId.is_valid(book["_id"]) else book["_id"]
         full = await books_collection.find_one({"_id": oid}, {"full_content": 1})
-        content = (full or {}).get("full_content") or ""
-        stats = document_stats(parse_lexical(content), content)
+        stats = book_maintenance.stats_fields((full or {}).get("full_content"))
         book.update(stats)
         await books_collection.update_one({"_id": oid}, {"$set": stats})
 
@@ -710,6 +728,8 @@ async def import_book_from_file(
     # Inserted under the id minted above, the one its pictures are stored under
     book_dict = new_book.model_dump(by_alias=True)
     book_dict["_id"] = book_oid
+    book_dict["stats_version"] = book_maintenance.STATS_VERSION
+    book_dict.update(book_maintenance.search_fields(book_title, username, "imported"))
     await books_collection.insert_one(book_dict)
     book_id = str(book_oid)
 

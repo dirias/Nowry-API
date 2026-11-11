@@ -20,6 +20,8 @@ from typing import Any, Optional
 
 from pymongo.collation import Collation
 
+from app.services import book_maintenance
+
 KINDS = ("all", "written", "imported")
 SORTS = ("edited", "title", "cards")
 PAGE_DEFAULT: int = 24
@@ -30,7 +32,8 @@ CARD_RANK_MAX: int = 2000
 
 #: Titles sort as a reader expects: "álgebra" beside "algebra", "Zoo" after both.
 TITLE_COLLATION = Collation(locale="en", strength=2)
-SUMMARY_PROJECTION = {"full_content": 0}
+#: A row for the list: neither the document's content nor its search terms travel.
+SUMMARY_PROJECTION = {"full_content": 0, "search_terms": 0}
 
 
 def owned(user_id: str) -> dict:
@@ -49,10 +52,28 @@ def library_filter(user_id: str, kind: str = "all", search: str = "", tags: Opti
         query["tags"] = {"$in": tags}
     needle = (search or "").strip()
     if needle:
-        pattern = {"$regex": re.escape(needle), "$options": "i"}
-        # An import is also found by its author, as the list has always done.
-        query["$or"] = [{"title": pattern}, {"source": "imported", "author": pattern}]
+        query["$or"] = _search_clauses(needle)
     return query
+
+
+def _search_clauses(needle: str) -> list[dict]:
+    """Which documents the typed words find (IMPORT-036, ADR-069).
+
+    Each folded word must begin one of the document's stored search terms —
+    the suffixes of its title's words, and of an import's author — so the
+    match ignores case, accents, width and kana, and is answered by the index
+    on `search_terms`. A document the maintenance pass has not reached yet has
+    no terms; until it does, it is matched the old way, on its title.
+    """
+    literal = {"$regex": re.escape(needle), "$options": "i"}
+    unreached = {"search_version": {"$exists": False},
+                 "$or": [{"title": literal}, {"source": "imported", "author": literal}]}
+    terms = book_maintenance.query_terms(needle)
+    if not terms:
+        # Nothing but punctuation was typed: only a title that contains exactly that can match.
+        return [{"title": literal}]
+    by_terms = {"$and": [{"search_terms": {"$regex": "^" + re.escape(term)}} for term in terms]}
+    return [by_terms, unreached]
 
 
 def apply_title_collation(cursor: Any) -> Any:
