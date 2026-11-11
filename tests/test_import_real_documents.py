@@ -126,7 +126,7 @@ def test_punctuation_and_brackets_come_out_as_typed():
     # Visual: ".(ןימי) הנושאר הדומע" — the brackets are stored as drawn, mirrored.
     assert file_import._logical_rtl_text(_drawn(".(ןימי) הנושאר הדומע")) == "עמודה ראשונה (ימין)."
     assert file_import._logical_rtl_text(_drawn(",APPLE גתומ לש")) == "של מותג APPLE,"
-    assert file_import._logical_rtl_text(_drawn("(ok) בוט"), base_rtl=True) == "טוב (ok)"
+    assert file_import._logical_rtl_text(_drawn("(ok) דואמ בוט"), base_rtl=True) == "טוב מאוד (ok)"
 
 
 def test_a_line_drawn_left_to_right_or_with_no_rtl_letters_is_left_as_stored():
@@ -138,3 +138,59 @@ def test_a_line_drawn_left_to_right_or_with_no_rtl_letters_is_left_as_stored():
 def test_a_gap_with_no_stored_space_is_a_space():
     stored = [("ב", 60), ("א", 54), ("ד", 30), ("ג", 24)]   # two words, 18 points apart, no space glyph
     assert file_import._logical_rtl_text(_raw_line(stored)) == "בא דג"
+
+
+# ── IMPORT-047: equations and text boxes are text the writer typed ──────────
+
+_NS = ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+       'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
+       'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+       'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"')
+
+
+def _docx(body: str, prolog: str = "") -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                         '<Default Extension="xml" ContentType="application/xml"/>'
+                         '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+        archive.writestr("_rels/.rels", '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+        archive.writestr("word/document.xml", f'<?xml version="1.0"?>{prolog}<w:document {_NS}><w:body>{body}</w:body></w:document>')
+    return out.getvalue()
+
+
+def _p(text: str) -> str:
+    return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+
+
+def _mr(text: str) -> str:
+    return f"<m:r><m:t>{text}</m:t></m:r>"
+
+
+def test_an_equation_is_imported_as_its_linear_text():
+    fraction = f"<m:f><m:fPr/><m:num>{_mr('a+b')}</m:num><m:den>{_mr('2')}</m:den></m:f>"
+    power = f"<m:sSup><m:e>{_mr('c')}</m:e><m:sup>{_mr('2')}</m:sup></m:sSup>"
+    root = f"<m:rad><m:radPr/><m:deg/><m:e>{_mr('x')}</m:e></m:rad>"
+    body = (_p("Energy:") + f"<w:p><w:r><w:t xml:space=\"preserve\">so </w:t></w:r><m:oMath>{_mr('E=m')}{power}</m:oMath></w:p>"
+            + f"<w:p><m:oMathPara><m:oMath>{fraction}{_mr('+')}{root}</m:oMath></m:oMathPara></w:p>")
+    html = _html(process_uploaded_file("physics.docx", _docx(body)))
+    assert "so E=mc^2" in html and "(a+b)/2+√(x)" in html and "Energy:" in html
+
+
+def test_a_text_box_without_fallback_markup_follows_its_paragraph():
+    box = ("<w:p><w:r><w:t>Anchor paragraph.</w:t></w:r><w:r><mc:AlternateContent><mc:Choice Requires=\"wps\"><wps:wsp><wps:txbx>"
+           f"<w:txbxContent>{_p('Inside the box.')}{_p('Second line in the box.')}</w:txbxContent></wps:txbx></wps:wsp></mc:Choice>"
+           "</mc:AlternateContent></w:r></w:p>")
+    html = _html(process_uploaded_file("boxed.docx", _docx(box + _p("After."))))
+    order = [html.index(text) for text in ("Anchor paragraph.", "Inside the box.", "Second line in the box.", "After.")]
+    assert order == sorted(order)
+
+
+def test_a_document_with_neither_is_not_rewritten_and_one_with_a_doctype_is_left_alone():
+    plain = _docx(_p("Nothing special."))
+    assert file_import._with_unread_text(plain) is plain
+    declared = _docx(f"<w:p><m:oMath>{_mr('x')}</m:oMath></w:p>", prolog='<!DOCTYPE d [<!ENTITY a "b">]>')
+    assert file_import._with_unread_text(declared) is declared
+    assert file_import._with_unread_text(b"not a zip") == b"not a zip"

@@ -756,6 +756,123 @@ def extract_text_from_pdf_fallback(file_content: bytes) -> List[Dict[str, str]]:
         return []
 
 
+# ── what the Word reader does not read ──────────────────────────────────────
+#
+# mammoth reads paragraphs, runs, tables, pictures and (through Word's own
+# fallback markup) text boxes. It skips an equation entirely, and a text box
+# written without the fallback. Both are text the writer typed, so the
+# document's XML is rewritten first: an equation becomes a run holding its
+# linear form, and such a text box's paragraphs follow the paragraph it is
+# anchored in (IMPORT-047).
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _math_text(node) -> str:
+    """An Office Math element as a line of text: fractions with a slash, scripts with ^ and _, roots with √."""
+    tag = node.tag.rsplit("}", 1)[-1]
+    child = {c.tag.rsplit("}", 1)[-1]: c for c in node}
+
+    def part(name: str) -> str:
+        return _math_text(child[name]) if name in child else ""
+
+    def grouped(text: str) -> str:
+        return text if len(text) <= 1 or text.isalnum() else f"({text})"
+
+    if tag == "t":
+        return node.text or ""
+    if tag == "f":
+        return f"{grouped(part('num'))}/{grouped(part('den'))}"
+    if tag == "sSup":
+        return f"{part('e')}^{grouped(part('sup'))}"
+    if tag == "sSub":
+        return f"{part('e')}_{grouped(part('sub'))}"
+    if tag == "sSubSup":
+        return f"{part('e')}_{grouped(part('sub'))}^{grouped(part('sup'))}"
+    if tag == "rad":
+        degree = part("deg")
+        return f"{degree}√({part('e')})"
+    if tag == "d":
+        return "(" + ", ".join(_math_text(c) for c in node if c.tag.endswith("}e")) + ")"
+    if tag.endswith("Pr"):
+        return ""  # properties: how it looks, not what it says
+    return "".join(_math_text(c) for c in node)
+
+
+def _lift_equations(root) -> int:
+    """Replace every equation with a run of its text. Returns how many."""
+    import xml.etree.ElementTree as ET
+
+    parents = {child: parent for parent in root.iter() for child in parent}
+    equations = [node for node in root.iter(f"{{{_M_NS}}}oMath")]
+    for equation in equations:
+        parent = parents.get(equation)
+        if parent is None:
+            continue
+        run = ET.Element(f"{{{_W_NS}}}r")
+        text = ET.SubElement(run, f"{{{_W_NS}}}t")
+        text.text = _math_text(equation)
+        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        if parent.tag == f"{{{_M_NS}}}oMathPara":   # a displayed equation: its wrapper sits where the run must
+            grandparent = parents.get(parent)
+            if grandparent is None:
+                continue
+            grandparent.insert(list(grandparent).index(parent), run)
+            grandparent.remove(parent)
+        else:
+            parent.insert(list(parent).index(equation), run)
+            parent.remove(equation)
+    return len(equations)
+
+
+def _lift_text_boxes(root) -> int:
+    """Move the paragraphs of a text box that has no fallback markup to after its anchor paragraph."""
+    body = root.find(f"{{{_W_NS}}}body")
+    if body is None:
+        return 0
+    lifted = 0
+    for anchor in list(body):
+        if anchor.tag != f"{{{_W_NS}}}p":
+            continue
+        boxes = [alternate for alternate in anchor.iter(f"{{{_MC_NS}}}AlternateContent")
+                 if alternate.find(f"{{{_MC_NS}}}Fallback") is None]
+        paragraphs = [p for box in boxes for content in box.iter(f"{{{_W_NS}}}txbxContent") for p in list(content)]
+        for offset, paragraph in enumerate(paragraphs, start=1):
+            body.insert(list(body).index(anchor) + offset, paragraph)
+            lifted += 1
+    return lifted
+
+
+def _with_unread_text(file_content: bytes) -> bytes:
+    """The .docx with its equations and fallback-less text boxes turned into text the reader reads."""
+    import io
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
+            document = archive.read("word/document.xml")
+            if b"oMath" not in document and b"txbxContent" not in document:
+                return file_content
+            if b"<!DOCTYPE" in document or b"<!ENTITY" in document:
+                return file_content  # a Word file declares neither; leave it to the reader to refuse
+            root = ET.fromstring(document)
+            if not (_lift_equations(root) + _lift_text_boxes(root)):
+                return file_content
+            rewritten = io.BytesIO()
+            with zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as out:
+                for item in archive.infolist():
+                    data = ET.tostring(root, encoding="utf-8", xml_declaration=True) if item.filename == "word/document.xml" \
+                        else archive.read(item.filename)
+                    out.writestr(item.filename, data)
+            return rewritten.getvalue()
+    except Exception:
+        logger.warning("DOCX import: equations and text boxes left as they were", exc_info=True)
+        return file_content
+
+
 def _docx_picture_handler(media: List[Dict]):
     """A mammoth image converter that keeps the bytes and leaves a marker in the HTML."""
     def handle(image) -> Dict[str, str]:
@@ -781,7 +898,7 @@ def extract_formatted_text_from_docx(file_content: bytes, media: Optional[List[D
     try:
         import io
 
-        docx_file = io.BytesIO(file_content)
+        docx_file = io.BytesIO(_with_unread_text(file_content))
 
         # Convert DOCX to HTML using mammoth (preserves formatting); pictures
         # come out as bytes beside it, never as data URIs (ADR-062 point 5).
