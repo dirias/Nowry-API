@@ -214,7 +214,10 @@ def _render(parts: List[List]) -> str:
     return "".join(out)
 
 
-def _heading_tag(size: float) -> Optional[str]:
+def _heading_tag(size: float, scale: Optional[Dict[float, str]] = None) -> Optional[str]:
+    """The heading level of a line set at `size`, by the document's own type scale when it is known."""
+    if scale is not None:
+        return scale.get(size)
     if size > 24:
         return "h1"
     if size > 18:
@@ -222,6 +225,50 @@ def _heading_tag(size: float) -> Optional[str]:
     if size > 14:
         return "h3"
     return None
+
+
+_HEADING_RATIO = 1.12       # a heading is set at least this much larger than the body text
+_HEADING_MAX_SHARE = 0.20   # …and a size that carries more of the document than this is not a heading
+
+
+def _type_scale(sizes: Dict[float, int]) -> Dict[float, str]:
+    """Which sizes are headings, and of what level, from how much text the document sets at each (IMPORT-045).
+
+    Fixed point sizes read a 12-point manual with 14-point chapters as having
+    no headings above the third level, so it had no sections. The body is the
+    size most of the text is set in; the sizes clearly above it, largest first,
+    are the first, second and third levels. A document with a single heading
+    size keeps the level its point size suggests, at least the second: it is
+    what the sections are cut at.
+    """
+    if not sizes:
+        return {}
+    total = sum(sizes.values())
+    body = max(sizes, key=sizes.get)
+    larger = sorted((size for size, chars in sizes.items()
+                     if size >= body * _HEADING_RATIO and chars <= total * _HEADING_MAX_SHARE), reverse=True)
+    if len(larger) == 1:
+        return {larger[0]: _heading_tag(larger[0]) if larger[0] > 18 else "h2"}
+    return {size: ("h1", "h2")[rank] if rank < 2 else "h3" for rank, size in enumerate(larger)}
+
+
+#: "3. The POSIX Shell Standard", "2.1. Command Interpreter", "3.1.2 Quoting": a numbered heading.
+_NUMBERED_HEADING = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,2}){0,3})\.?\s+\S")
+_NUMBERED_HEADING_MAX_LENGTH = 90
+#: The dots that lead the eye from a contents entry to its page number.
+_DOT_LEADER = re.compile(r"(?:\s*\.){4,}\s*")
+
+
+def _numbered_heading(block: Dict, entry: Dict) -> Optional[str]:
+    """The level of a bold, numbered line standing alone: a paper's section heading set at body size (IMPORT-045)."""
+    if len(block.get("lines", [])) > 2 or len(entry["text"]) > _NUMBERED_HEADING_MAX_LENGTH:
+        return None
+    if not entry["segments"] or not all(flags & 16 for text, flags in entry["segments"] if text.strip()):
+        return None
+    match = _NUMBERED_HEADING.match(entry["text"])
+    if not match:
+        return None
+    return "h2" if "." not in match.group(1) else "h3"
 
 
 def _running_key(page_height: float, entry: Dict) -> Optional[Tuple[str, str]]:
@@ -238,23 +285,34 @@ def _running_key(page_height: float, entry: Dict) -> Optional[Tuple[str, str]]:
     return band, _DIGITS.sub("#", entry["text"])
 
 
-def _running_lines(doc) -> set:
-    """The margin lines that repeat on at least half the pages (and at least two): headers, footers, page numbers."""
-    if doc.page_count < 2:
-        return set()
+def _document_survey(doc) -> Tuple[set, Dict[float, str]]:
+    """One pass over the document: its running lines, and its type scale.
+
+    Running lines are the margin lines that repeat on at least half the pages
+    (and at least two): headers, footers, page numbers.
+    """
     seen: Dict[Tuple[str, str], int] = {}
+    sizes: Dict[float, int] = {}
     for page in doc:
         keys = set()
         for block in page.get_text("dict", flags=0)["blocks"]:
             for line in block.get("lines", []):
                 entry = _pdf_line(line)
-                key = _running_key(page.rect.height, entry) if entry else None
+                if not entry:
+                    continue
+                sizes[entry["size"]] = sizes.get(entry["size"], 0) + len(entry["text"])
+                key = _running_key(page.rect.height, entry)
                 if key:
                     keys.add(key)
         for key in keys:
             seen[key] = seen.get(key, 0) + 1
     needed = max(2, (doc.page_count + 1) // 2)
-    return {key for key, count in seen.items() if count >= needed}
+    running = {key for key, count in seen.items() if count >= needed} if doc.page_count >= 2 else set()
+    return running, _type_scale(sizes)
+
+
+def _running_lines(doc) -> set:
+    return _document_survey(doc)[0]
 
 
 def _page_tables(page) -> List[Dict]:
@@ -291,7 +349,8 @@ def _inside(bbox, container) -> bool:
     return container[0] <= x <= container[2] and container[1] <= y <= container[3]
 
 
-def _pdf_blocks_to_html(blocks_list: List[Dict], page_height: float = 0, running: Optional[set] = None) -> str:
+def _pdf_blocks_to_html(blocks_list: List[Dict], page_height: float = 0, running: Optional[set] = None,
+                        scale: Optional[Dict[float, str]] = None) -> str:
     """Text blocks as paragraphs, headings and lists; pictures and tables where they sit."""
     pieces: List[Tuple[Optional[str], str]] = []  # (list kind or None, html)
 
@@ -315,7 +374,18 @@ def _pdf_blocks_to_html(blocks_list: List[Dict], page_height: float = 0, running
                 continue
             if running and _running_key(page_height, entry) in running:
                 continue
-            heading = _heading_tag(entry["size"])
+            if _DOT_LEADER.search(entry["text"]):
+                # A contents entry: its leader is not text, and however large it is set it is not a heading.
+                for segment in entry["segments"]:
+                    segment[0] = _DOT_LEADER.sub(" … ", segment[0])
+                entry["text"] = _DOT_LEADER.sub(" … ", entry["text"]).strip()
+                heading = None
+            else:
+                heading = _heading_tag(entry["size"], scale)
+                if not heading:
+                    heading = _numbered_heading(block, entry)
+                    if heading:  # its weight is what made it a heading; a heading is not also bold
+                        entry["segments"] = [[text, flags & ~16] for text, flags in entry["segments"]]
             marker = None if heading else (_BULLET.match(entry["text"]) or _NUMBERED.match(entry["text"]))
             if marker:
                 flush(kind, parts, tag)
@@ -465,7 +535,7 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
 
         pages = []
         total_chars_extracted = 0
-        running = _running_lines(doc)
+        running, scale = _document_survey(doc)
         # The file was broken and the reader rebuilt what it could: what follows
         # may be only part of the document, and the preview says so (IMPORT-021).
         repaired = bool(getattr(doc, "is_repaired", False))
@@ -502,7 +572,7 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
             # The order a reader follows: down each column, columns left to right,
             # however many there are (IMPORT-018).
             ordered, column_count = _reading_order(placed)
-            page_html = _pdf_blocks_to_html(ordered, page_height, running)
+            page_html = _pdf_blocks_to_html(ordered, page_height, running, scale)
             page_has_columns = column_count > 1
 
             # Extract plain text for quality metrics
