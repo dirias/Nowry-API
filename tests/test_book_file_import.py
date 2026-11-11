@@ -1006,3 +1006,13 @@ def test_import_pictures_are_ledgered_as_imports_and_not_counted_in_the_month(wo
 def test_the_default_ceiling_is_one_named_number():
     from app.utils import file_import
     assert file_import.IMPORT_PICTURES_PER_DOCUMENT == 100
+
+
+# ── IMPORT-031 / ADR-067: an import stores facts, not prose ─────────────────
+
+def test_an_import_stores_what_it_is_and_no_sentence_in_any_language(world):
+    assert _upload(world, "mito.pdf", pdf_bytes(2)).status_code == 200
+    stored = world.run(world.raw["books"].find_one({}))
+    assert stored["source"] == "imported" and stored["source_filename"] == "mito.pdf" and stored["page_count"] == 2
+    assert stored["summary"] == "" and not stored.get("cover_color") and "isbn" not in stored
+    assert "Imported from" not in json.dumps(stored, default=str) and "Importado" not in json.dumps(stored, default=str)

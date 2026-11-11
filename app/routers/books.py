@@ -665,12 +665,13 @@ async def import_book_from_file(
         title=book_title,
         author=username,
         user_id=current_user.get("user_id"),
-        isbn="Importado",
-        summary=f"Imported from {filename} - {len(extracted_pages)} pages",
+        # ADR-067: facts, not prose. That it was imported, the file it came from
+        # and its page count are stored below as fields each client words in its
+        # own language; no sentence, no borrowed ISBN and no fixed colour is written.
+        summary="",
         created_at=datetime.now(),
         updated_at=datetime.now(),
         full_content=full_content,
-        cover_color="#4A90E2",
         source="imported",
         source_hash=source_hash,
         source_filename=filename[:255] or None,
