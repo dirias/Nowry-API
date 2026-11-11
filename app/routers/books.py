@@ -42,6 +42,7 @@ def ensure_document_within_bytes(content_bytes: int) -> None:
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils import media_ledger
+from app.utils.labels import AUTHOR_MAX_LENGTH, TITLE_MAX_LENGTH, clean_label, import_title
 from app.utils.logger import get_logger
 from app.utils.storage import get_storage_backend, media_root
 from app.utils.uploads import read_bounded_upload
@@ -86,6 +87,9 @@ async def create_book(
     logger.info(f"Creating book: {book.title}")
     # Exclude _id to let MongoDB generate it as ObjectId
     book_dict = book.model_dump(by_alias=True, exclude={'id'})
+    # IMPORT-049: a title and an author are one printable line of bounded length, however they arrive.
+    book_dict["title"] = clean_label(book_dict.get("title"), TITLE_MAX_LENGTH)
+    book_dict["author"] = clean_label(book_dict.get("author"), AUTHOR_MAX_LENGTH)
     if book_dict.get("full_content"):
         stats = document_stats(parse_lexical(book_dict["full_content"]), book_dict["full_content"])
         ensure_document_within_ceiling(stats["word_count"])
@@ -132,6 +136,11 @@ async def edit_book(
                         "source_hash", "source_filename", "search_terms"]
     for field in fields_to_remove:
         update_data.pop(field, None)
+
+    if "title" in update_data:
+        update_data["title"] = clean_label(update_data["title"], TITLE_MAX_LENGTH)
+    if "author" in update_data:
+        update_data["author"] = clean_label(update_data["author"], AUTHOR_MAX_LENGTH)
 
     # docs/prd-book-cards.md E5 / prd-books-library.md D6: words and sections are computed on
     # save, so the library never parses content to draw a row.
@@ -666,7 +675,10 @@ async def import_book_from_file(
         raise HTTPException(status_code=409, detail={"code": IMPORT_DUPLICATE_CODE, "existing": duplicate_of})
 
     # Create book title from filename or use provided title
-    book_title = title if title and title.strip() else filename.rsplit(".", 1)[0]
+    book_title = import_title(title, filename)
+    # IMPORT-049: who imported it is the account, not a field the request carries. `username`
+    # stays in the form for a display name the account has not got; it is cleaned and bounded.
+    username = clean_label(current_user.get("username") or username, AUTHOR_MAX_LENGTH)
 
     # Get extraction metadata
     metadata = extracted_pages[0].get("extraction_metadata", {})

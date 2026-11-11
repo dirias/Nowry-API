@@ -222,3 +222,57 @@ def test_the_reason_for_an_empty_answer_comes_back_with_it():
     assert read_file("empty.txt", b"")["refusal"] == "import_empty"
     assert read_file("old.doc", b"\xd0\xcf\x11\xe0")["refusal"] == "import_legacy_doc"
     assert "refusal" not in read_file("a.txt", b"some words here")
+
+
+# ── IMPORT-049: titles and authors are one bounded, printable line ──────────
+
+from tests._fake_world import fake_world  # noqa: E402
+
+
+@pytest.fixture
+def world():
+    with fake_world() as w:
+        w.act_as(w.new_user("reader"))
+        yield w
+
+
+def _import(world, name, content=b"some words to import here", **form):
+    return world.http.post("/book/import", files={"file": (name, content, "application/octet-stream")}, data=form)
+
+
+def _stored(world):
+    return world.run(world.raw["books"].find_one({}, sort=[("_id", -1)]))
+
+
+def test_clean_label_keeps_one_printable_line():
+    from app.utils.labels import clean_label, import_title
+    assert clean_label("  a\x00b\n c\t ", 50) == "a b c"
+    assert clean_label("report\u202etxt.exe", 50) == "report txt.exe"     # no override left to reverse the name
+    assert clean_label("x" * 500, 200) == "x" * 200 and clean_label(None, 10) == ""
+    assert clean_label("日本語のノート 📚", 50) == "日本語のノート 📚"
+    assert import_title("  ", "notes.final.txt") == "notes.final"
+    assert import_title(None, ".txt") == ".txt" and import_title("Mine", "x.txt") == "Mine"
+
+
+def test_an_import_never_has_an_empty_or_endless_title(world):
+    assert _import(world, ".txt").status_code == 200 and _stored(world)["title"] == ".txt"
+    assert _import(world, "   .txt", b"other words to import now").status_code == 200 and _stored(world)["title"] == ".txt"
+    assert _import(world, "n" * 300 + ".txt", b"third file of words").status_code == 200 and len(_stored(world)["title"]) == 200
+    assert _import(world, "a.txt", b"fourth file of words", title="T" * 5000).status_code == 200 and len(_stored(world)["title"]) == 200
+    assert _import(world, "a\x00b.txt", b"fifth file of words").status_code == 200 and "\x00" not in _stored(world)["title"]
+
+
+def test_the_author_of_an_import_is_the_account_not_the_form(world):
+    account = world.current["user"].get("username")
+    assert _import(world, "a.txt", username="<script>x</script>" + "U" * 5000).status_code == 200
+    stored = _stored(world)
+    if account:
+        assert stored["author"] == account
+    assert len(stored["author"]) <= 100 and "U" * 101 not in stored["author"]
+
+
+def test_created_and_edited_titles_are_cleaned_and_bounded(world):
+    created = world.http.post("/book/create", json={"title": "  My\u202e notes\n ", "author": "A" * 400}).json()
+    assert created["title"] == "My notes" and len(created["author"]) == 100
+    edited = world.http.put(f"/book/edit/{created['_id']}", json={"title": "Z" * 900}).json()
+    assert len(edited["title"]) == 200
