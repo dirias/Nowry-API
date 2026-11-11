@@ -62,18 +62,13 @@ def _search_clauses(needle: str) -> list[dict]:
     Each folded word must begin one of the document's stored search terms —
     the suffixes of its title's words, and of an import's author — so the
     match ignores case, accents, width and kana, and is answered by the index
-    on `search_terms`. A document written before the terms existed has none;
-    it is matched on its title as before, until its title is next saved.
+    on `search_terms`.
     """
-    literal = {"$regex": re.escape(needle), "$options": "i"}
     terms = book_search.query_terms(needle)
     if not terms:
         # Nothing but punctuation was typed: only a title that contains exactly that can match.
-        return [{"title": literal}]
-    by_terms = {"$and": [{"search_terms": {"$regex": "^" + re.escape(term)}} for term in terms]}
-    without_terms = {"search_terms": {"$exists": False},
-                     "$or": [{"title": literal}, {"source": "imported", "author": literal}]}
-    return [by_terms, without_terms]
+        return [{"title": {"$regex": re.escape(needle), "$options": "i"}}]
+    return [{"$and": [{"search_terms": {"$regex": "^" + re.escape(term)}} for term in terms]}]
 
 
 def apply_title_collation(cursor: Any) -> Any:

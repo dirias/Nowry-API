@@ -81,17 +81,10 @@ def test_an_import_is_found_by_its_author_and_punctuation_alone_only_literally(w
     assert _titles(world, q=".*") == []
 
 
-def test_a_document_without_terms_is_still_found_by_its_title_and_gets_terms_when_renamed(world):
-    book_id = _insert(world, title="Old Notes on Cells", word_count=1, section_count=1)
-    assert _titles(world, q="notes") == ["Old Notes on Cells"]
-    assert world.http.put(f"/book/edit/{book_id}", json={"title": "Células"}).status_code == 200
-    assert _titles(world, q="celulas") == ["Células"]
-
-
 def test_the_query_is_a_prefix_match_on_the_indexed_terms():
     clauses = book_library.library_filter("u1", search="Álgebra II")["$or"]
     assert clauses[0] == {"$and": [{"search_terms": {"$regex": "^algebra"}}, {"search_terms": {"$regex": "^ii"}}]}
-    assert clauses[1]["search_terms"] == {"$exists": False}
+    assert len(clauses) == 1
 
 
 def test_a_rename_is_searchable_and_the_terms_never_leave_the_server(world):

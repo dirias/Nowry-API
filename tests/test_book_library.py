@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from bson import ObjectId
 
-from app.services import book_library
+from app.services import book_library, book_search
 from tests._fake_world import fake_world
 
 T0 = datetime(2026, 11, 1, 12, 0, 0)
@@ -28,6 +28,7 @@ def _book(world, title, minutes, **fields):
     doc = {"title": title, "user_id": world.current["user"]["user_id"], "deleted_at": None,
            "updated_at": T0 + timedelta(minutes=minutes), "created_at": T0, "word_count": 10, "section_count": 1,
            "full_content": "x" * 50, **fields}
+    doc.update(book_search.search_fields(title, doc.get("author"), doc.get("source")))  # as every write path stores
     return str(world.run(world.raw["books"].insert_one(doc)).inserted_id)
 
 
@@ -68,7 +69,8 @@ def test_every_document_is_reached_exactly_once_by_paging(world):
 def test_search_kind_and_tags_are_answered_by_the_server_over_the_whole_library(world):
     _seed(world)
     found = _library(world, q="DOC 00")
-    assert found["total"] == 10 and {item["title"] for item in found["items"]} == {f"doc 00{n}" for n in range(10)}
+    # Each typed word begins a suffix of a title's word (ADR-069), so "00" also finds "doc 100".
+    assert found["total"] == 11 and {item["title"] for item in found["items"]} == {f"doc 00{n}" for n in range(10)} | {"doc 100"}
     assert found["counts"]["all"] == 130  # the counts describe the library, not the answer
     imported = _library(world, kind="imported", limit=100)
     assert imported["total"] == 44 and all(item["source"] == "imported" for item in imported["items"])
