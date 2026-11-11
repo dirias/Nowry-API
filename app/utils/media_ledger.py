@@ -243,12 +243,20 @@ async def collect(rows_query: Optional[Dict[str, Any]] = None, label: str = "con
     return removed
 
 
-async def condemn_orphans(books_collection: Any, limit: int = ORPHAN_SCAN_PAGE) -> int:
-    """Condemn the images of books that are already deleted.
+#: How long a row may name a book that does not exist before it is an orphan. An
+#: import stores its pictures before its document (ADR-062 point 2), so for the
+#: length of one import that is the ordinary state of things.
+ORPHAN_GRACE_SECONDS = int(os.getenv("MEDIA_ORPHAN_GRACE_SECONDS", "3600"))
 
-    These are rows from before removal was durable, or from a deletion whose
-    request ended before its rows were marked. The ledger is walked a page per
-    call, by `_id`, and starts over at its end.
+
+async def condemn_orphans(books_collection: Any, limit: int = ORPHAN_SCAN_PAGE) -> int:
+    """Condemn the images of books that are deleted, or that were never saved.
+
+    A deleted book's rows are here when its deletion ended before they were
+    marked. A missing book's rows are an import that stored its pictures and
+    then died before its document was written (ADR-071 point 1); they are
+    orphans once older than `ORPHAN_GRACE_SECONDS`. The ledger is walked a page
+    per call, by `_id`, and starts over at its end.
     """
     global _orphan_cursor
     query: Dict[str, Any] = {"delete_after": {"$exists": False}, "book_id": {"$ne": None}}
@@ -256,15 +264,21 @@ async def condemn_orphans(books_collection: Any, limit: int = ORPHAN_SCAN_PAGE) 
         query["_id"] = {"$gt": _orphan_cursor}
     rows = await media_collection.find(query, {"book_id": 1}).sort("_id", 1).limit(limit).to_list(length=limit)
     _orphan_cursor = rows[-1]["_id"] if len(rows) == limit else None
-    book_ids = sorted({row["book_id"] for row in rows if ObjectId.is_valid(str(row["book_id"]))})
+    book_ids = sorted({str(row["book_id"]) for row in rows if ObjectId.is_valid(str(row["book_id"]))})
     if not book_ids:
         return 0
-    deleted = await books_collection.find(
-        {"_id": {"$in": [ObjectId(b) for b in book_ids]}, "deleted_at": {"$ne": None}}, {"_id": 1}
+    books = await books_collection.find(
+        {"_id": {"$in": [ObjectId(b) for b in book_ids]}}, {"deleted_at": 1}
     ).to_list(length=len(book_ids))
-    if not deleted:
-        return 0
-    return await condemn({"book_id": {"$in": [str(book["_id"]) for book in deleted]}})
+    deleted = [str(book["_id"]) for book in books if book.get("deleted_at") is not None]
+    missing = sorted(set(book_ids) - {str(book["_id"]) for book in books})
+    condemned = 0
+    if deleted:
+        condemned += await condemn({"book_id": {"$in": deleted}})
+    if missing:
+        cutoff = _now() - timedelta(seconds=ORPHAN_GRACE_SECONDS)
+        condemned += await condemn({"book_id": {"$in": missing}, "created_at": {"$lt": cutoff}})
+    return condemned
 
 
 async def reap_once(books_collection: Any = None) -> int:

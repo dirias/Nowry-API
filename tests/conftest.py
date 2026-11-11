@@ -12,6 +12,10 @@ for _name in ("SENTRY_DSN", "GROQ_API_KEY", "GEMINI_API_KEY", "STRIPE_SECRET_KEY
               "FIREBASE_SERVICE_ACCOUNT_JSON", "FIREBASE_SERVICE_ACCOUNT_PATH"):
     os.environ[_name] = ""
 os.environ["MONGO_URI"] = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200"
+# ADR-070: imports are read in a child process in production. The suite reads them in
+# this process (a spawn per test file would triple its time); tests/test_import_parser.py
+# exercises the child itself.
+os.environ.setdefault("IMPORT_PARSER_ISOLATION", "inline")
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch

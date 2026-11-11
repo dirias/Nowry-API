@@ -7,7 +7,8 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, U
 from pymongo.collection import Collection
 from bson import ObjectId
 from app.models.Book import Book, BookLibraryPage, BookSummary
-from app.services import book_library, book_search
+from app.services import book_library, book_search, import_parser
+from pymongo.errors import DuplicateKeyError
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection
 from app.models.CardGenerationRequest import compute_effective_cap
@@ -17,11 +18,27 @@ from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 DOCUMENT_TOO_LONG_CODE = "document_too_long"
 
 
+DOCUMENT_TOO_LARGE_CODE = "document_too_large"
+#: What one document may weigh as stored JSON (ADR-071). The database refuses a
+#: record past 16 MB; the ceiling sits under it so a document that was saved can
+#: still be edited and saved again. Words do not bound this: 190,000 long ones
+#: (a hex dump, minified code) are under the word ceiling and over this.
+DOCUMENT_MAX_BYTES: int = int(os.getenv("DOCUMENT_MAX_BYTES", str(12 * 1024 * 1024)))
+
+
 def ensure_document_within_ceiling(word_count: int) -> None:
     """ADR-041: one size ceiling per document, the same on every tier (413 with a code)."""
     limit = int(SUBSCRIPTION_PLANS[SubscriptionTier.FREE]["limits"]["document_words"])
     if limit != -1 and word_count > limit:
         raise HTTPException(status_code=413, detail={"code": DOCUMENT_TOO_LONG_CODE, "limit": limit, "words": word_count})
+
+
+def ensure_document_within_bytes(content_bytes: int) -> None:
+    """ADR-071: a document the database could not hold is refused with a code, never met as a failed write."""
+    if content_bytes > DOCUMENT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "code": DOCUMENT_TOO_LARGE_CODE, "limit": DOCUMENT_MAX_BYTES // (1024 * 1024),
+            "megabytes": round(content_bytes / (1024 * 1024), 1)})
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_ownership, track_ai_usage
 from app.utils import media_ledger
@@ -72,6 +89,7 @@ async def create_book(
     if book_dict.get("full_content"):
         stats = document_stats(parse_lexical(book_dict["full_content"]), book_dict["full_content"])
         ensure_document_within_ceiling(stats["word_count"])
+        ensure_document_within_bytes(len(book_dict["full_content"].encode("utf-8")))
         book_dict.update(stats)
     # Searchable from its first write (ADR-069).
     book_dict.update(book_search.search_fields(book_dict.get("title"), book_dict.get("author"), book_dict.get("source")))
@@ -121,6 +139,7 @@ async def edit_book(
         content = update_data["full_content"]
         stats = document_stats(parse_lexical(content), content)
         ensure_document_within_ceiling(stats["word_count"])
+        ensure_document_within_bytes(len(content.encode("utf-8")))
         update_data.update(stats)
 
     if not update_data:
@@ -471,6 +490,92 @@ async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> 
     return dict(entry for entry in stored if entry)
 
 
+IMPORT_FAILED_CODE = "import_failed"
+IMPORT_PICTURES_NOT_STORED_CODE = "import_pictures_not_stored"
+IMPORT_IN_PROGRESS_CODE = "import_in_progress"
+#: What one stored picture adds to a document's JSON, for the size check made before any is stored.
+PICTURE_NODE_BYTES: int = 400
+IMPORT_LOCK_WAIT_SECONDS: float = float(os.getenv("IMPORT_LOCK_WAIT_SECONDS", "45"))
+
+
+class _import_lock:
+    """One reader's save of one file at a time (ADR-071 point 4).
+
+    The lock is a row keyed by reader and file hash; its unique `_id` is what
+    makes taking it atomic. A second save of the same file waits for the first
+    and then finds the document it made. A row left by a crashed process is
+    removed by its TTL index.
+    """
+
+    def __init__(self, books_collection: Collection, user_id: str, source_hash: str) -> None:
+        self._locks = books_collection.database["import_locks"]
+        self._key = f"{user_id}:{source_hash}"
+
+    async def __aenter__(self) -> None:
+        waited = 0.0
+        while True:
+            try:
+                await self._locks.insert_one({"_id": self._key, "created_at": datetime.now(timezone.utc)})
+                return
+            except DuplicateKeyError:
+                if waited >= IMPORT_LOCK_WAIT_SECONDS:
+                    raise HTTPException(status_code=409, detail={"code": IMPORT_IN_PROGRESS_CODE})
+                await asyncio.sleep(0.25)
+                waited += 0.25
+
+    async def __aexit__(self, *_: object) -> None:
+        try:
+            await self._locks.delete_one({"_id": self._key})
+        except Exception:
+            logger.warning("Import lock %s not released; its TTL will", self._key, exc_info=True)
+
+
+async def _save_import(books_collection: Collection, current_user: dict, extracted_pages: list, pictures: list, *,
+                       title: str, author: str, filename: str, source_hash: str) -> dict:
+    """Store the pictures, build the document and insert it — or leave nothing behind (ADR-071).
+
+    Pictures are stored before the document exists, under the id minted for
+    it (ADR-062 point 2). Whatever stops the save after that — a conversion
+    error, a ceiling, the database — marks those pictures for removal, and the
+    answer is a coded refusal rather than a bare 500.
+    """
+    from app.utils.file_import import place_media
+
+    user_id = current_user.get("user_id")
+    book_oid = ObjectId()
+    try:
+        placements = await _store_import_pictures(pictures, user_id, str(book_oid))
+        dropped = len(pictures) - len(placements)
+        combined_html = place_media("\n".join(p.get("content", "") for p in extracted_pages), placements)
+        full_content = await import_parser.to_lexical(combined_html)
+        stats = document_stats(parse_lexical(full_content), full_content)
+        if dropped and not placements and not stats["word_count"]:
+            # A scan whose pages could not be stored is an empty document: refuse it, do not save it (IMPORT-044).
+            raise HTTPException(status_code=422, detail={"code": IMPORT_PICTURES_NOT_STORED_CODE})
+        ensure_document_within_ceiling(stats["word_count"])
+        ensure_document_within_bytes(len(full_content.encode("utf-8")))
+        new_book = Book(
+            id=book_oid, title=title, author=author, user_id=user_id,
+            # ADR-067: facts, not prose. That it was imported, the file it came from
+            # and its page count are fields each client words in its own language.
+            summary="", created_at=datetime.now(), updated_at=datetime.now(), full_content=full_content,
+            source="imported", source_hash=source_hash, source_filename=filename[:255] or None,
+            page_count=len(extracted_pages), **stats,
+        )
+        book_dict = new_book.model_dump(by_alias=True)
+        book_dict["_id"] = book_oid
+        book_dict.update(book_search.search_fields(title, author, "imported"))
+        await books_collection.insert_one(book_dict)
+    except HTTPException:
+        await media_ledger.condemn_for({"book_id": str(book_oid)}, f"refused import {book_oid}")
+        raise
+    except Exception:
+        logger.error("Import of %r failed while saving; its pictures are marked for removal", filename, exc_info=True)
+        await media_ledger.condemn_for({"book_id": str(book_oid)}, f"failed import {book_oid}")
+        raise HTTPException(status_code=500, detail={"code": IMPORT_FAILED_CODE})
+    return {"book_id": str(book_oid), "pictures_dropped": dropped}
+
+
 IMPORT_DUPLICATE_CODE = "import_duplicate"
 
 async def _existing_import(books_collection: Collection, user_id: str, source_hash: str) -> Optional[dict]:
@@ -484,20 +589,6 @@ async def _existing_import(books_collection: Collection, user_id: str, source_ha
     created = rows[0].get("created_at")
     return {"_id": str(rows[0]["_id"]), "title": rows[0].get("title") or "",
             "created_at": created.isoformat() if hasattr(created, "isoformat") else None}
-
-
-def _import_word_count(extracted_pages: list) -> int:
-    """The words the import would save, counted the way a save counts them (pictures add none)."""
-    from app.utils.file_import import strip_media_markers
-    from app.utils.html_to_lexical import html_to_lexical_json
-    import json
-
-    html_content = strip_media_markers("\n".join(p.get("content", "") for p in extracted_pages))
-    try:
-        content = json.dumps(html_to_lexical_json(html_content))
-    except Exception:
-        return 0  # the save path has its own fallback converter and counts again
-    return int(document_stats(parse_lexical(content), content)["word_count"])
 
 
 @router.post("/import", summary="Import a book from file (PDF, DOCX, TXT)")
@@ -522,7 +613,7 @@ async def import_book_from_file(
     Preserves formatting, multi-column layouts, and provides quality metrics.
     """
     from app.utils.file_import import (
-        IMPORT_PICTURES_PER_DOCUMENT, IMPORT_TOO_LARGE, place_media, process_uploaded_file_with_media, refusal_code, strip_media_markers,
+        IMPORT_PICTURES_PER_DOCUMENT, IMPORT_TOO_LARGE, refusal_code, strip_media_markers,
     )
 
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
@@ -539,29 +630,38 @@ async def import_book_from_file(
         )
     filename = file.filename or ""
 
-    # Extract pages from file; its pictures come back as bytes beside the HTML (ADR-062 point 5)
-    extracted_pages, pictures = process_uploaded_file_with_media(filename, file_content)
+    # Read in a child process with a time limit (ADR-070): a hostile or merely
+    # huge file costs that child, never the server. Its pictures come back as
+    # bytes beside the HTML (ADR-062 point 5).
+    try:
+        parsed = await import_parser.parse(filename, file_content)
+    except import_parser.ImportTooComplex:
+        raise HTTPException(status_code=422, detail={"code": import_parser.IMPORT_TOO_COMPLEX})
+    extracted_pages = parsed.pages
     # ADR-067: an import keeps the first IMPORT_PICTURES_PER_DOCUMENT pictures. The
     # text is imported whole; the markers of the pictures left out are dropped
     # with them, and the preview says how many will be kept.
-    pictures_found = len(pictures)
-    pictures = pictures[:IMPORT_PICTURES_PER_DOCUMENT]
+    pictures_found = len(parsed.pictures)
+    pictures = parsed.pictures[:IMPORT_PICTURES_PER_DOCUMENT]
 
     if not extracted_pages:
         # Which of the reasons it was (IMPORT-007): wrong type, old .doc, empty,
         # password-protected, or unreadable.
         raise HTTPException(status_code=400, detail={"code": refusal_code(filename, file_content)})
 
-    # ADR-041: the ceiling is per document, however the document arrives. An
-    # import past it is refused here, in the preview and in the save, before a
-    # picture is stored: accepted, it could never be saved again (IMPORT-003).
-    import_words = _import_word_count(extracted_pages)
+    # ADR-041, ADR-071: the ceilings are per document, however the document
+    # arrives. An import past either is refused here, in the preview and in the
+    # save, before a picture is stored: accepted, it could never be saved again
+    # (IMPORT-003) — or could not be written at all (IMPORT-042).
+    import_words = parsed.words
     ensure_document_within_ceiling(import_words)
+    ensure_document_within_bytes(parsed.content_bytes + len(pictures) * PICTURE_NODE_BYTES)
 
     # ADR-066: the same bytes already imported by this reader? The preview says
     # so; a save that asked to be told is refused with the document it would copy.
     source_hash = hashlib.sha256(file_content).hexdigest()
-    duplicate_of = await _existing_import(books_collection, current_user.get("user_id"), source_hash)
+    user_id = current_user.get("user_id")
+    duplicate_of = await _existing_import(books_collection, user_id, source_hash)
     if duplicate_of and not preview and on_duplicate == "ask":
         raise HTTPException(status_code=409, detail={"code": IMPORT_DUPLICATE_CODE, "existing": duplicate_of})
 
@@ -642,58 +742,20 @@ async def import_book_from_file(
             },
         }
 
-    # SAVE MODE: Create the book with full_content
-    # Convert extracted pages to clean JSON format (Content-First)
-    from app.utils.html_to_lexical import html_to_lexical_json
-    import json
-    
-    # The book's id is minted here so its pictures can be stored under its
-    # folder before the document exists (ADR-062 point 2).
-    book_oid = ObjectId()
-    placements = await _store_import_pictures(pictures, current_user.get("user_id"), str(book_oid))
-
-    # Combine all pages into single HTML, each picture now a stored URL
-    combined_html = place_media("\n".join([p.get("content", "") for p in extracted_pages]), placements)
-    
-    # Convert HTML to Lexical JSON
-    try:
-        lexical_json = html_to_lexical_json(combined_html)
-        full_content = json.dumps(lexical_json)
-        logger.info(f"Converted import to JSON format: {len(lexical_json['root']['children'])} blocks")
-    except Exception as e:
-        logger.warning(f"HTML conversion failed, using simple fallback: {e}")
-        from app.utils.html_to_lexical import simple_html_to_lexical
-        lexical_json = simple_html_to_lexical(combined_html)
-        full_content = json.dumps(lexical_json)
-
-    stats = document_stats(parse_lexical(full_content), full_content)
-    ensure_document_within_ceiling(stats["word_count"])  # the fallback converter's count, if it ran
-
-    new_book = Book(
-        id=book_oid,
-        title=book_title,
-        author=username,
-        user_id=current_user.get("user_id"),
-        # ADR-067: facts, not prose. That it was imported, the file it came from
-        # and its page count are stored below as fields each client words in its
-        # own language; no sentence, no borrowed ISBN and no fixed colour is written.
-        summary="",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        full_content=full_content,
-        source="imported",
-        source_hash=source_hash,
-        source_filename=filename[:255] or None,
-        page_count=len(extracted_pages),
-        **stats,
-    )
-
-    # Inserted under the id minted above, the one its pictures are stored under
-    book_dict = new_book.model_dump(by_alias=True)
-    book_dict["_id"] = book_oid
-    book_dict.update(book_search.search_fields(book_title, username, "imported"))
-    await books_collection.insert_one(book_dict)
-    book_id = str(book_oid)
+    # SAVE MODE. A save that asked about duplicates holds the file's lock while
+    # it works, so two of them at once cannot both find the library empty of it
+    # (ADR-071 point 4).
+    if on_duplicate == "ask":
+        async with _import_lock(books_collection, user_id, source_hash):
+            existing = await _existing_import(books_collection, user_id, source_hash)
+            if existing:
+                raise HTTPException(status_code=409, detail={"code": IMPORT_DUPLICATE_CODE, "existing": existing})
+            saved = await _save_import(books_collection, current_user, extracted_pages, pictures,
+                                       title=book_title, author=username, filename=filename, source_hash=source_hash)
+    else:
+        saved = await _save_import(books_collection, current_user, extracted_pages, pictures,
+                                   title=book_title, author=username, filename=filename, source_hash=source_hash)
+    book_id = saved["book_id"]
 
     # Return the book info
     return {
@@ -701,6 +763,8 @@ async def import_book_from_file(
         "title": book_title,
         "author": username,
         "page_count": len(extracted_pages), # Keep count for meta info
+        # ADR-071 point 3: pictures the storage would not keep; the client says so.
+        "pictures_dropped": saved["pictures_dropped"],
         "extraction_quality": {
             "total_words": metadata.get("total_words", 0),
             "multi_column_pages": metadata.get("multi_column_pages", 0),
