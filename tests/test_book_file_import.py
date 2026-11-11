@@ -755,3 +755,51 @@ def test_one_column_with_a_page_number_beside_it_is_one_column():
     page.insert_text((500, 400), "12", fontsize=10)
     (result,) = process_uploaded_file("narrow.pdf", doc.tobytes())
     assert result["has_columns"] is False and "Body text" in result["content"]
+
+
+# ── IMPORT-020 / ADR-066: a file already imported is recognised, and the reader is asked ──
+
+def test_the_preview_says_when_the_same_file_is_already_in_the_library(world):
+    first = _upload(world, "mito.txt", txt_bytes()).json()
+    body = _upload(world, "renamed.txt", txt_bytes(), preview="true").json()
+    assert body["duplicate_of"]["_id"] == first["_id"] and body["duplicate_of"]["title"] == "mito"
+    assert _upload(world, "other.txt", b"something else entirely", preview="true").json()["duplicate_of"] is None
+
+
+def test_a_save_that_asks_is_refused_with_the_document_it_would_copy_and_copy_imports_it(world):
+    first = _upload(world, "mito.txt", txt_bytes(), on_duplicate="ask")
+    assert first.status_code == 200, first.text
+    again = _upload(world, "mito.txt", txt_bytes(), on_duplicate="ask")
+    assert again.status_code == 409
+    detail = again.json()["detail"]
+    assert detail["code"] == "import_duplicate" and detail["existing"]["_id"] == first.json()["_id"]
+    assert world.run(world.raw["books"].count_documents({})) == 1
+    assert _upload(world, "mito.txt", txt_bytes(), on_duplicate="copy").status_code == 200
+    assert world.run(world.raw["books"].count_documents({})) == 2
+
+
+def test_a_client_that_says_nothing_keeps_importing_as_it_always_did(world):
+    assert _upload(world, "mito.txt", txt_bytes()).status_code == 200
+    assert _upload(world, "mito.txt", txt_bytes()).status_code == 200
+
+
+def test_the_import_records_what_it_was_made_from_and_an_edit_cannot_change_it(world):
+    import hashlib
+    book_id = _upload(world, "mito.txt", txt_bytes()).json()["_id"]
+    stored = world.run(world.raw["books"].find_one({}))
+    assert stored["source_hash"] == hashlib.sha256(txt_bytes()).hexdigest() and stored["source_filename"] == "mito.txt"
+    response = world.http.put(f"/book/edit/{book_id}", json={"title": "renamed", "source_hash": "forged"})
+    assert response.status_code == 200, response.text
+    assert world.run(world.raw["books"].find_one({}))["source_hash"] == stored["source_hash"]
+
+
+def test_a_deleted_import_and_another_readers_import_are_not_duplicates(world):
+    book_id = _upload(world, "mito.txt", txt_bytes()).json()["_id"]
+    assert world.http.delete(f"/book/delete/{book_id}").status_code == 204
+    assert _upload(world, "mito.txt", txt_bytes(), on_duplicate="ask").status_code == 200
+    world.act_as(world.new_user("someone else"))
+    assert _upload(world, "mito.txt", txt_bytes(), on_duplicate="ask").status_code == 200
+
+
+def test_an_unknown_answer_to_the_duplicate_question_is_refused(world):
+    assert _upload(world, "mito.txt", txt_bytes(), on_duplicate="replace").status_code == 422

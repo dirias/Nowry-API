@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -107,7 +108,8 @@ async def edit_book(
     
     # Remove immutable/system fields that shouldn't be updated by user.
     # forked_from is permanently set at fork time and must never be overwritten.
-    fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from", "source", "page_count"]
+    fields_to_remove = ["id", "_id", "user_id", "created_at", "forked_from", "source", "page_count",
+                        "source_hash", "source_filename"]
     for field in fields_to_remove:
         update_data.pop(field, None)
 
@@ -458,6 +460,22 @@ async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> 
     return dict(entry for entry in stored if entry)
 
 
+IMPORT_DUPLICATE_CODE = "import_duplicate"
+
+
+async def _existing_import(books_collection: Collection, user_id: str, source_hash: str) -> Optional[dict]:
+    """The reader's live document made from the same file, newest first, or None."""
+    rows = await books_collection.find(
+        {"user_id": user_id, "deleted_at": None, "source_hash": source_hash},
+        {"title": 1, "created_at": 1},
+    ).sort([("created_at", -1), ("_id", -1)]).limit(1).to_list(length=1)
+    if not rows:
+        return None
+    created = rows[0].get("created_at")
+    return {"_id": str(rows[0]["_id"]), "title": rows[0].get("title") or "",
+            "created_at": created.isoformat() if hasattr(created, "isoformat") else None}
+
+
 def _import_word_count(extracted_pages: list) -> int:
     """The words the import would save, counted the way a save counts them (pictures add none)."""
     from app.utils.file_import import strip_media_markers
@@ -478,6 +496,10 @@ async def import_book_from_file(
     username: str = Form("Unknown"),
     preview: bool = Form(False),  # Preview mode for validation
     title: Optional[str] = Form(None), # Optional title override
+    # ADR-066: "ask" refuses a file already in the library with 409 so the client
+    # can ask the reader; "copy" imports it again. A client that says nothing is
+    # one built before the question existed, and keeps its old behaviour.
+    on_duplicate: str = Form("copy", pattern="^(ask|copy)$"),
     books_collection: Collection = Depends(get_books_collection),
     current_user: dict = Depends(get_firebase_user),
 ):
@@ -520,6 +542,13 @@ async def import_book_from_file(
     # picture is stored: accepted, it could never be saved again (IMPORT-003).
     ensure_document_within_ceiling(_import_word_count(extracted_pages))
 
+    # ADR-066: the same bytes already imported by this reader? The preview says
+    # so; a save that asked to be told is refused with the document it would copy.
+    source_hash = hashlib.sha256(file_content).hexdigest()
+    duplicate_of = await _existing_import(books_collection, current_user.get("user_id"), source_hash)
+    if duplicate_of and not preview and on_duplicate == "ask":
+        raise HTTPException(status_code=409, detail={"code": IMPORT_DUPLICATE_CODE, "existing": duplicate_of})
+
     # Create book title from filename or use provided title
     book_title = title if title and title.strip() else filename.rsplit(".", 1)[0]
 
@@ -553,6 +582,7 @@ async def import_book_from_file(
             "total_pages": len(extracted_pages),
             "metadata": metadata,
             "facts": facts,
+            "duplicate_of": duplicate_of,
             "info": info_msg,
             "warnings": warnings,
             "file_info": {
@@ -628,6 +658,8 @@ async def import_book_from_file(
         full_content=full_content,
         cover_color="#4A90E2",
         source="imported",
+        source_hash=source_hash,
+        source_filename=filename[:255] or None,
         page_count=len(extracted_pages),
         **stats,
     )

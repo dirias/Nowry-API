@@ -436,5 +436,8 @@ async def create_indexes():
         collation={"locale": "en", "strength": 2})
     await cards_collection.create_index(
         [("user_id", 1), ("source_book_id", 1)], name="cards_by_source_book")
+    # ADR-066: "has this reader imported this file before?" is one indexed lookup.
+    await books_collection.create_index(
+        [("user_id", 1), ("source_hash", 1)], name="books_source_hash", sparse=True)
 
     logger.info("Database indexes created successfully.")

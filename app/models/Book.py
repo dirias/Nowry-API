@@ -38,6 +38,9 @@ class Book(BaseModel, SoftDeleteMixin):
     # debounced; a position-only update never counts as an edit (updated_at untouched).
     last_section: Optional[str] = None      # heading text of the section the reader was under
     reading_position: Optional[int] = None  # active page, imports only
+    # ADR-066: what an import was made from, so the same file is recognised next time.
+    source_hash: Optional[str] = None      # SHA-256 of the imported file's bytes
+    source_filename: Optional[str] = None
 
     is_public: bool = False
     published_at: Optional[datetime] = None
