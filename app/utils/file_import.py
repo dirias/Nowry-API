@@ -105,11 +105,13 @@ def _joint(previous: str, following: str) -> Tuple[str, str]:
 # a search, a card answer or a read-aloud voice does not find "الخلية" in them.
 # Compatibility normalisation maps each form back to its letter. It is applied
 # to these blocks only — applied to everything it would also turn "²" into "2".
-_PRESENTATION_FORMS = re.compile("[\ufb1d-\ufb4f\ufb50-\ufdff\ufe70-\ufeff]+")
+# The same holds for the Latin ligatures a typesetter's font draws as one glyph
+# (ﬁ, ﬂ, ﬀ, ﬃ, ﬄ, ﬅ, ﬆ): "suﬁciente" is not found by a search for "suficiente".
+_PRESENTATION_FORMS = re.compile("[\ufb00-\ufb06\ufb1d-\ufb4f\ufb50-\ufdff\ufe70-\ufeff]+")
 
 
 def _fold_presentation_forms(text: str) -> str:
-    """Arabic and Hebrew presentation forms as the letters they stand for."""
+    """Latin ligatures and Arabic and Hebrew presentation forms as the letters they stand for."""
     if not _PRESENTATION_FORMS.search(text):
         return text
     return _PRESENTATION_FORMS.sub(lambda match: unicodedata.normalize("NFKC", match.group(0)), text)
