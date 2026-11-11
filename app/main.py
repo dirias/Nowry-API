@@ -24,6 +24,8 @@ if _SENTRY_DSN:
 
 import asyncio
 import logging
+from app.config.database import books_collection
+from app.utils import media_ledger
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,8 +108,12 @@ async def lifespan(app: FastAPI):
     # [Phase 10] Pre-warm all 8 prompt templates into _prompt_cache and langfuse_cache.json.
     # Non-raising: falls back to core/prompts.py constants on any Langfuse error (D-07).
     await prompt_manager.prewarm()
+    # ADR-065: images of deleted documents are removed by a reaper that keeps
+    # trying, so a storage hiccup or a restart never leaves them stored for good.
+    reaper = asyncio.create_task(media_ledger.reaper_loop(books_collection))
     yield
     # Shutdown
+    reaper.cancel()
     await _flush_langfuse_queue()
 
 

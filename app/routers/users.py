@@ -1318,6 +1318,7 @@ async def delete_account(
     await device_tokens_collection.delete_many({"user_id": user_id})
 
     # Stored images — every ledger row of the account, swept after the response.
+    await media_ledger.condemn_for({"user_id": user_id}, f"user {user_id}")  # durable before the response (ADR-065)
     background_tasks.add_task(media_ledger.sweep_user, user_id)
 
     # 3. Revoke Firebase credentials AFTER all MongoDB soft-deletes (D-08)

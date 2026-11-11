@@ -192,6 +192,9 @@ async def delete_book(
 
         if result.modified_count > 0:
             logger.info(f"Book soft-deleted successfully: {book_id}")
+            # The decision is written before the response (ADR-065): whatever
+            # happens to the first attempt below, the reaper finishes the job.
+            await media_ledger.condemn_for({"book_id": book_id}, f"book {book_id}")
             background_tasks.add_task(media_ledger.sweep_book, book_id)
             return None
 

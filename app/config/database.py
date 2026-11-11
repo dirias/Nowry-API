@@ -424,6 +424,8 @@ async def create_indexes():
     # date; a book's deletion reads its rows by book.
     await media_collection.create_index([("user_id", 1), ("created_at", -1)], name="media_owner_date")
     await media_collection.create_index("book_id", name="media_book")
+    # ADR-065: the reaper reads the rows marked for removal by when they are due.
+    await media_collection.create_index("delete_after", name="media_condemned", sparse=True)
 
     # The paged library (ADR-063): one user's live documents, newest edit first,
     # and by title in the reader's alphabet — the collation the query asks with.

@@ -173,9 +173,11 @@ class CloudinaryStorage(StorageBackend):
             batch = public_ids[start:start + self.DELETE_BATCH]
             result = await loop.run_in_executor(
                 None,
-                functools.partial(cloudinary.api.delete_resources, batch, resource_type="image"),
+                # `invalidate`: a deleted picture leaves the CDN's cache too, not only the bucket.
+                functools.partial(cloudinary.api.delete_resources, batch, resource_type="image", invalidate=True),
             )
-            removed += sum(1 for state in (result.get("deleted") or {}).values() if state == "deleted")
+            # "not_found" is gone as well: an earlier attempt removed it and lost the answer.
+            removed += sum(1 for state in (result.get("deleted") or {}).values() if state in ("deleted", "not_found"))
         return removed
     
     def get_thumbnail_url(self, public_id: str, width: int = 200, height: int = 200) -> str:
