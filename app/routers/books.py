@@ -463,6 +463,26 @@ async def _store_import_pictures(pictures: list, user_id: str, book_id: str) -> 
 
 IMPORT_DUPLICATE_CODE = "import_duplicate"
 
+#: What a refusal says to a client that does not read codes (ADR-068): one
+#: plain sentence per code, in English, as the import always answered.
+_REFUSAL_TEXT = {
+    "import_unsupported_type": "This file type cannot be imported. Use a PDF, a Word .docx or a plain text file.",
+    "import_legacy_doc": "This is an old Word .doc file. Save it as .docx and import that.",
+    "import_empty": "This file has no text to import.",
+    "import_password_protected": "This file is password-protected. Remove the password and import it again.",
+    "import_unreadable": "This file could not be read. It may be damaged.",
+    "import_too_large": "File exceeds the {limit_mb} MB limit.",
+    DOCUMENT_TOO_LONG_CODE: "This document is over the {limit}-word limit. Split it into two.",
+}
+
+
+def _import_refusal(status_code: int, detail: dict, coded: bool) -> HTTPException:
+    """The refusal in the shape the client reads: the coded object, or its sentence."""
+    if coded or not isinstance(detail, dict):
+        return HTTPException(status_code=status_code, detail=detail)
+    template = _REFUSAL_TEXT.get(detail.get("code"), "Failed to extract content from file")
+    return HTTPException(status_code=status_code, detail=template.format(**detail))
+
 
 async def _existing_import(books_collection: Collection, user_id: str, source_hash: str) -> Optional[dict]:
     """The reader's live document made from the same file, newest first, or None."""
@@ -501,6 +521,10 @@ async def import_book_from_file(
     # can ask the reader; "copy" imports it again. A client that says nothing is
     # one built before the question existed, and keeps its old behaviour.
     on_duplicate: str = Form("copy", pattern="^(ask|copy)$"),
+    # ADR-068: a refusal is a coded object only for a client that says it reads
+    # one. A client built before the codes renders `detail` as text, and an
+    # object there took its page down; it keeps getting a sentence.
+    error_format: str = Form("text", pattern="^(text|coded)$"),
     books_collection: Collection = Depends(get_books_collection),
     current_user: dict = Depends(get_firebase_user),
 ):
@@ -519,15 +543,13 @@ async def import_book_from_file(
     # The upload's bytes, bounded (QA-019): a file past the cap is refused
     # before a parser sees it, as the .apkg import does (QA-008). The refusal
     # carries a code and the limit, so the client says it in its own language.
+    coded = error_format == "coded"
     try:
         file_content = await _read_bounded_upload(file)
     except HTTPException as refused:
         if refused.status_code != 413:
             raise
-        raise HTTPException(
-            status_code=413,
-            detail={"code": IMPORT_TOO_LARGE, "limit_mb": BOOK_IMPORT_MAX_BYTES // (1024 * 1024)},
-        )
+        raise _import_refusal(413, {"code": IMPORT_TOO_LARGE, "limit_mb": BOOK_IMPORT_MAX_BYTES // (1024 * 1024)}, coded)
     filename = file.filename or ""
 
     # Extract pages from file; its pictures come back as bytes beside the HTML (ADR-062 point 5)
@@ -541,13 +563,16 @@ async def import_book_from_file(
     if not extracted_pages:
         # Which of the reasons it was (IMPORT-007): wrong type, old .doc, empty,
         # password-protected, or unreadable.
-        raise HTTPException(status_code=400, detail={"code": refusal_code(filename, file_content)})
+        raise _import_refusal(400, {"code": refusal_code(filename, file_content)}, coded)
 
     # ADR-041: the ceiling is per document, however the document arrives. An
     # import past it is refused here, in the preview and in the save, before a
     # picture is stored: accepted, it could never be saved again (IMPORT-003).
     import_words = _import_word_count(extracted_pages)
-    ensure_document_within_ceiling(import_words)
+    try:
+        ensure_document_within_ceiling(import_words)
+    except HTTPException as refused:
+        raise _import_refusal(refused.status_code, refused.detail, coded)
 
     # ADR-066: the same bytes already imported by this reader? The preview says
     # so; a save that asked to be told is refused with the document it would copy.
@@ -658,7 +683,10 @@ async def import_book_from_file(
         full_content = json.dumps(lexical_json)
 
     stats = document_stats(parse_lexical(full_content), full_content)
-    ensure_document_within_ceiling(stats["word_count"])  # the fallback converter's count, if it ran
+    try:
+        ensure_document_within_ceiling(stats["word_count"])  # the fallback converter's count, if it ran
+    except HTTPException as refused:
+        raise _import_refusal(refused.status_code, refused.detail, coded)
 
     new_book = Book(
         id=book_oid,

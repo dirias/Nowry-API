@@ -168,6 +168,8 @@ def world():
 
 
 def _upload(world, name, content, **form):
+    # The web client of today: it says it reads coded refusals (ADR-068).
+    form.setdefault("error_format", "coded")
     return world.http.post("/book/import", files={"file": (name, content, "application/octet-stream")}, data=form)
 
 
@@ -1016,3 +1018,35 @@ def test_an_import_stores_what_it_is_and_no_sentence_in_any_language(world):
     assert stored["source"] == "imported" and stored["source_filename"] == "mito.pdf" and stored["page_count"] == 2
     assert stored["summary"] == "" and not stored.get("cover_color") and "isbn" not in stored
     assert "Imported from" not in json.dumps(stored, default=str) and "Importado" not in json.dumps(stored, default=str)
+
+
+# ── IMPORT-032 / ADR-068: a client built before the codes still gets a sentence ──
+
+@pytest.mark.parametrize("name, content, status, words", [
+    ("notes.md", b"# Title", 400, "file type cannot be imported"),
+    ("old.doc", b"\xd0\xcf\x11\xe0" + b"\x00" * 32, 400, "old Word .doc"),
+    ("empty.txt", b"", 400, "no text to import"),
+    ("locked.pdf", _encrypted_pdf(), 400, "password-protected"),
+    ("broken.pdf", b"%PDF-1.4 nope", 400, "could not be read"),
+])
+def test_a_refusal_is_a_sentence_for_a_client_that_does_not_say_it_reads_codes(world, name, content, status, words):
+    for form in ({"preview": "true"}, {}):
+        response = world.http.post("/book/import", files={"file": (name, content, "application/octet-stream")}, data=form)
+        assert response.status_code == status
+        detail = response.json()["detail"]
+        assert isinstance(detail, str) and words in detail
+
+
+def test_the_size_and_word_refusals_are_sentences_too_for_such_a_client(world):
+    with patch("app.routers.books.BOOK_IMPORT_MAX_BYTES", 2 * 1024 * 1024):
+        big = world.http.post("/book/import", files={"file": ("big.txt", b"x" * (3 * 1024 * 1024), "text/plain")})
+    assert big.status_code == 413 and big.json()["detail"] == "File exceeds the 2 MB limit."
+    with patch("app.routers.books.SUBSCRIPTION_PLANS", {"free": {"limits": {"document_words": 50}}}), \
+            patch("app.routers.books.SubscriptionTier") as tier:
+        tier.FREE = "free"
+        long_ = world.http.post("/book/import", files={"file": ("long.txt", txt_bytes(), "text/plain")})
+    assert long_.status_code == 413 and long_.json()["detail"] == "This document is over the 50-word limit. Split it into two."
+
+
+def test_an_unknown_error_format_is_refused(world):
+    assert _upload(world, "a.txt", b"hola", error_format="xml").status_code == 422
