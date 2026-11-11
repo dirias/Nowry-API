@@ -142,6 +142,108 @@ def _is_rtl(text: str) -> bool:
     return sum(1 for char in letters if _RTL.match(char)) > len(letters) / 2
 
 
+# ── a right-to-left line, back in the order it is read ──────────────────────
+#
+# A PDF stores glyphs where they are drawn, in whatever order its producer
+# wrote them. For a Hebrew or Arabic line with Latin words or numbers in it
+# that order is often neither the reading order nor the visual one: Apple's
+# own licence stores "Apple" before the Hebrew sentence it ends. The positions
+# are the truth, so such a line is rebuilt from them: glyphs from right to
+# left, with each left-to-right run (Latin, digits, and what sits between
+# them) turned back the way it reads (IMPORT-046).
+
+_LTR_STRONG = re.compile(r"[A-Za-z0-9\u00c0-\u024f]")
+_RTL_ORDER_SHARE = 0.7     # stored right-to-left this consistently: a real RTL layout, safe to rebuild
+_WORD_GAP = 0.25           # of the type size: a gap this wide between glyphs with no space stored is a space
+
+
+def _is_ltr_strong(char: str) -> bool:
+    return bool(_LTR_STRONG.match(char))
+
+
+def _stored_right_to_left(chars: List[Dict]) -> bool:
+    """Whether the line's RTL letters are stored in the order they are drawn, right to left.
+
+    A file that draws Hebrew left to right (text placed without shaping) keeps
+    its letters in reading order already; rebuilding it would reverse it.
+    """
+    xs = [char["bbox"][0] for char in chars if _RTL.match(char["c"])]
+    steps = [later < earlier for earlier, later in zip(xs, xs[1:])]
+    return len(steps) >= 3 and sum(steps) >= len(steps) * _RTL_ORDER_SHARE
+
+
+def _reverse_ltr_runs(visual: List[str]) -> List[str]:
+    """Turn each left-to-right run in a right-to-left sequence back to reading order."""
+    out: List[str] = []
+    index = 0
+    while index < len(visual):
+        if not _is_ltr_strong(visual[index]):
+            out.append(visual[index])
+            index += 1
+            continue
+        end = last = index
+        while end < len(visual) and not _RTL.match(visual[end]):
+            if _is_ltr_strong(visual[end]):
+                last = end
+            end += 1
+        out.extend(reversed(visual[index:last + 1]))   # neutrals inside the run go with it; trailing ones stay
+        index = last + 1
+    return out
+
+
+def _logical_rtl_text(raw_line: Dict, base_rtl: bool = False) -> Optional[str]:
+    """A right-to-left line's text in reading order, from where its glyphs sit; None to leave it as stored.
+
+    `base_rtl` says the page around it is right-to-left, so a line that is
+    mostly a Latin name with a Hebrew word or two is still read from the right.
+    """
+    chars = [char for span in raw_line.get("spans", []) for char in span.get("chars", []) if char.get("c")]
+    text = "".join(char["c"] for char in chars)
+    if not chars or not (_is_rtl(text) or (base_rtl and _RTL.search(text))) or not _stored_right_to_left(chars):
+        return None
+    size = max((span.get("size", 12) for span in raw_line.get("spans", [])), default=12)
+    ordered = sorted(chars, key=lambda char: -(char["bbox"][0] + char["bbox"][2]) / 2)
+    visual: List[str] = []
+    for previous, char in zip([None] + ordered, ordered):
+        if previous and previous["c"] != " " and char["c"] != " " and previous["bbox"][0] - char["bbox"][2] > size * _WORD_GAP:
+            visual.append(" ")
+        visual.append(char["c"])
+    logical = _reverse_ltr_runs(visual)
+    # A bracket is stored as the shape drawn, the mirror of the one typed — outside a left-to-right run.
+    ltr = [False] * len(logical)
+    for position, char in enumerate(logical):
+        if _is_ltr_strong(char):
+            ltr[position] = True
+    for position, char in enumerate(logical):
+        if char in "()[]{}<>«»":
+            before = next((ltr[i] for i in range(position - 1, -1, -1) if logical[i].strip() and logical[i] not in "()[]{}<>«»"), False)
+            after = next((ltr[i] for i in range(position + 1, len(logical)) if logical[i].strip() and logical[i] not in "()[]{}<>«»"), False)
+            if not (before and after):
+                logical[position] = char.translate(_MIRRORED)
+    text = re.sub(r" {2,}", " ", "".join(logical))
+    return re.sub(r" ([.,;:!?،؛])(?= |$)", r"\1", text)   # a mark set off by its glyph's side bearing belongs to its word
+
+
+def _rebuild_rtl_lines(page, blocks: List[Dict]) -> None:
+    """Replace each right-to-left line's spans with one span holding its text in reading order."""
+    if not any(_is_rtl("".join(span.get("text", "") for span in line.get("spans", [])))
+               for block in blocks for line in block.get("lines", [])):
+        return
+    raw = {block.get("number"): block for block in page.get_text("rawdict")["blocks"]}
+    base_rtl = _blocks_are_rtl(blocks)
+    for block in blocks:
+        raw_lines = raw.get(block.get("number"), {}).get("lines", [])
+        for line, raw_line in zip(block.get("lines", []), raw_lines):
+            if not line.get("spans"):
+                continue
+            text = _logical_rtl_text(raw_line, base_rtl)
+            if text is None:
+                continue
+            first = max(line["spans"], key=lambda span: len(span.get("text", "")))
+            line["spans"] = [{**first, "text": text}]
+            line["logical"] = True
+
+
 def _pdf_line(line: Dict) -> Optional[Dict]:
     """One line as `{"segments": [[text, flags]], "text", "size", "bbox"}`, or None when it is blank."""
     segments: List[List] = []
@@ -160,7 +262,7 @@ def _pdf_line(line: Dict) -> Optional[Dict]:
     text = "".join(segment[0] for segment in segments)
     if not text.strip():
         return None
-    if _is_rtl(text):
+    if _is_rtl(text) and not line.get("logical"):
         for segment in segments:
             segment[0] = segment[0].translate(_MIRRORED)
         text = text.translate(_MIRRORED)
@@ -548,6 +650,7 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
 
             # Extract text blocks with position info
             blocks = page.get_text("dict")["blocks"]
+            _rebuild_rtl_lines(page, blocks)
 
             # Ruled tables are read as tables; the text they cover is theirs.
             tables = _page_tables(page)

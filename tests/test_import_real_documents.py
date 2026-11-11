@@ -91,3 +91,50 @@ def test_a_contents_line_loses_its_dot_leader_and_is_never_a_heading():
         page.insert_text((72, 110 + n * 16), "Body text that sets the size most of the document is written in, line after line.", fontsize=11)
     html = _html(process_uploaded_file("toc.pdf", doc.tobytes()))
     assert "<p>3 Basic Shell Features … 5</p>" in html and ". . ." not in html and "<h" not in html
+
+
+# ── IMPORT-046: a right-to-left line is rebuilt from where its glyphs sit ────
+
+def _raw_line(stored: list) -> dict:
+    """A rawdict line from `(char, x)` pairs in the order the file stores them; each glyph is 6 points wide."""
+    return {"spans": [{"size": 11, "chars": [{"c": c, "bbox": [x, 0, x + 6, 11]} for c, x in stored]}]}
+
+
+def _drawn(visual: str, stored_order=None) -> dict:
+    """`visual` is the line as it looks on the page, left to right; storage order defaults to right-to-left."""
+    placed = [(char, index * 6) for index, char in enumerate(visual)]
+    return _raw_line(stored_order(placed) if stored_order else list(reversed(placed)))
+
+
+def test_latin_words_and_numbers_inside_hebrew_read_in_their_place():
+    # On the page, left to right: "Apple גתומ לש"  — read right to left: "של מותג Apple".
+    assert file_import._logical_rtl_text(_drawn("Apple גתומ לש")) == "של מותג Apple"
+    # Mostly a Latin name: read from the right because the page is.
+    assert file_import._logical_rtl_text(_drawn("macOS Tahoe 26 רובע"), base_rtl=True) == "עבור macOS Tahoe 26"
+    assert file_import._logical_rtl_text(_drawn("macOS Tahoe 26 רובע")) is None
+
+
+def test_the_storage_order_does_not_matter_only_the_positions_do():
+    """Apple's licence stores the Latin word first although it is read last."""
+    def latin_first(placed):
+        latin = [p for p in placed if p[0].isascii() and p[0].isalpha()]
+        return latin + [p for p in reversed(placed) if p not in latin]
+    assert file_import._logical_rtl_text(_drawn("Apple גתומ לש", latin_first)) == "של מותג Apple"
+
+
+def test_punctuation_and_brackets_come_out_as_typed():
+    # Visual: ".(ןימי) הנושאר הדומע" — the brackets are stored as drawn, mirrored.
+    assert file_import._logical_rtl_text(_drawn(".(ןימי) הנושאר הדומע")) == "עמודה ראשונה (ימין)."
+    assert file_import._logical_rtl_text(_drawn(",APPLE גתומ לש")) == "של מותג APPLE,"
+    assert file_import._logical_rtl_text(_drawn("(ok) בוט"), base_rtl=True) == "טוב (ok)"
+
+
+def test_a_line_drawn_left_to_right_or_with_no_rtl_letters_is_left_as_stored():
+    assert file_import._logical_rtl_text(_raw_line([(c, i * 6) for i, c in enumerate("עמודה ראשונה")])) is None
+    assert file_import._logical_rtl_text(_drawn("plain English")) is None
+    assert file_import._logical_rtl_text({"spans": []}) is None
+
+
+def test_a_gap_with_no_stored_space_is_a_space():
+    stored = [("ב", 60), ("א", 54), ("ד", 30), ("ג", 24)]   # two words, 18 points apart, no space glyph
+    assert file_import._logical_rtl_text(_raw_line(stored)) == "בא דג"
