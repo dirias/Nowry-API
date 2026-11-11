@@ -2,10 +2,11 @@ import asyncio
 import os
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
-from app.models.Book import Book, BookSummary
+from app.models.Book import Book, BookLibraryPage, BookSummary
+from app.services import book_library
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection
 from app.models.CardGenerationRequest import compute_effective_cap
@@ -214,8 +215,8 @@ async def search_books(
     cursor = books_collection.find(
         {"title": {"$regex": safe_title, "$options": "i"}, "user_id": user_id, "deleted_at": None},
         {"full_content": 0}
-    )
-    books = await cursor.to_list(length=100)  # Limit to 100 books for safety
+    ).sort([("updated_at", -1), ("_id", -1)]).limit(100)
+    books = await cursor.to_list(length=100)  # the hundred most recent matches
     return books
 
 
@@ -232,15 +233,25 @@ async def get_all_books(
 
     # Retrieve all books for the current user that are NOT soft-deleted
     # Exclude full_content significantly improves performance for large documents
+    # The hundred most recently edited, newest first. This route is kept for the
+    # surfaces that want "the recent documents" and for clients that predate the
+    # paged library (ADR-063); unsorted, it returned the OLDEST hundred, so a new
+    # document past the hundredth was invisible (IMPORT-016). The library itself
+    # reads `GET /book/library`.
     cursor = books_collection.find(
         {
             "user_id": user_id,
             "deleted_at": None  # Only books where deleted_at is None
         },
         {"full_content": 0}
-    )
-    books = await cursor.to_list(length=100)  # Limit to 100 books for safety
+    ).sort([("updated_at", -1), ("_id", -1)]).limit(100)
+    books = await cursor.to_list(length=100)
 
+    return await _as_library_rows(books_collection, user_id, books)
+
+
+async def _as_library_rows(books_collection: Collection, user_id: str, books: list[dict]) -> list[dict]:
+    """Rows as the library draws them: string ids, stats present, and each row's cards."""
     for book in books:
         book["_id"] = str(book["_id"])
 
@@ -257,6 +268,41 @@ async def get_all_books(
         book.setdefault("source", "written")
 
     return books
+
+
+@router.get("/library", summary="One page of the library, with its counts (ADR-063)", response_model=BookLibraryPage)
+async def get_library(
+    kind: str = Query("all", pattern="^(all|written|imported)$"),
+    q: str = Query("", max_length=200),
+    tags: Optional[List[str]] = Query(None, max_length=20),
+    sort: str = Query("edited", pattern="^(edited|title|cards)$"),
+    offset: int = Query(0, ge=0, le=100_000),
+    limit: int = Query(book_library.PAGE_DEFAULT, ge=1, le=book_library.PAGE_MAX),
+    books_collection: Collection = Depends(get_books_collection),
+    current_user: dict = Depends(get_firebase_user),
+) -> dict:
+    """The library answers a question a page at a time; the screen never holds the whole list.
+
+    `total` counts the documents that match the question; `counts`, `tags` and
+    `continue_book` describe the whole library, whatever was asked.
+    """
+    user_id = current_user.get("user_id")
+    items, total = await book_library.library_page(
+        books_collection, cards_collection, user_id,
+        kind=kind, search=q, tags=[t for t in (tags or []) if t][:20], sort=sort, offset=offset, limit=limit,
+    )
+    summary = await book_library.library_summary(books_collection, user_id)
+    continue_book = summary["continue_book"]
+    decorated = await _as_library_rows(books_collection, user_id, items + ([continue_book] if continue_book else []))
+    return {
+        "items": decorated[:len(items)],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "counts": summary["counts"],
+        "tags": summary["tags"],
+        "continue_book": decorated[len(items)] if continue_book else None,
+    }
 
 
 BACKFILL_PER_REQUEST = 20

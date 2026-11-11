@@ -59,3 +59,19 @@ class BookSummary(Book):
     cards: Optional[int] = None
     due: Optional[int] = None
     sections_with_cards: Optional[int] = None
+
+
+class LibraryTag(BaseModel):
+    tag: str
+    count: int
+
+
+class BookLibraryPage(BaseModel):
+    """One page of the library and what the screen draws beside it (ADR-063)."""
+    items: List[BookSummary]
+    total: int                      # documents that match the question asked
+    offset: int
+    limit: int
+    counts: dict                    # {"all", "written", "imported"} for the whole library
+    tags: List[LibraryTag]          # the library's tags, most used first
+    continue_book: Optional[BookSummary] = None  # the most recently edited document

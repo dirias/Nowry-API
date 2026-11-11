@@ -53,6 +53,12 @@ class FakeCursor:
     def __init__(self, rows):
         self.rows = rows
 
+    def sort(self, *_args, **_kwargs):  # the list is asked newest first and bounded (ADR-063)
+        return self
+
+    def limit(self, *_args, **_kwargs):
+        return self
+
     async def to_list(self, length=None):
         return list(self.rows)
 

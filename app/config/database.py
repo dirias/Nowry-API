@@ -425,4 +425,14 @@ async def create_indexes():
     await media_collection.create_index([("user_id", 1), ("created_at", -1)], name="media_owner_date")
     await media_collection.create_index("book_id", name="media_book")
 
+    # The paged library (ADR-063): one user's live documents, newest edit first,
+    # and by title in the reader's alphabet — the collation the query asks with.
+    await books_collection.create_index(
+        [("user_id", 1), ("deleted_at", 1), ("updated_at", -1), ("_id", -1)], name="books_library_edited")
+    await books_collection.create_index(
+        [("user_id", 1), ("deleted_at", 1), ("title", 1), ("_id", 1)], name="books_library_title",
+        collation={"locale": "en", "strength": 2})
+    await cards_collection.create_index(
+        [("user_id", 1), ("source_book_id", 1)], name="cards_by_source_book")
+
     logger.info("Database indexes created successfully.")
