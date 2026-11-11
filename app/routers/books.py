@@ -10,7 +10,7 @@ from app.models.Book import Book, BookLibraryPage, BookSummary
 from app.services import book_library, book_search, import_parser
 from pymongo.errors import DuplicateKeyError
 from app.models.ai_expand import AIExpandRequest, AIExpandResponse
-from app.config.database import books_collection, cards_collection
+from app.config.database import books_collection, cards_collection, users_collection
 from app.models.CardGenerationRequest import compute_effective_cap
 from app.services.book_sections import PLUS_CARDS_PER_SECTION, annotate_with_cards, document_stats, parse_lexical, split_sections
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
@@ -507,6 +507,14 @@ PICTURE_NODE_BYTES: int = 400
 IMPORT_LOCK_WAIT_SECONDS: float = float(os.getenv("IMPORT_LOCK_WAIT_SECONDS", "45"))
 
 
+async def _account_name(user_id: Optional[str]) -> Optional[str]:
+    """The name on the reader's account, or None when it has none."""
+    if not user_id or not ObjectId.is_valid(user_id):
+        return None
+    user = await users_collection.find_one({"_id": ObjectId(user_id)}, {"username": 1})
+    return (user or {}).get("username") or None
+
+
 class _import_lock:
     """One reader's save of one file at a time (ADR-071 point 4).
 
@@ -678,7 +686,7 @@ async def import_book_from_file(
     book_title = import_title(title, filename)
     # IMPORT-049: who imported it is the account, not a field the request carries. `username`
     # stays in the form for a display name the account has not got; it is cleaned and bounded.
-    username = clean_label(current_user.get("username") or username, AUTHOR_MAX_LENGTH)
+    username = clean_label(await _account_name(current_user.get("user_id")) or username, AUTHOR_MAX_LENGTH)
 
     # Get extraction metadata
     metadata = extracted_pages[0].get("extraction_metadata", {})

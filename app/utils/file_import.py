@@ -876,8 +876,13 @@ def _with_unread_text(file_content: bytes) -> bytes:
 def _docx_picture_handler(media: List[Dict]):
     """A mammoth image converter that keeps the bytes and leaves a marker in the HTML."""
     def handle(image) -> Dict[str, str]:
-        with image.open() as handle_:
-            data = handle_.read()
+        try:
+            with image.open() as handle_:
+                data = handle_.read()
+        except Exception:
+            # A picture the file names and does not hold (or holds outside itself) is
+            # a missing picture, not an unreadable document: its text is still imported (IMPORT-048).
+            return {"alt": image.alt_text or DEFAULT_ALT}
         ext = (image.content_type or "image/png").split("/")[-1].replace("jpeg", "jpg")
         index = _picture(media, data, ext, None, None, image.alt_text or DEFAULT_ALT)
         return {"data-media": str(index), "alt": image.alt_text or DEFAULT_ALT}

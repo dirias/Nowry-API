@@ -263,12 +263,14 @@ def test_an_import_never_has_an_empty_or_endless_title(world):
 
 
 def test_the_author_of_an_import_is_the_account_not_the_form(world):
-    account = world.current["user"].get("username")
+    from bson import ObjectId
+    uid = world.current["user"]["user_id"]
+    world.run(world.raw["users"].update_one({"_id": ObjectId(uid)}, {"$set": {"username": "ana"}}))
     assert _import(world, "a.txt", username="<script>x</script>" + "U" * 5000).status_code == 200
-    stored = _stored(world)
-    if account:
-        assert stored["author"] == account
-    assert len(stored["author"]) <= 100 and "U" * 101 not in stored["author"]
+    assert _stored(world)["author"] == "ana"
+    world.run(world.raw["users"].update_one({"_id": ObjectId(uid)}, {"$unset": {"username": ""}}))
+    assert _import(world, "b.txt", b"another file of words", username="U" * 5000).status_code == 200
+    assert _stored(world)["author"] == "U" * 100            # no name on the account: the form's, bounded
 
 
 def test_created_and_edited_titles_are_cleaned_and_bounded(world):
@@ -311,3 +313,20 @@ def test_text_in_another_encoding_is_not_mistaken_for_damaged_utf8():
     assert file_import._nearly_utf8(japanese.encode("utf-16-le")) is None
     assert file_import.decode_text(spanish.encode("cp1252")) == spanish
     assert file_import.decode_text(japanese.encode("shift_jis")) == japanese
+
+
+def test_a_picture_the_word_file_names_but_does_not_hold_costs_the_picture_not_the_text():
+    drawing = ('<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+               '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+               '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill>'
+               '<a:blip r:embed="rId9" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+               '</pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>')
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(_docx(_p("Before the missing picture.") + drawing + _p("After it.")))) as src, \
+            zipfile.ZipFile(out, "w") as dst:
+        for item in src.infolist():
+            dst.writestr(item, src.read(item.filename))
+        dst.writestr("word/_rels/document.xml.rels", '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                     '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../../../etc/passwd"/></Relationships>')
+    html = _html(process_uploaded_file("broken-picture.docx", out.getvalue()))
+    assert "Before the missing picture." in html and "After it." in html

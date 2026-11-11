@@ -185,7 +185,8 @@ def test_save_creates_the_book_with_its_pages(world):
     response = _upload(world, "mito.docx", docx_bytes(), title="Mitochondria", username="Ana")
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["title"] == "Mitochondria" and body["author"] == "Ana" and body["page_count"] >= 1
+    # IMPORT-049: the author is the account's name, not the form's "Ana".
+    assert body["title"] == "Mitochondria" and body["author"].startswith("reader") and body["page_count"] >= 1
     stored = world.run(world.raw["books"].find_one({}))
     assert stored["title"] == "Mitochondria" and stored["source"] == "imported"
     assert "cristae" in stored["full_content"] and stored["user_id"] == world.current["user"]["user_id"]
