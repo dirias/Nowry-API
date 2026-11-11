@@ -704,7 +704,7 @@ def test_a_preview_of_a_scan_says_it_is_one(world):
         page = doc.new_page()
         page.insert_image(page.rect, pixmap=pixmap)
     facts = _upload(world, "scan.pdf", doc.tobytes(), preview="true").json()["facts"]
-    assert facts == {"pages": 2, "words": 0, "pictures": 2, "scanned": True}
+    assert facts == {"pages": 2, "words": 0, "pictures": 2, "scanned": True, "damaged": False}
 
 
 def test_a_preview_carries_the_first_pages_only_and_still_says_how_many_there_are(world):
@@ -803,3 +803,70 @@ def test_a_deleted_import_and_another_readers_import_are_not_duplicates(world):
 
 def test_an_unknown_answer_to_the_duplicate_question_is_refused(world):
     assert _upload(world, "mito.txt", txt_bytes(), on_duplicate="replace").status_code == 422
+
+
+# ── IMPORT-021/022: a damaged PDF says so; East Asian text is read in the encoding it has ──
+
+CHINESE = "细胞是生命的基本单位。线粒体产生能量,细胞核含有遗传物质。\n\n第二段:核糖体合成蛋白质。"
+KOREAN = "세포는 생명의 기본 단위입니다. 미토콘드리아는 에너지를 만듭니다.\n\n핵에는 유전 물질이 있습니다."
+JAPANESE_LONG = "第3章 細胞の構造\n\n核にはDNAが含まれています。ミトコンドリアはATPを産生します。\n\n・核:DNAを含む\n1. 最初の手順\n"
+
+
+@pytest.mark.parametrize("label, data, expected", [
+    ("utf-16-le, Japanese, no mark", JAPANESE_LONG.encode("utf-16-le"), JAPANESE_LONG),
+    ("utf-16-be, Japanese, no mark", JAPANESE_LONG.encode("utf-16-be"), JAPANESE_LONG),
+    ("utf-16-le, Chinese, no mark", CHINESE.encode("utf-16-le"), CHINESE),
+    ("utf-16-be, Spanish, no mark", SPANISH.encode("utf-16-be"), SPANISH),
+    ("euc-jp", JAPANESE_LONG.encode("euc_jp"), JAPANESE_LONG),
+    ("euc-jp, short", JAPANESE.encode("euc_jp"), JAPANESE),
+    ("iso-2022-jp", JAPANESE_LONG.encode("iso2022_jp"), JAPANESE_LONG),
+    ("shift-jis, long", JAPANESE_LONG.encode("shift_jis"), JAPANESE_LONG),
+    ("gbk", CHINESE.encode("gbk"), CHINESE),
+    ("euc-kr", KOREAN.encode("euc_kr"), KOREAN),
+])
+def test_east_asian_text_is_read_in_the_encoding_it_was_saved_in(label, data, expected):
+    """IMPORT-022. EUC-JP became mojibake and ISO-2022-JP its own escape codes; UTF-16 without a mark was refused."""
+    from app.utils.file_import import decode_text
+    assert decode_text(data) == expected, label
+
+
+@pytest.mark.parametrize("label, data, expected", [
+    ("windows-1252 Spanish", SPANISH.encode("cp1252"), SPANISH),
+    ("windows-1252 short", "Señor Núñez dijo que sí, mañana.".encode("cp1252"), "Señor Núñez dijo que sí, mañana."),
+    ("windows-1252 French", "L’unité de base. Très bien, où ça ? Cœur, façade, être.".encode("cp1252"),
+     "L’unité de base. Très bien, où ça ? Cœur, façade, être."),
+    ("utf-8 with NUL bytes", b"Texto antes\x00\x00 despues.\n\nSegundo.", "Texto antes\x00\x00 despues.\n\nSegundo."),
+])
+def test_western_text_is_not_mistaken_for_an_east_asian_or_utf16_file(label, data, expected):
+    from app.utils.file_import import decode_text
+    assert decode_text(data) == expected, label
+
+
+def _truncated_pdf(keep: float) -> bytes:
+    import fitz
+    doc = fitz.open()
+    for n in range(6):
+        doc.new_page().insert_text((72, 100), f"Page {n + 1}. {PARAGRAPH}", fontsize=11)
+    data = doc.tobytes()
+    return data[:int(len(data) * keep)]
+
+
+def test_a_damaged_pdf_that_yields_nothing_is_called_damaged_not_empty(world):
+    """IMPORT-021: 'has no text to import' sent the writer looking for the wrong problem."""
+    from app.utils.file_import import refusal_code
+    data = _truncated_pdf(0.5)
+    if process_uploaded_file("cut.pdf", data):
+        pytest.skip("this cut still yields pages; the next test covers that case")
+    assert refusal_code("cut.pdf", data) == "import_unreadable"
+    assert _upload(world, "cut.pdf", data, preview="true").json()["detail"] == {"code": "import_unreadable"}
+
+
+def test_a_damaged_pdf_that_still_yields_pages_is_previewed_as_damaged(world):
+    import fitz
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 100), PARAGRAPH, fontsize=11)
+    whole = doc.tobytes()
+    assert _upload(world, "whole.pdf", whole, preview="true").json()["facts"]["damaged"] is False
+    cut = whole[:-40]  # the cross-reference table's end is gone; the reader rebuilds it
+    body = _upload(world, "cut.pdf", cut, preview="true").json()
+    assert body["facts"]["damaged"] is True and body["facts"]["words"] > 10

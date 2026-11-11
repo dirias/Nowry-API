@@ -406,6 +406,9 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
         pages = []
         total_chars_extracted = 0
         running = _running_lines(doc)
+        # The file was broken and the reader rebuilt what it could: what follows
+        # may be only part of the document, and the preview says so (IMPORT-021).
+        repaired = bool(getattr(doc, "is_repaired", False))
 
         for page_num, page in enumerate(doc):
             # Get page dimensions to detect columns
@@ -475,6 +478,7 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
                 "multi_column_pages": sum(
                     1 for p in pages if p.get("has_columns", False)
                 ),
+                "damaged": repaired,
             }
 
         return pages
@@ -655,16 +659,6 @@ _BOMS = (
     (codecs.BOM_UTF16_BE, "utf-16"),
 )
 
-#: Encodings the detector is trusted to tell apart: their byte patterns are
-#: distinctive. Between the single-byte code pages it guesses, and guesses wrong
-#: (Windows-1252 French read as Windows-1250), so those are not asked of it.
-_DETECTABLE = frozenset({
-    "utf_16", "utf_16_le", "utf_16_be", "utf_32", "utf_32_le", "utf_32_be",
-    "cp932", "shift_jis", "shift_jis_2004", "shift_jisx0213", "euc_jp", "euc_jis_2004", "euc_jisx0213", "iso2022_jp",
-    "gb18030", "gbk", "gb2312", "big5", "big5hkscs", "cp950", "cp949", "euc_kr", "johab",
-})
-
-
 def _detected_encoding(data: bytes) -> Optional[str]:
     """The detector's best guess, or None when it has none or is not installed."""
     try:
@@ -683,12 +677,138 @@ def _looks_like_text(text: str) -> bool:
     return controls / len(text) < 0.02
 
 
+_UTF16_MIN_BYTES = 16
+_UTF16_MIN_DISTANCE = 0.5
+
+
+def _byte_shares(stream: bytes) -> Dict[int, float]:
+    shares: Dict[int, float] = {}
+    for byte in stream:
+        shares[byte] = shares.get(byte, 0) + 1
+    return {byte: count / len(stream) for byte, count in shares.items()}
+
+
+_COMMON_UTF16 = frozenset(" \n\r\t\u3000\u3001\u3002\uff0c\uff01\uff1f")
+
+
+def _utf16_without_mark(data: bytes) -> Optional[str]:
+    """The text, if these bytes are UTF-16 that carries no byte-order mark.
+
+    Two things must both hold, because either alone is fooled:
+
+    - The bytes at even and at odd offsets are two different streams (the low
+      and the high byte of each character). In a single-byte encoding they are
+      drawn from one alphabet and their distributions are close — though a
+      multi-byte encoding such as Shift-JIS or GBK also has two streams.
+    - Some byte is below 0x09. UTF-16 has them wherever there is a space, a
+      line break or CJK punctuation (U+0020, U+000A, U+3001, U+3002); text in
+      any single- or multi-byte encoding has none.
+
+    The byte order is the one whose reading has more spaces, line breaks, ASCII
+    and CJK punctuation.
+    """
+    if len(data) < _UTF16_MIN_BYTES or len(data) % 2 or not any(byte < 0x09 for byte in data):
+        return None
+    even_shares, odd_shares = _byte_shares(data[0::2]), _byte_shares(data[1::2])
+    distance = sum(abs(even_shares.get(b, 0) - odd_shares.get(b, 0)) for b in set(even_shares) | set(odd_shares)) / 2
+    if distance < _UTF16_MIN_DISTANCE:
+        return None
+    best: Optional[str] = None
+    best_score = 0
+    for encoding in ("utf-16-le", "utf-16-be"):
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        score = sum(1 for char in text if char in _COMMON_UTF16 or "!" <= char <= "~")
+        if score > best_score and _looks_like_text(text):
+            best, best_score = text, score
+    return best
+
+
+_ISO2022 = ("iso2022_jp_2", "iso2022_jp", "iso2022_kr")
+
+
+def _iso2022(data: bytes) -> Optional[str]:
+    """The text, if these bytes are ISO-2022 (7-bit, with escape sequences that switch character sets).
+
+    Such a file is all ASCII bytes, so it is valid UTF-8 and would be read as
+    its own escape codes.
+    """
+    if b"\x1b$" not in data and b"\x1b(" not in data:
+        return None
+    for encoding in _ISO2022:
+        try:
+            text = data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if "\x1b" not in text and _looks_like_text(text):
+            return text
+    return None
+
+
+def _share(text: str, low: int, high: int) -> float:
+    return sum(1 for char in text if low <= ord(char) <= high) / len(text) if text else 0.0
+
+
+def _is_japanese(text: str) -> bool:
+    return _share(text, 0x3040, 0x30FF) >= 0.05          # kana: no Chinese text has that much
+
+
+def _is_korean(text: str) -> bool:
+    return _share(text, 0xAC00, 0xD7A3) >= 0.20
+
+
+def _is_chinese(text: str) -> bool:
+    plausible = sum(1 for char in text if char.isascii() or 0x4E00 <= ord(char) <= 0x9FFF or 0x3000 <= ord(char) <= 0x303F
+                    or 0xFF00 <= ord(char) <= 0xFFEF) / len(text) if text else 0.0
+    return plausible >= 0.95 and _share(text, 0x4E00, 0x9FFF) >= 0.20
+
+
+#: Legacy Japanese and Korean encodings, each with the test its reading must
+#: pass. EUC-JP and GB2312 share the code positions of kana, so Japanese is
+#: asked first, and by its kana.
+_JAPANESE_KOREAN = (
+    ("euc_jp", _is_japanese),
+    ("cp932", _is_japanese),
+    ("cp949", _is_korean),
+)
+_CHINESE = ("gb18030", "big5")
+
+
+def _strict(data: bytes, encoding: str) -> Optional[str]:
+    try:
+        return data.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return None
+
+
+def _east_asian(data: bytes) -> Optional[str]:
+    """The text, if these bytes read as Japanese, Korean or Chinese in one of the legacy encodings.
+
+    Decided by what the reading looks like, not by a statistical detector: the
+    detector said nothing of 424 bytes of EUC-JP and called a longer sample
+    Big5. It is asked one question only — simplified or traditional — when the
+    same bytes read as plausible Chinese both ways.
+    """
+    for encoding, reads_right in _JAPANESE_KOREAN:
+        text = _strict(data, encoding)
+        if text is not None and reads_right(text) and _looks_like_text(text):
+            return text
+    readings = {encoding: _strict(data, encoding) for encoding in _CHINESE}
+    chinese = {encoding: text for encoding, text in readings.items() if text is not None and _is_chinese(text)}
+    if len(chinese) > 1:
+        return chinese["big5"] if _detected_encoding(data) in ("big5", "big5hkscs", "cp950") else chinese["gb18030"]
+    return next(iter(chinese.values()), None)
+
+
 def decode_text(data: bytes) -> Optional[str]:
     """A text file's bytes as text, or None when they are not text.
 
-    In order: a byte-order mark says what it is; valid UTF-8 is UTF-8; a
-    multi-byte encoding the detector recognises (Shift-JIS, GB18030, EUC-KR,
-    UTF-16 without a mark) is that; anything else is read as Windows-1252, the
+    In order: a byte-order mark says what it is; ISO-2022 is known by its
+    escape sequences; valid UTF-8 is UTF-8; a
+    UTF-16 without a mark is recognised by its two byte streams; a multi-byte
+    encoding the detector recognises (Shift-JIS, GB18030, EUC-KR) is that; anything else is read as Windows-1252, the
     code page Western-language "plain text" comes in. A byte-order mark is
     never part of the text.
     """
@@ -698,16 +818,19 @@ def decode_text(data: bytes) -> Optional[str]:
                 return data.decode(encoding).lstrip("\ufeff")
             except UnicodeDecodeError:
                 break
+    escaped = _iso2022(data)
+    if escaped is not None:
+        return escaped
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         pass
-    guess = _detected_encoding(data)
-    if guess in _DETECTABLE:
-        try:
-            return data.decode(guess)
-        except (UnicodeDecodeError, LookupError):
-            pass
+    unmarked = _utf16_without_mark(data)
+    if unmarked is not None:
+        return unmarked
+    east_asian = _east_asian(data)
+    if east_asian is not None:
+        return east_asian
     if b"\x00" in data:
         return None  # binary: no single-byte text carries NUL bytes
     for encoding in ("cp1252", "latin-1"):
@@ -875,6 +998,7 @@ def process_uploaded_file_with_media(filename: str, file_content: bytes) -> Tupl
         metadata.setdefault("total_words", sum(p["word_count"] for p in pages))
         metadata.setdefault("total_chars", sum(p["char_count"] for p in pages))
         metadata.setdefault("multi_column_pages", 0)
+        metadata.setdefault("damaged", False)
         metadata["pictures"] = len(media)
     return pages, media
 
@@ -929,7 +1053,11 @@ def _pdf_refusal(file_content: bytes) -> str:
     try:
         if doc.needs_pass:
             return IMPORT_PASSWORD_PROTECTED
-        return IMPORT_EMPTY if doc.page_count else IMPORT_UNREADABLE
+        # A file the reader had to repair and that then gave no text is damaged,
+        # not empty: "has no text" sent the writer looking for the wrong problem.
+        if getattr(doc, "is_repaired", False) or not doc.page_count:
+            return IMPORT_UNREADABLE
+        return IMPORT_EMPTY
     finally:
         doc.close()
 

@@ -571,6 +571,8 @@ async def import_book_from_file(
         # Pages that are pictures and no text: a scan. It imports, but there is
         # nothing in it to make cards from, and the reader should hear that first.
         "scanned": total_words == 0 and len(pictures) > 0,
+        # The file was broken and only what could be rebuilt was read (IMPORT-021).
+        "damaged": bool(metadata.get("damaged")),
     }
     avg_words_per_page = total_words / len(extracted_pages) if extracted_pages else 0
 
