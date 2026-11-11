@@ -302,6 +302,90 @@ def _pdf_blocks_to_html(blocks_list: List[Dict], page_height: float = 0, running
     return "".join(out)
 
 
+# ── the order of a page ─────────────────────────────────────────────────────
+#
+# A page's blocks arrive in the order the file stores them. Read top to bottom
+# they interleave the columns of a two- or three-column page. The importer used
+# to split the page at its midpoint, which reads two columns and scrambles
+# three: the middle column straddles the midpoint and was taken for a headline.
+
+_COLUMN_MIN_SHARE = 0.10   # a column carries at least this share of the page's column text…
+_COLUMN_MIN_CHARS = 150    # …and at least this much of it: a page number is not a column
+_SPANNING_SHARE = 0.60     # a block this wide, against the text's width, spans the columns
+_BAND_TOLERANCE = 3.0      # points by which two blocks may overlap and still be side by side
+
+
+def _block_chars(block: Dict) -> int:
+    if block.get("type") != 0:
+        return 0
+    return sum(len(span.get("text", "")) for line in block.get("lines", []) for span in line.get("spans", []))
+
+
+def _column_bands(narrow: List[Dict]) -> List[List[float]]:
+    """The horizontal bands the narrow blocks fall into: one per column, left to right."""
+    bands: List[List[float]] = []
+    for block in sorted(narrow, key=lambda b: b["bbox"][0]):
+        left, right = block["bbox"][0], block["bbox"][2]
+        if bands and left < bands[-1][1] - _BAND_TOLERANCE:
+            bands[-1][1] = max(bands[-1][1], right)
+        else:
+            bands.append([left, right])
+    return bands
+
+
+def _band_of(block: Dict, bands: List[List[float]]) -> int:
+    centre = (block["bbox"][0] + block["bbox"][2]) / 2
+    for index, (left, right) in enumerate(bands):
+        if left - _BAND_TOLERANCE <= centre <= right + _BAND_TOLERANCE:
+            return index
+    return min(range(len(bands)), key=lambda i: abs((bands[i][0] + bands[i][1]) / 2 - centre))
+
+
+def _reading_order(blocks: List[Dict]) -> Tuple[List[Dict], int]:
+    """The blocks in reading order, and how many columns the page has.
+
+    Blocks that span the columns (a title, a full-width figure) cut the page
+    into zones; inside a zone each column is read top to bottom, left column
+    first. A page with one column is simply top to bottom.
+    """
+    by_top = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+    if len(by_top) < 2:
+        return by_top, 1
+    span_left = min(b["bbox"][0] for b in by_top)
+    span_right = max(b["bbox"][2] for b in by_top)
+    width = max(span_right - span_left, 1.0)
+    narrow = [b for b in by_top if (b["bbox"][2] - b["bbox"][0]) < width * _SPANNING_SHARE]
+    bands = _column_bands(narrow)
+    if len(bands) > 1:
+        chars = [0] * len(bands)
+        for block in narrow:
+            chars[_band_of(block, bands)] += _block_chars(block)
+        total = sum(chars)
+        floor = max(_COLUMN_MIN_CHARS, total * _COLUMN_MIN_SHARE)
+        if any(count < floor for count in chars):
+            bands = []  # a margin note or a page number beside the text, not columns
+    if len(bands) < 2:
+        return by_top, 1
+
+    narrow_ids = {id(b) for b in narrow}
+    ordered: List[Dict] = []
+    zone: List[Dict] = []
+
+    def flush_zone() -> None:
+        for index in range(len(bands)):
+            ordered.extend(b for b in zone if _band_of(b, bands) == index)
+        zone.clear()
+
+    for block in by_top:
+        if id(block) in narrow_ids:
+            zone.append(block)
+        else:
+            flush_zone()
+            ordered.append(block)
+    flush_zone()
+    return ordered, len(bands)
+
+
 def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Dict]] = None) -> List[Dict[str, str]]:
     """
     Extract text from PDF preserving formatting AND multi-column layouts
@@ -338,24 +422,11 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
                 blocks = [b for b in blocks if b.get("type") != 0
                           or not any(_inside(b.get("bbox", [0, 0, 0, 0]), t["bbox"]) for t in tables)] + tables
 
-            # Separate blocks into left and right columns
-            left_column = []
-            right_column = []
-            full_width_blocks = []
-
+            # Pictures become markers; anything that is neither text, table nor picture is left out.
+            placed = []
             for block in blocks:
-                # Common block properties
-                bbox = block.get("bbox", [0, 0, 0, 0])
-                block_left = bbox[0]
-                block_right = bbox[2]
-                block_top = bbox[1]
-
-                # Attach position for sorting
-                block["_y_pos"] = block_top
-
-                if block.get("type") in (0, "table"):  # Text block, or a table found above
-                    # Determine column (logic handled below)
-                    pass
+                if block.get("type") in (0, "table"):
+                    placed.append(block)
                 elif block.get("type") == 1:  # Image block — the dict carries the bytes
                     image_bytes = block.get("image")
                     if not image_bytes:
@@ -363,86 +434,13 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
                     index = _picture(media, image_bytes, block.get("ext", "png"),
                                      block.get("width"), block.get("height"), DEFAULT_ALT)
                     block["custom_html"] = media_marker(index)
-                else:
-                    continue  # Skip other types
+                    placed.append(block)
 
-                # Determine if block is in left column, right column, or full width
-                if block_right < mid_point + 10:  # Left column (tighter margin)
-                    left_column.append(block)
-                elif block_left > mid_point - 10:  # Right column
-                    right_column.append(block)
-                else:  # Spanning / Center
-                    full_width_blocks.append(block)
-
-            # --- INTELLIGENT LAYOUT DETECTION ---
-            # Check if this is actually a 2-column page or just a single column with some short lines
-
-            # Count text length in each section
-            def get_text_len(block_list):
-                length = 0
-                for b in block_list:
-                    if b.get("type") == 0:  # Only count text blocks
-                        for line in b.get("lines", []):
-                            for span in line.get("spans", []):
-                                length += len(span.get("text", ""))
-                return length
-
-            left_len = get_text_len(left_column)
-            right_len = get_text_len(right_column)
-            spanning_len = get_text_len(full_width_blocks)
-
-            total_len = left_len + right_len + spanning_len
-
-            # Heuristics for 2-Column Mode:
-            # 1. Must have substantial content in BOTH columns (to avoid sidebars/margin notes being treated as 2-col)
-            # 2. Spanning content (titles) shouldn't dominate (> 40% of page usually means generic single col)
-            is_two_column = False
-
-            if total_len > 0:
-                has_two_distinct_cols = (left_len > total_len * 0.1) and (
-                    right_len > total_len * 0.1
-                )
-                not_dominated_by_center = spanning_len < total_len * 0.6
-
-                if has_two_distinct_cols and not_dominated_by_center:
-                    is_two_column = True
-
-            # If NOT 2-column, merge everything back to linear layout (Single Column)
-            if not is_two_column:
-                full_width_blocks = full_width_blocks + left_column + right_column
-                # Sort by vertical position (top to bottom)
-                full_width_blocks.sort(key=lambda b: b.get("bbox", [0, 0, 0, 0])[1])
-                left_column = []
-                right_column = []
-
-            # Sort blocks by vertical position within each column
-            left_column.sort(key=lambda b: b.get("_y_pos", 0))
-            right_column.sort(key=lambda b: b.get("_y_pos", 0))
-            full_width_blocks.sort(key=lambda b: b.get("_y_pos", 0))
-
-            # Format blocks to HTML
-            def format_blocks_to_html(blocks_list, column_class=""):
-                return _pdf_blocks_to_html(blocks_list, page_height, running)
-
-            # Build page HTML preserving column structure
-            page_html = ""
-
-            # Full-width content first (titles, abstracts)
-            if full_width_blocks:
-                page_html += format_blocks_to_html(full_width_blocks)
-
-            # If we have two columns, preserve them
-            if left_column and right_column:
-                page_html += '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">'
-                page_html += f'<div class="column-left">{format_blocks_to_html(left_column)}</div>'
-                page_html += f'<div class="column-right">{format_blocks_to_html(right_column)}</div>'
-                page_html += "</div>"
-            elif left_column:
-                # Only left column (or single column)
-                page_html += format_blocks_to_html(left_column)
-            elif right_column:
-                # Only right column
-                page_html += format_blocks_to_html(right_column)
+            # The order a reader follows: down each column, columns left to right,
+            # however many there are (IMPORT-018).
+            ordered, column_count = _reading_order(placed)
+            page_html = _pdf_blocks_to_html(ordered, page_height, running)
+            page_has_columns = column_count > 1
 
             # Extract plain text for quality metrics
             plain_text = page.get_text()
@@ -457,7 +455,7 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
                         "content": page_html,
                         "page_number": page_num + 1,
                         "format": "html",
-                        "has_columns": bool(left_column and right_column),
+                        "has_columns": page_has_columns,
                         "word_count": word_count,
                         "char_count": char_count,
                         "quality_score": min(

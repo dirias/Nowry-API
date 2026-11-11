@@ -712,3 +712,46 @@ def test_a_preview_carries_the_first_pages_only_and_still_says_how_many_there_ar
         body = _upload(world, "long.pdf", pdf_bytes(7), preview="true").json()
     assert body["total_pages"] == 7 and body["facts"]["pages"] == 7
     assert [page["page_number"] for page in body["sample_pages"]] == [1, 2, 3]
+
+
+# ── IMPORT-018: a page is read down its columns, however many it has ────────
+
+def _columns_pdf(columns: int, title: bool = True) -> bytes:
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page()
+    if title:
+        page.insert_text((50, 60), "A title across the whole page width of this article", fontsize=20)
+    width = 480 / columns
+    for c in range(columns):
+        left = 50 + c * (width + 12)
+        page.insert_textbox(fitz.Rect(left, 90, left + width, 420), (f"Column{c + 1} text here. " * (72 // columns)), fontsize=9)
+        page.insert_textbox(fitz.Rect(left, 440, left + width, 760), (f"Column{c + 1} lower part. " * (60 // columns)), fontsize=9)
+    return doc.tobytes()
+
+
+@pytest.mark.parametrize("columns", [2, 3, 4])
+def test_columns_are_read_left_to_right_each_from_top_to_bottom(columns):
+    """The fault: three columns came out 2, 1, 3 — the page was split at its midpoint."""
+    import re
+    (page,) = process_uploaded_file("article.pdf", _columns_pdf(columns))
+    order = []
+    for name in re.findall(r"Column(\d) (?:text|lower)", page["content"]):
+        if not order or order[-1] != name:
+            order.append(name)
+    assert order == [str(n) for n in range(1, columns + 1)]
+    assert page["has_columns"] is True
+    assert page["content"].index("A title across") < page["content"].index("Column1")
+    upper, lower = page["content"].index("Column1 text"), page["content"].index("Column1 lower")
+    assert upper < lower < page["content"].index("Column2 text")
+    assert "<div" not in page["content"]
+
+
+def test_one_column_with_a_page_number_beside_it_is_one_column():
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(72, 80, 330, 700), "Body text of a narrow single column. " * 60, fontsize=10)
+    page.insert_text((500, 400), "12", fontsize=10)
+    (result,) = process_uploaded_file("narrow.pdf", doc.tobytes())
+    assert result["has_columns"] is False and "Body text" in result["content"]
