@@ -27,6 +27,7 @@ from app.utils import media_ledger
 from app.utils.logger import get_logger
 from app.utils.storage import get_storage_backend, media_root
 from app.utils.uploads import read_bounded_upload
+from app.utils.word_count import count_words
 from app.core.model_config import get_client_for_tier, TIER_MODEL_NAMES
 from app.core.langfuse_client import get_langfuse_client
 from langfuse import propagate_attributes
@@ -366,7 +367,7 @@ async def get_book_sections(
         from app.services.book_sections import Section, section_hash
         import re as _re
         text = _re.sub(r"<[^>]+>", " ", raw)
-        words = len(text.split())
+        words = count_words(text)
         if words:
             sections = [Section(0, title, "doc", text, words, section_hash(text))]
     linked = await cards_collection.find(

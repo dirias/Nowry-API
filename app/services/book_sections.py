@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, asdict
 from typing import Any, Iterable, Optional
 
+from app.utils.word_count import count_words
+
 MIN_SECTION_WORDS: int = 40
 # The 20-card cap per run applies per section on Plus (docs/prd-book-cards.md D10).
 PLUS_CARDS_PER_SECTION: int = 20
@@ -60,7 +62,8 @@ def _node_text(node: Any) -> str:
 
 
 def _word_count(text: str) -> int:
-    return len([w for w in re.split(r"\s+", text.strip()) if w])
+    """Words in any script (ADR-064): spaced scripts by token, unspaced ones by estimate."""
+    return count_words(text)
 
 
 def section_hash(text: str) -> str:

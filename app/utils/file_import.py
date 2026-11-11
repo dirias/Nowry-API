@@ -11,6 +11,8 @@ import logging
 import re
 import html
 
+from app.utils.word_count import count_words
+
 logger = logging.getLogger(__name__)
 
 # ── pictures ────────────────────────────────────────────────────────────────
@@ -445,7 +447,7 @@ def extract_formatted_text_from_pdf(file_content: bytes, media: Optional[List[Di
             # Extract plain text for quality metrics
             plain_text = page.get_text()
             char_count = len(plain_text)
-            word_count = len(plain_text.split())
+            word_count = count_words(plain_text)
             total_chars_extracted += char_count
 
             if page_html.strip():
@@ -892,7 +894,7 @@ def _count_pages(pages: List[Dict]) -> None:
         if "word_count" in page and "char_count" in page:
             continue
         text = html.unescape(_ANY_TAG.sub(" ", page.get("content", "")))
-        page.setdefault("word_count", len(text.split()))
+        page.setdefault("word_count", count_words(text))
         page.setdefault("char_count", len(" ".join(text.split())))
 
 
