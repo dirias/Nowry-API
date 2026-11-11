@@ -249,7 +249,7 @@ def _pdf_line(line: Dict) -> Optional[Dict]:
     segments: List[List] = []
     sizes: Dict[float, int] = {}
     for span in line.get("spans", []):
-        text = _fold_presentation_forms(span.get("text", ""))
+        text = strip_noise(_fold_presentation_forms(span.get("text", ""))).replace("\u2028", " ").replace("\u2029", " ")
         if not text:
             continue
         flags = span.get("flags", 0) & (16 | 2)
@@ -903,7 +903,7 @@ def extract_formatted_text_from_docx(file_content: bytes, media: Optional[List[D
         # Convert DOCX to HTML using mammoth (preserves formatting); pictures
         # come out as bytes beside it, never as data URIs (ADR-062 point 5).
         result = mammoth.convert_to_html(docx_file, convert_image=_docx_picture_handler(media))
-        html_content = result.value
+        html_content = strip_noise(result.value)
 
         # Split into pages (by page breaks or content length)
         pages = []
@@ -1152,6 +1152,48 @@ def _east_asian(data: bytes) -> Optional[str]:
     return next(iter(chinese.values()), None)
 
 
+_NEARLY_UTF8_RATIO = 10   # this many well-formed multi-byte characters for every malformed sequence
+
+
+def _nearly_utf8(data: bytes) -> Optional[str]:
+    """UTF-8 with a few bad bytes in it, read as UTF-8 without them (IMPORT-050).
+
+    One truncated character or a stray surrogate used to send a whole UTF-8
+    file down to Windows-1252, where every accent became two wrong letters.
+    Text in another encoding is not mistaken for this: read as UTF-8 it is
+    nearly all malformed.
+    """
+    lenient = data.decode("utf-8", errors="replace")
+    bad = lenient.count("\ufffd")
+    good = sum(1 for char in lenient if ord(char) > 0x7f) - bad
+    if not bad or good < bad * _NEARLY_UTF8_RATIO:
+        return None
+    return lenient.replace("\ufffd", "")
+
+
+# ── what is in a file and is not text ───────────────────────────────────────
+
+_ANSI = re.compile("\x1b\\[[0-9;?]*[ -/]*[@-~]")   # terminal colour and cursor codes, whole
+_NOT_TEXT = re.compile("[\ufffe\uffff\u202d\u202e\U000e0000-\U000e007f]")   # noncharacters, direction overrides, tags
+_INVISIBLE_RUN = re.compile("([\u200b\u200c\u200d\u2060\ufeff])[\u200b\u200c\u200d\u2060\ufeff]+")
+_COMBINING_FLOOD = re.compile("([\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]{6})"
+                              "[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]+")
+
+
+def strip_noise(text: str) -> str:
+    """Remove what a file carries that no reader typed (IMPORT-050).
+
+    Terminal colour codes; noncharacters, tag characters and the two direction
+    overrides; a run of zero-width characters past the first; combining marks
+    stacked more than six deep on one letter. A single zero-width joiner (an
+    emoji family) and ordinary accents are untouched.
+    """
+    text = _ANSI.sub("", text)
+    text = _NOT_TEXT.sub("", text)
+    text = _INVISIBLE_RUN.sub(r"\1", text)
+    return _COMBINING_FLOOD.sub(r"\1", text)
+
+
 def decode_text(data: bytes) -> Optional[str]:
     """A text file's bytes as text, or None when they are not text.
 
@@ -1175,6 +1217,9 @@ def decode_text(data: bytes) -> Optional[str]:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         pass
+    nearly = _nearly_utf8(data)
+    if nearly is not None:
+        return nearly
     unmarked = _utf16_without_mark(data)
     if unmarked is not None:
         return unmarked
@@ -1323,6 +1368,8 @@ def extract_formatted_text_from_txt(file_content: bytes) -> List[Dict[str, str]]
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         # A form feed is a page break, which here is a paragraph break; the other
         # control characters (a stray NUL from a bad export) are not text.
+        # U+2028 and U+2029 are a line and a paragraph break written the Unicode way.
+        text = strip_noise(text).replace("\u2028", "\n").replace("\u2029", "\n\n")
         text = _CONTROL.sub("", text.replace("\f", "\n\n"))
 
         paragraphs = [p.strip("\n") for p in _PARAGRAPH_BREAK.split(text) if p.strip()]

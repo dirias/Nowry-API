@@ -276,3 +276,38 @@ def test_created_and_edited_titles_are_cleaned_and_bounded(world):
     assert created["title"] == "My notes" and len(created["author"]) == 100
     edited = world.http.put(f"/book/edit/{created['_id']}", json={"title": "Z" * 900}).json()
     assert len(edited["title"]) == 200
+
+
+# ── IMPORT-050: what a file carries that no one typed ───────────────────────
+
+def test_noise_is_removed_and_text_is_not():
+    strip = file_import.strip_noise
+    assert strip("\x1b[31mred\x1b[0m and \x1b[1;32mgreen\x1b[m") == "red and green"
+    assert strip("a\ufffeb\U000e0001c\u202egnp.exe") == "abcgnp.exe"
+    assert strip("word" + "\u200b\u200c\u200d\u2060" * 500 + "end") == "word\u200bend"
+    assert len(strip("Z" + "\u0301\u0302\u0303" * 1000 + " ok")) == 1 + 6 + 3
+    family = "👨\u200d👩\u200d👧"
+    assert strip(family) == family and strip("é e\u0301 ñ שָׁלוֹם مَرْحَبًا") == "é e\u0301 ñ שָׁלוֹם مَرْحَبًا"
+    assert strip("left\u200eright\u200f") == "left\u200eright\u200f"        # direction marks are real typing
+
+
+def test_a_text_file_with_terminal_codes_and_unicode_breaks_reads_cleanly():
+    data = "\x1b[31mTitle\x1b[0m line\u2028second line\u2029A new paragraph\ufffe.".encode("utf-8")
+    html = _html(process_uploaded_file("log.txt", data))
+    assert "[31m" not in html and "\ufffe" not in html and "\u2028" not in html
+    assert "Title line" in html and "second line" in html and "<p>A new paragraph.</p>" in html
+
+
+def test_utf8_with_a_few_bad_bytes_is_still_read_as_utf8():
+    good = "El pingüino comió ñandú en la montaña. ¿Qué pasó después? ¡Ánimo, señor Núñez! " * 4
+    data = good.encode("utf-8") + b" stray \xed\xa0\x80 surrogate"
+    assert file_import.decode_text(data) == good + " stray  surrogate"
+
+
+def test_text_in_another_encoding_is_not_mistaken_for_damaged_utf8():
+    spanish, japanese = "Año, niño, pingüino, ¿qué? ¡ánimo! Señor Núñez.", "細胞は生命の基本単位です。漢字、ひらがな、カタカナ。"
+    assert file_import._nearly_utf8(spanish.encode("cp1252")) is None
+    assert file_import._nearly_utf8(japanese.encode("shift_jis")) is None
+    assert file_import._nearly_utf8(japanese.encode("utf-16-le")) is None
+    assert file_import.decode_text(spanish.encode("cp1252")) == spanish
+    assert file_import.decode_text(japanese.encode("shift_jis")) == japanese
