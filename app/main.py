@@ -114,7 +114,7 @@ async def lifespan(app: FastAPI):
     reaper = asyncio.create_task(media_ledger.reaper_loop(books_collection))
     # ADR-069: documents whose stored counts or search terms were computed under an
     # older rule are brought up to date in small batches, in the background.
-    maintenance = asyncio.create_task(book_maintenance.run_pass(books_collection))
+    maintenance = asyncio.create_task(book_maintenance.maintenance_loop(books_collection))
     yield
     # Shutdown
     reaper.cancel()

@@ -176,3 +176,21 @@ async def run_pass(books: Any, batch: int = BATCH, pause: float = PAUSE_SECONDS)
     if total:
         logger.info("Book maintenance brought %d documents up to date", total)
     return total
+
+
+#: Seconds between two passes. A pass that finds nothing behind costs one indexed query.
+INTERVAL_SECONDS: int = int(os.getenv("BOOK_MAINTENANCE_INTERVAL_SECONDS", "3600"))
+
+
+async def maintenance_loop(books: Any, interval: Optional[int] = None) -> None:
+    """Run the pass at startup and again every `interval` seconds, for the life of the process.
+
+    Once is not enough: during a deploy an older API instance may still be
+    writing documents without stamps after this one's first pass has finished.
+    """
+    interval = INTERVAL_SECONDS if interval is None else interval
+    while True:
+        await run_pass(books)
+        if interval <= 0:
+            return
+        await asyncio.sleep(interval)

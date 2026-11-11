@@ -182,3 +182,9 @@ def test_a_written_document_with_that_sentence_typed_in_it_is_left_alone():
     assert book_maintenance.legacy_import_facts({"source": "imported", "summary": "My own summary"}) == {}
     assert book_maintenance.legacy_import_facts({"source": "imported", "source_filename": "kept.pdf",
                                                   "summary": "Imported from other.pdf - 2 pages"}) == {}
+
+
+def test_the_loop_runs_a_pass_and_stops_when_told_to_run_once(world):
+    _insert(world, title="behind", full_content=_state(("paragraph", "uno dos", None)))
+    world.run(book_maintenance.maintenance_loop(world.raw["books"], interval=0))
+    assert world.run(world.raw["books"].count_documents(book_maintenance.BEHIND)) == 0
