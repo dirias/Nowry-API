@@ -60,13 +60,23 @@ def sender_config(kind: str) -> Optional[dict]:
     return {"key": key, "from": sender, "reply_to": reply_to}
 
 
+def without_tag(address: str) -> str:
+    """`ana+test@example.com` reads as `ana@example.com`: a "+tag" names the same mailbox."""
+    local, at, domain = address.strip().lower().rpartition("@")
+    return f"{local.split('+', 1)[0]}{at}{domain}"
+
+
 def allowed_recipient(to: str, allowlist: str) -> bool:
-    """With no list, anyone. With one, only its addresses and `@domain` entries."""
+    """With no list, anyone. With one, only its addresses and `@domain` entries.
+
+    Whatever follows a "+" in the local part is ignored on both sides, so one
+    entry covers every alias of that mailbox.
+    """
     entries = [entry.strip().lower() for entry in allowlist.split(",") if entry.strip()]
     if not entries:
         return True
-    address = to.strip().lower()
-    return any(address == entry or (entry.startswith("@") and address.endswith(entry)) for entry in entries)
+    address = without_tag(to)
+    return any(address.endswith(entry) if entry.startswith("@") else address == without_tag(entry) for entry in entries)
 
 
 def resend_payload(config: dict, to: str, rendered: RenderedEmail) -> dict:

@@ -124,6 +124,17 @@ def test_an_allow_list_names_addresses_and_domains_and_none_means_anyone():
     assert not email_service.allowed_recipient("someone@else.org", "ana@example.com, @nowry.app")
 
 
+def test_an_entry_covers_every_plus_alias_of_its_mailbox_and_no_other():
+    listed = "ana@example.com, bo+team@example.com"
+    assert email_service.allowed_recipient("ana+anything@example.com", listed)
+    assert email_service.allowed_recipient("Ana+a+b@Example.com", listed)
+    assert email_service.allowed_recipient("bo@example.com", listed) and email_service.allowed_recipient("bo+other@example.com", listed)
+    assert not email_service.allowed_recipient("anab@example.com", listed)
+    assert not email_service.allowed_recipient("ana+x@other.org", listed)
+    assert not email_service.allowed_recipient("x+ana@example.com", listed)
+    assert email_service.allowed_recipient("me+tag@nowry.app", "@nowry.app")
+
+
 async def test_without_the_settings_nothing_is_sent_and_nothing_is_recorded(ledger, monkeypatch):
     monkeypatch.delenv("EMAIL_FROM_ACCOUNT")
     with patch.object(email_service.httpx, "AsyncClient") as client:
