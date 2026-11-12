@@ -53,19 +53,27 @@ async def require_admin(
     current_user: dict = Depends(get_firebase_user)
 ) -> dict:
     """
-    Verifies that the current user has is_admin=true in their MongoDB user document.
-    Raises HTTPException(403) if is_admin is missing or False.
+    Verifies that the current user's MongoDB document says ``is_admin: true``.
+
+    The flag is read from the account on every call (INVITE-001, ADR-077).
+    ``current_user`` is built from the Firebase token and never carries it, and
+    a token is cached for minutes: reading the document means a flag taken away
+    stops working at the next request. Anything but a stored ``True`` is 403.
 
     Usage in route:
       @router.get("/admin/reports")
       async def list_reports(current_user: dict = Depends(require_admin)):
-          # current_user is guaranteed to have is_admin=true
+          # the account behind current_user has is_admin=true
     """
-    if not current_user.get("is_admin"):
-        raise HTTPException(
-            status_code=403,
-            detail="Admin access required"
-        )
+    refusal = HTTPException(status_code=403, detail="Admin access required")
+    user_id = current_user.get("user_id")
+    if not user_id or not ObjectId.is_valid(user_id):
+        raise refusal
+    account = await users_collection.find_one(
+        {"_id": ObjectId(user_id), "deleted_at": None}, {"is_admin": 1}
+    )
+    if not account or account.get("is_admin") is not True:
+        raise refusal
     return current_user
 
 
