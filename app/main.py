@@ -55,6 +55,7 @@ from app.routers import (
     annual_planning,
     image_upload,
     auth,
+    account_email,
     public_content,
     moderation,
     blackboards,
@@ -169,6 +170,7 @@ app.add_middleware(
 
 app.include_router(health.router)  # Readiness for the uptime monitor
 app.include_router(auth.router)  # Firebase auth
+app.include_router(account_email.router)  # verification and reset emails (ADR-078)
 app.include_router(books.router)
 app.include_router(users.router)
 app.include_router(sessions.router)

@@ -20,6 +20,7 @@ PUBLIC = {
     "POST /beta/invites/check": "checked before the Firebase account exists (ADR-038)",
     "POST /beta/waitlist": "for people without an account (ADR-038)",
     "POST /contact": "the public contact form",
+    "POST /auth/email/password-reset": "asked for signed out; one answer whatever the address (ADR-078)",
     "POST /copyright-notices": "takedown notices come from rights holders (GTM-008)",
     "POST /stripe/webhook": "authenticated by Stripe's signature, not a user token",
     "POST /session/login": "deprecated, answers 410",
