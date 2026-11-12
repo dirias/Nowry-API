@@ -43,7 +43,11 @@ async def store_contact_message(payload: ContactMessageCreate, collection) -> Co
 @router.post("", response_model=ContactMessageResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
 async def submit_contact_message(request: Request, payload: ContactMessageCreate, background_tasks: BackgroundTasks) -> ContactMessageResponse:
-    """Store a message from the public contact form, then tell the mailbox (GTM-007). No auth; 5 per minute per address."""
+    """Store a message from the public contact form, then tell the mailbox (GTM-007). No auth; 5 per minute per address.
+
+    The notice's Reply-To is the sender's address (MAIL-001), validated by the model as an email.
+    """
     response = await store_contact_message(payload, contact_messages_collection)
-    background_tasks.add_task(notify, *contact_notification(contact_document(payload)))
+    doc = contact_document(payload)
+    background_tasks.add_task(notify, *contact_notification(doc), reply_to=doc["email"])
     return response

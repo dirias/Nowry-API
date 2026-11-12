@@ -44,6 +44,32 @@ async def test_with_the_settings_it_posts_to_resend(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_reply_address_is_sent_only_when_given(monkeypatch):
+    """MAIL-001: answering a contact notice answers the person, not the sender mailbox."""
+    _clear(monkeypatch)
+    for k, v in ENV.items():
+        monkeypatch.setenv(k, v)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(return_value=MagicMock(status_code=200, text="ok"))
+    with patch.object(notifications.httpx, "AsyncClient", return_value=client):
+        assert await notifications.notify("s", "t", reply_to=" ana@x.io ") is True
+        assert client.post.call_args.kwargs["json"]["reply_to"] == "ana@x.io"
+        for absent in (None, "", "   "):
+            assert await notifications.notify("s", "t", reply_to=absent) is True
+            assert "reply_to" not in client.post.call_args.kwargs["json"]
+
+
+def test_only_the_contact_notice_carries_a_reply_address():
+    """MAIL-001: the contact route passes the sender's address; the other three notices do not."""
+    routers = APP / "routers"
+    assert 'background_tasks.add_task(notify, *contact_notification(doc), reply_to=doc["email"])' in (routers / "contact.py").read_text()
+    for other in ("copyright.py", "moderation.py", "beta.py"):
+        assert "reply_to" not in (routers / other).read_text()
+
+
+@pytest.mark.asyncio
 async def test_a_failure_is_logged_and_never_raised(monkeypatch):
     _clear(monkeypatch)
     for k, v in ENV.items():

@@ -36,12 +36,18 @@ def notification_config() -> Optional[dict]:
     return {"key": key, "to": to, "from": sender}
 
 
-async def notify(subject: str, text: str) -> bool:
-    """Send one plain-text notification. True when Resend accepted it, False otherwise. Never raises."""
+async def notify(subject: str, text: str, reply_to: Optional[str] = None) -> bool:
+    """Send one plain-text notification. True when Resend accepted it, False otherwise. Never raises.
+
+    `reply_to` is the address a reply should reach (MAIL-001): the person who
+    wrote in, so answering the notice answers them and not the sender mailbox.
+    """
     config = notification_config()
     if config is None:
         return False
     payload = {"from": config["from"], "to": [config["to"]], "subject": subject[:200], "text": text[:20000]}
+    if reply_to and reply_to.strip():
+        payload["reply_to"] = reply_to.strip()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
