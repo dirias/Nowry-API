@@ -25,6 +25,7 @@ tasks_collection = db["tasks"]
 task_lists_collection = db["task_lists"]  # a task's list, named and owned (PLAN-021)
 bugs_collection = db["bugs"]
 contact_messages_collection = db["contact_messages"]  # the public contact form (SITE-006)
+invites_collection = db["invites"]  # personal invitations, one row per link; the token is stored hashed (ADR-077)
 waitlist_collection = db["waitlist"]  # the beta waitlist, one row per email (ADR-038)
 copyright_notices_collection = db["copyright_notices"]  # takedown notices (GTM-008)
 
@@ -221,6 +222,10 @@ async def create_indexes():
     await users_collection.create_index("username", unique=True)
     # ADR-077: a cohort code's uses are counted from the accounts it made.
     await users_collection.create_index("beta.invite_code", sparse=True)
+    # ADR-077: a personal invitation is found by its token's hash, and by address when a new one replaces it.
+    await invites_collection.create_index("token_hash", unique=True)
+    await invites_collection.create_index("email")
+    await invites_collection.create_index([("created_at", -1)])
 
     # Data indexes for performance
     await books_collection.create_index("user_id")

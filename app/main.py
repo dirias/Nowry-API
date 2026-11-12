@@ -73,6 +73,7 @@ from app.routers import (
     comments,
     contact,
     beta,
+    beta_admin,
     copyright,
     blocks,
     health,
@@ -198,6 +199,7 @@ app.include_router(sheets.router)         # Micro Sheets — CRUD /sheets
 app.include_router(goal_ai.router)        # Goal AI — POST /goal-ai/analyze (Pro-only)
 app.include_router(comments.router, prefix="/v1/comments", tags=["comments"])  # Text-anchored annotations
 app.include_router(contact.router)        # The public contact form — POST /contact (SITE-006)
+app.include_router(beta_admin.router)     # Personal invitations, admin-only (ADR-077)
 app.include_router(beta.router)           # The beta gate — GET /beta/config, invites, waitlist (ADR-038)
 app.include_router(copyright.router)      # Takedown notices — POST /copyright-notices (GTM-008)
 app.include_router(blocks.router)        # Blocks — the one object for time (PLAN-001, ADR-045)
