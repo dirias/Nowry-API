@@ -12,6 +12,7 @@ from app.auth.email_verification import session_is_cut, verification_update
 from app.config.firebase_config import verify_firebase_token
 from app.config.subscription_plans import SubscriptionTier
 from app.config.beta import INVITE_HEADER, gate_new_account
+from app.services.beta_invites import count_code_uses
 from app.models.User import USERNAME_MAX_LENGTH, sanitize_username
 from functools import lru_cache
 from typing import Optional
@@ -209,7 +210,7 @@ async def get_firebase_user(request: Request) -> dict:
             # being, for the email flow and the Google flow alike, so the beta
             # invite is enforced here. A refusal is raised before anything is
             # written; an existing account never reaches this branch.
-            beta_stamp: Optional[dict] = gate_new_account(request.headers.get(INVITE_HEADER))
+            beta_stamp: Optional[dict] = await gate_new_account(request.headers.get(INVITE_HEADER), count_code_uses)
             display_name: str = token_data.get("name") or ""
             email: str = token_data.get("email") or ""
             raw_username: str = display_name or (email.split("@")[0] if email else "user")

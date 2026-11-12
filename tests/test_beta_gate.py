@@ -41,17 +41,22 @@ NOW = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
 
 
 def _clear(monkeypatch):
-    for name in ("BETA_ACTIVE", "BETA_INVITE_REQUIRED", "BETA_UPGRADES_OPEN", "BETA_INVITE_CODES"):
+    for name in ("BETA_ACTIVE", "BETA_INVITE_REQUIRED", "BETA_UPGRADES_OPEN", "BETA_INVITE_CODES", "BETA_CODE_MAX_USES", "BETA_CODE_EXPIRES"):
         monkeypatch.delenv(name, raising=False)
 
 
 # ── 1. Unset means off ───────────────────────────────────────────────────────
 
 
-def test_unset_env_is_no_beta(monkeypatch):
+async def _no_count(code: str, ceiling: int) -> int:
+    raise AssertionError("a code without a ceiling is never counted")
+
+
+@pytest.mark.asyncio
+async def test_unset_env_is_no_beta(monkeypatch):
     _clear(monkeypatch)
     assert beta_config() == {"active": False, "invite_required": False, "upgrades_open": True}
-    assert gate_new_account("anything") is None
+    assert await gate_new_account("anything", _no_count) is None
     require_upgrades_open()  # does not raise
 
 
@@ -88,28 +93,31 @@ def test_invite_cohort_is_case_insensitive_and_strict(monkeypatch):
 # ── 3. The gate ──────────────────────────────────────────────────────────────
 
 
-def test_gate_refuses_a_new_account_without_a_code(monkeypatch):
+@pytest.mark.asyncio
+async def test_gate_refuses_a_new_account_without_a_code(monkeypatch):
     _clear(monkeypatch)
     monkeypatch.setenv("BETA_INVITE_REQUIRED", "true")
     monkeypatch.setenv("BETA_INVITE_CODES", "friends:c0-7f3a")
     for header in (None, "", "wrong"):
         with pytest.raises(HTTPException) as raised:
-            gate_new_account(header)
+            await gate_new_account(header, _no_count)
         assert raised.value.status_code == 403
         assert raised.value.detail == {"code": BETA_INVITE_REQUIRED_CODE}
 
 
-def test_gate_stamps_the_cohort_on_a_right_code(monkeypatch):
+@pytest.mark.asyncio
+async def test_gate_stamps_the_cohort_on_a_right_code(monkeypatch):
     _clear(monkeypatch)
     monkeypatch.setenv("BETA_INVITE_REQUIRED", "true")
     monkeypatch.setenv("BETA_INVITE_CODES", "friends:c0-7f3a,students:c1-9b2e")
-    assert gate_new_account("C1-9B2E", now=NOW) == {"cohort": "students", "invite_code": "c1-9b2e", "joined_at": NOW}
+    assert await gate_new_account("C1-9B2E", _no_count, now=NOW) == {"cohort": "students", "invite_code": "c1-9b2e", "joined_at": NOW}
 
 
-def test_gate_is_off_when_invites_are_not_required_even_with_codes_set(monkeypatch):
+@pytest.mark.asyncio
+async def test_gate_is_off_when_invites_are_not_required_even_with_codes_set(monkeypatch):
     _clear(monkeypatch)
     monkeypatch.setenv("BETA_INVITE_CODES", "friends:c0-7f3a")
-    assert gate_new_account(None) is None
+    assert await gate_new_account(None, _no_count) is None
 
 
 def test_provisioning_reads_the_gate_before_writing(monkeypatch):
@@ -118,7 +126,7 @@ def test_provisioning_reads_the_gate_before_writing(monkeypatch):
     from app.auth import firebase_auth
 
     source = inspect.getsource(firebase_auth.get_firebase_user)
-    gate_at = source.index("gate_new_account(request.headers.get(INVITE_HEADER))")
+    gate_at = source.index("await gate_new_account(request.headers.get(INVITE_HEADER), count_code_uses)")
     insert_at = source.index("users_collection.insert_one(new_user_doc)")
     assert gate_at < insert_at
     assert '"beta": beta_stamp' in source

@@ -219,6 +219,8 @@ async def create_indexes():
     await users_collection.create_index("firebase_uid", unique=True)
     await users_collection.create_index("email", unique=True)
     await users_collection.create_index("username", unique=True)
+    # ADR-077: a cohort code's uses are counted from the accounts it made.
+    await users_collection.create_index("beta.invite_code", sparse=True)
 
     # Data indexes for performance
     await books_collection.create_index("user_id")

@@ -24,6 +24,8 @@ class InviteCheckRequest(BaseModel):
 
 
 class InviteCheckResponse(BaseModel):
+    """`cohort` stays on the wire for earlier clients and is always null (ADR-077)."""
+
     valid: bool
     cohort: Optional[str] = None
 

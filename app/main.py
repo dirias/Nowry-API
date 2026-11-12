@@ -32,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from app.config.beta import describe_code_rules
 from app.config.database import create_indexes
 from app.core.limiter import limiter
 from app.core import langfuse_client as _langfuse_module
@@ -105,6 +106,9 @@ async def _flush_langfuse_queue() -> None:
 async def lifespan(app: FastAPI):
     # Startup
     await create_indexes()
+    # ADR-077: say what each cohort code is limited to, and shout about one whose limit cannot be read.
+    for line in describe_code_rules():
+        (logger.error if "UNREADABLE" in line else logger.info)("beta: %s", line)
     # [Phase 10] Pre-warm all 8 prompt templates into _prompt_cache and langfuse_cache.json.
     # Non-raising: falls back to core/prompts.py constants on any Langfuse error (D-07).
     await prompt_manager.prewarm()

@@ -2,7 +2,7 @@
 The beta gate's public endpoints (ADR-038, docs/prd-road-to-market.md FR-001, FR-002, FR-004).
 
     GET  /beta/config          the three flags, read once by every client
-    POST /beta/invites/check   is this code one of ours, and which cohort
+    POST /beta/invites/check   can this code still make an account
     POST /beta/waitlist        one row per email for the next cohort
 
 No auth on any of them: the config decides what a visitor sees, an invite is
@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, BackgroundTasks, Request, status
 from pymongo import ReturnDocument
 
-from app.config.beta import beta_config, invite_cohort
+from app.config.beta import beta_config, open_code_rule
 from app.config.database import waitlist_collection
 from app.core.limiter import limiter
 from app.models.Beta import (
@@ -30,6 +30,7 @@ from app.models.Beta import (
     WaitlistCreate,
     WaitlistResponse,
 )
+from app.services.beta_invites import count_code_uses
 from app.services.notifications import notify, waitlist_notification
 
 router = APIRouter(prefix="/beta", tags=["beta"])
@@ -80,9 +81,13 @@ async def get_beta_config() -> BetaConfigResponse:
 @router.post("/invites/check", response_model=InviteCheckResponse)
 @limiter.limit("10/minute")
 async def check_invite(request: Request, payload: InviteCheckRequest) -> InviteCheckResponse:
-    """Whether a code is one of ours. The register form asks before creating a Firebase account."""
-    cohort = invite_cohort(payload.code)
-    return InviteCheckResponse(valid=cohort is not None, cohort=cohort)
+    """Whether a code can still make an account. The register form asks before creating a Firebase account.
+
+    An unknown, full or expired code gets the same answer, and the cohort is
+    not named: the endpoint is public (ADR-077, FR-020).
+    """
+    rule = await open_code_rule(payload.code, count_code_uses)
+    return InviteCheckResponse(valid=rule is not None)
 
 
 @router.post("/waitlist", response_model=WaitlistResponse, status_code=status.HTTP_201_CREATED)
