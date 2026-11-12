@@ -145,7 +145,8 @@ async def send_email(
     if config is None:
         return UNCONFIGURED  # tests, a fresh checkout: nothing is sent and nothing is recorded
     email_class = KINDS[kind]["class"]
-    filled = {"email": to, "support": config["reply_to"] or config["from"], **values}
+    # "Questions:" names an address alone, never "Name <address>".
+    filled = {"email": to, "support": config["reply_to"] or parseaddr(config["from"])[1], **values}
     rendered = render_email(kind, locale, filled, logo_url=mark_url(), postal=_env("EMAIL_POSTAL_ADDRESS"))
     if not allowed_recipient(to, _env("EMAIL_ALLOWLIST")):
         outcome = NOT_ALLOWED

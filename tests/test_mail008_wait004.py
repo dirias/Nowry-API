@@ -134,6 +134,7 @@ async def test_a_new_address_is_sent_one_confirmation_with_its_leave_link_and_he
     assert payload["to"] == [ANA] and payload["from"] == "Didier de Nowry <hello@nowry.app>"  # the row's language
     assert payload["subject"] == "Estás en la lista de espera de Nowry"
     assert f"https://www.nowry.app/waitlist/leave/{token}" in payload["text"]
+    assert "hello@nowry.app" in payload["text"] and "<hello@nowry.app>" not in payload["text"]  # the footer names the address alone
     assert payload["headers"] == waitlist.unsubscribe_headers(f"https://api.nowry.app/beta/waitlist/leave/{token}")
     row = world.rows.rows[0]
     assert row["confirmation_sent_at"] == NOW and "confirmation_claimed_at" not in row
