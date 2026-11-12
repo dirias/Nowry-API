@@ -1,0 +1,34 @@
+{
+  "common": {
+    "or_open": "Oder öffne $link",
+    "questions": "Fragen: $support"
+  },
+  "account": {
+    "verify": {
+      "subject": "Bestätige deine E-Mail-Adresse für Nowry",
+      "before": [
+        "Hallo,",
+        "bestätige, dass diese Adresse dir gehört, und dein Nowry-Konto ist vollständig."
+      ],
+      "button": "E-Mail-Adresse bestätigen",
+      "after": [
+        "Wenn du kein Nowry-Konto erstellt hast, ignoriere diese E-Mail. Es passiert nichts, solange der Link nicht geöffnet wird."
+      ],
+      "signature": "Nowry",
+      "footer": "Gesendet an $email, weil mit dieser Adresse ein Nowry-Konto erstellt wurde."
+    },
+    "reset": {
+      "subject": "Setze dein Nowry-Passwort zurück",
+      "before": [
+        "Hallo,",
+        "jemand möchte das Passwort des Nowry-Kontos mit dieser Adresse zurücksetzen. Wenn du das warst, wähle hier ein neues:"
+      ],
+      "button": "Neues Passwort wählen",
+      "after": [
+        "Der Link funktioniert einmal und nur kurze Zeit. Wenn du das nicht warst, ignoriere diese E-Mail: Dein Passwort bleibt, wie es ist."
+      ],
+      "signature": "Nowry",
+      "footer": "Gesendet an $email, weil für diese Adresse ein neues Passwort angefordert wurde."
+    }
+  }
+}

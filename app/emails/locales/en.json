@@ -1,0 +1,34 @@
+{
+  "common": {
+    "or_open": "Or open $link",
+    "questions": "Questions: $support"
+  },
+  "account": {
+    "verify": {
+      "subject": "Confirm your email for Nowry",
+      "before": [
+        "Hi,",
+        "Confirm that this address is yours and your Nowry account is complete."
+      ],
+      "button": "Confirm my email",
+      "after": [
+        "If you didn't create a Nowry account, ignore this email. Nothing happens unless the link is opened."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email because this address was used to sign up for Nowry."
+    },
+    "reset": {
+      "subject": "Reset your Nowry password",
+      "before": [
+        "Hi,",
+        "Someone asked to reset the password for the Nowry account with this address. If it was you, choose a new one here:"
+      ],
+      "button": "Choose a new password",
+      "after": [
+        "The link works once and for a short time. If you didn't ask, ignore this email: your password stays as it is."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email because a password reset was requested for this address."
+    }
+  }
+}

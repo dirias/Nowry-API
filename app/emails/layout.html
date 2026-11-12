@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="$lang">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>$subject</title>
+<style>
+:root { color-scheme: light dark; }
+@media (prefers-color-scheme: dark) {
+  .bg { background-color: #023135 !important; }
+  .fg { color: #F6F1E8 !important; }
+  .muted { color: #CAC7BF !important; }
+  .rule { border-color: #245156 !important; }
+  .btn { background-color: #E7E2DA !important; }
+  .btn a { color: #023135 !important; }
+}
+</style>
+</head>
+<body class="bg" style="margin:0;padding:0;background-color:#FCFBF8;">
+<table role="presentation" class="bg" width="100%" cellpadding="0" cellspacing="0" style="background-color:#FCFBF8;">
+<tr><td align="center" style="padding:24px 16px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,'Hiragino Sans','Noto Sans JP',sans-serif;">
+<tr><td style="padding:0 0 20px;">
+<table role="presentation" cellpadding="0" cellspacing="0"><tr>
+<td style="padding:0 8px 0 0;"><img src="$logo_url" width="36" height="36" alt="Nowry" style="display:block;border:0;border-radius:8px;"></td>
+<td class="fg" style="font-size:18px;font-weight:700;color:#142023;">nowry</td>
+</tr></table>
+</td></tr>
+<tr><td class="fg" style="font-size:16px;line-height:1.55;color:#142023;">
+$blocks
+</td></tr>
+<tr><td class="muted rule" style="padding:14px 0 0;border-top:1px solid #DDD9D0;font-size:12px;line-height:1.5;color:#4A5558;">
+$footer
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

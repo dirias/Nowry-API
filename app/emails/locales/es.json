@@ -1,0 +1,34 @@
+{
+  "common": {
+    "or_open": "O abre $link",
+    "questions": "Dudas: $support"
+  },
+  "account": {
+    "verify": {
+      "subject": "Confirma tu correo para Nowry",
+      "before": [
+        "Hola:",
+        "Confirma que esta dirección es tuya y tu cuenta de Nowry quedará completa."
+      ],
+      "button": "Confirmar mi correo",
+      "after": [
+        "Si no creaste una cuenta en Nowry, ignora este correo. No pasa nada si nadie abre el enlace."
+      ],
+      "signature": "Nowry",
+      "footer": "Enviado a $email porque esta dirección se usó para registrarse en Nowry."
+    },
+    "reset": {
+      "subject": "Restablece tu contraseña de Nowry",
+      "before": [
+        "Hola:",
+        "Alguien pidió restablecer la contraseña de la cuenta de Nowry con esta dirección. Si fuiste tú, elige una nueva aquí:"
+      ],
+      "button": "Elegir una contraseña nueva",
+      "after": [
+        "El enlace funciona una sola vez y por poco tiempo. Si no lo pediste, ignora este correo: tu contraseña sigue igual."
+      ],
+      "signature": "Nowry",
+      "footer": "Enviado a $email porque se pidió restablecer la contraseña de esta dirección."
+    }
+  }
+}

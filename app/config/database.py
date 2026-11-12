@@ -62,6 +62,7 @@ comments_collection = db["comments"]
 # Per-user fixed-window rate limit counters (app/utils/rate_limit.py).
 # Shared across Uvicorn workers; buckets self-purge via a TTL on expires_at.
 rate_limits_collection = db["rate_limits"]
+email_sends_collection = db["email_sends"]  # the send ledger: kind, class, day, outcome; never an address (ADR-078)
 
 # Fork idempotency records — one per (content type, source, user) (ADR-005).
 content_forks_collection = db["content_forks"]
@@ -226,6 +227,9 @@ async def create_indexes():
     await invites_collection.create_index("token_hash", unique=True)
     await invites_collection.create_index("email")
     await invites_collection.create_index([("created_at", -1)])
+    # The email ledger (ADR-078): counted by day, kept 90 days. The quota row has no created_at and stays.
+    await email_sends_collection.create_index("day")
+    await email_sends_collection.create_index("created_at", expireAfterSeconds=90 * 24 * 3600)
 
     # Data indexes for performance
     await books_collection.create_index("user_id")

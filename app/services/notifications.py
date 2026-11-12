@@ -19,6 +19,8 @@ from typing import Optional
 
 import httpx
 
+from app.emails.budget import may_send, parse_budget
+from app.services import email_ledger
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +50,17 @@ async def notify(subject: str, text: str, reply_to: Optional[str] = None) -> boo
     payload = {"from": config["from"], "to": [config["to"]], "subject": subject[:200], "text": text[:20000]}
     if reply_to and reply_to.strip():
         payload["reply_to"] = reply_to.strip()
+    # ADR-078: notices stop at their share of the day so account email never finds it spent.
+    if not may_send("notice", await email_ledger.sent_today(), parse_budget(os.getenv("EMAIL_DAILY_BUDGET"))):
+        logger.warning("notify: over the day's share for notices; '%s' not sent", subject[:60])
+        await email_ledger.record("notice", "notice", "over_budget", "en", config["to"])
+        return False
+    sent = await _post_notice(config, payload, subject)
+    await email_ledger.record("notice", "notice", "sent" if sent else "failed", "en", config["to"])
+    return sent
+
+
+async def _post_notice(config: dict, payload: dict, subject: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -58,6 +71,7 @@ async def notify(subject: str, text: str, reply_to: Optional[str] = None) -> boo
         if response.status_code >= 300:
             logger.warning("notify: Resend answered %s: %s", response.status_code, response.text[:200])
             return False
+        await email_ledger.note_resend_count(response.headers.get("x-resend-daily-quota"))
         return True
     except Exception as exc:  # noqa: BLE001 - a failed notification must never fail the request
         logger.warning("notify: could not send '%s': %s", subject[:60], exc)
