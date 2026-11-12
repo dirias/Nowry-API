@@ -80,3 +80,12 @@ def report_notification(report: dict, report_id: str) -> tuple[str, str]:
         f"[Nowry] Content report: {report.get('reason', '')} on {report.get('content_type', '')} '{report.get('content_title', '')}'",
         f"Report {report_id}\nContent: {report.get('content_type', '')} {report.get('content_id', '')} — {report.get('content_title', '')}\nReason: {report.get('reason', '')}\nReporter: {report.get('reporter_email', '')} ({report.get('reporter_user_id', '')})\n\n{report.get('description') or ''}",
     )
+
+
+def waitlist_notification(doc: dict) -> tuple[str, str]:
+    """Subject and body for a new email on the beta waitlist (WAIT-001)."""
+    joined = doc.get("updated_at")
+    return (
+        f"[Nowry] Waitlist: {doc.get('email', '')}",
+        f"Email: {doc.get('email', '')}\nLocale: {doc.get('locale')}\nSource: {doc.get('source')}\nJoined: {joined.isoformat() if joined else ''}",
+    )

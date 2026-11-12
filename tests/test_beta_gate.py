@@ -35,7 +35,7 @@ from app.config.beta import (
     require_upgrades_open,
 )
 from app.models.Beta import WaitlistCreate
-from app.routers.beta import WAITLIST_ACK, join_waitlist, waitlist_document
+from app.routers.beta import WAITLIST_ACK, join_waitlist, upsert_waitlist, waitlist_document
 
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -155,6 +155,109 @@ def test_waitlist_rejects_out_of_bounds_fields(field, value):
     payload[field] = value
     with pytest.raises(ValidationError):
         WaitlistCreate(**payload)
+
+
+# ── 4b. The operator hears about a new email once (WAIT-001, FR-013) ─────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before, expected", [(None, True), ({"email": "ana@example.com"}, False)])
+async def test_upsert_says_whether_the_email_is_new(before, expected):
+    collection = MagicMock()
+    collection.find_one_and_update = AsyncMock(return_value=before)
+
+    doc, is_new = await upsert_waitlist(WaitlistCreate(email="Ana@Example.com", locale="es", source="/"), collection, now=NOW)
+
+    assert is_new is expected
+    assert doc["email"] == "ana@example.com" and doc["updated_at"] == NOW
+    # The row as it was before the write is what tells a first time from a repeat.
+    from pymongo import ReturnDocument
+
+    assert collection.find_one_and_update.call_args.kwargs["return_document"] == ReturnDocument.BEFORE
+
+
+def _waitlist_client(monkeypatch, before):
+    """A bare app carrying only the beta router, a fake collection and a recorded `notify`."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from slowapi import _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
+
+    import app.routers.beta as beta_module
+    from app.core.limiter import limiter
+
+    collection = MagicMock()
+    collection.find_one_and_update = AsyncMock(side_effect=before)
+    notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(beta_module, "waitlist_collection", collection)
+    monkeypatch.setattr(beta_module, "notify", notify)
+    limiter.reset()
+    api = FastAPI()
+    api.state.limiter = limiter
+    api.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    api.add_middleware(SlowAPIMiddleware)
+    api.include_router(beta_module.router)
+    return TestClient(api), notify
+
+
+WAITLIST_FORM = {"email": "Ana@Example.com", "locale": "es", "source": "/"}
+
+
+def test_a_new_email_notifies_once_and_a_repeat_does_not(monkeypatch):
+    client, notify = _waitlist_client(monkeypatch, before=[None, {"email": "ana@example.com"}, {"email": "ana@example.com"}])
+
+    first = client.post("/beta/waitlist", json=WAITLIST_FORM)
+    repeats = [client.post("/beta/waitlist", json=WAITLIST_FORM) for _ in range(2)]
+
+    assert notify.await_count == 1
+    subject, body = notify.await_args.args
+    assert subject == "[Nowry] Waitlist: ana@example.com"
+    for line in ("Email: ana@example.com", "Locale: es", "Source: /", "Joined: 20"):
+        assert line in body
+    # No enumeration: the visitor cannot tell a first time from a repeat.
+    for repeat in repeats:
+        assert (repeat.status_code, repeat.json(), repeat.headers["content-type"]) == (first.status_code, first.json(), first.headers["content-type"])
+    assert first.status_code == 201 and first.json() == {"message": WAITLIST_ACK}
+
+
+def test_a_notification_that_fails_is_logged_and_the_sign_up_still_succeeds(monkeypatch, caplog):
+    """The real `notify`, with Resend unreachable: 201, the row written, a warning in the log."""
+    import logging
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import app.routers.beta as beta_module
+    from app.core.limiter import limiter
+    from app.services import notifications
+
+    for name, value in {"RESEND_API_KEY": "re_test", "NOTIFY_TO_EMAIL": "ops@example.com", "NOTIFY_FROM_EMAIL": "Nowry <notify@nowry.app>"}.items():
+        monkeypatch.setenv(name, value)
+    collection = MagicMock()
+    collection.find_one_and_update = AsyncMock(return_value=None)
+    monkeypatch.setattr(beta_module, "waitlist_collection", collection)
+    monkeypatch.setattr(notifications.httpx, "AsyncClient", MagicMock(side_effect=RuntimeError("resend is down")))
+    limiter.reset()
+    api = FastAPI()
+    api.state.limiter = limiter
+    api.include_router(beta_module.router)
+
+    with caplog.at_level(logging.WARNING):
+        response = TestClient(api).post("/beta/waitlist", json=WAITLIST_FORM)
+
+    assert response.status_code == 201 and response.json() == {"message": WAITLIST_ACK}
+    collection.find_one_and_update.assert_awaited_once()
+    assert notifications.httpx.AsyncClient.called
+    assert any("notify: could not send" in record.getMessage() for record in caplog.records)
+
+
+def test_the_waitlist_notice_carries_what_the_operator_needs():
+    from app.services.notifications import waitlist_notification
+
+    subject, body = waitlist_notification({"email": "ana@example.com", "locale": "es", "source": "/register", "updated_at": NOW})
+    assert subject == "[Nowry] Waitlist: ana@example.com"
+    assert body == "Email: ana@example.com\nLocale: es\nSource: /register\nJoined: 2026-10-02T12:00:00+00:00"
 
 
 # ── 5. Closed upgrades ───────────────────────────────────────────────────────

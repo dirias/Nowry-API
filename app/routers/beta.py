@@ -9,11 +9,15 @@ No auth on any of them: the config decides what a visitor sees, an invite is
 checked before an account exists, and the waitlist is for people who were not
 let in. The two writes are rate-limited like `/contact`. The enforcement of
 the invite is not here; it is where accounts are created (`firebase_auth`).
+
+A first submission to the waitlist tells the operator's mailbox (WAIT-001,
+FR-013); a repeat tells no one. The visitor gets the same answer either way,
+so the form cannot be used to learn whether an address is on the list.
 """
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, BackgroundTasks, Request, status
 from pymongo import ReturnDocument
 
 from app.config.beta import beta_config, invite_cohort
@@ -26,6 +30,7 @@ from app.models.Beta import (
     WaitlistCreate,
     WaitlistResponse,
 )
+from app.services.notifications import notify, waitlist_notification
 
 router = APIRouter(prefix="/beta", tags=["beta"])
 
@@ -44,15 +49,25 @@ def waitlist_document(payload: WaitlistCreate, now: Optional[datetime] = None) -
     }
 
 
-async def join_waitlist(payload: WaitlistCreate, collection, now: Optional[datetime] = None) -> WaitlistResponse:
-    """Upsert by email so a second submission updates rather than duplicates."""
+async def upsert_waitlist(payload: WaitlistCreate, collection, now: Optional[datetime] = None) -> Tuple[Dict[str, Any], bool]:
+    """Upsert by email so a second submission updates rather than duplicates.
+
+    Returns the row's fields and whether the email is new. The update hands back
+    the row as it was before the write: none means this was the first time.
+    """
     doc = waitlist_document(payload, now)
-    await collection.find_one_and_update(
+    before = await collection.find_one_and_update(
         {"email": doc["email"]},
         {"$set": doc, "$setOnInsert": {"created_at": doc["updated_at"]}},
         upsert=True,
-        return_document=ReturnDocument.AFTER,
+        return_document=ReturnDocument.BEFORE,
     )
+    return doc, before is None
+
+
+async def join_waitlist(payload: WaitlistCreate, collection, now: Optional[datetime] = None) -> WaitlistResponse:
+    """Store the email and return the one acknowledgement every submission gets."""
+    await upsert_waitlist(payload, collection, now)
     return WaitlistResponse(message=WAITLIST_ACK)
 
 
@@ -72,6 +87,9 @@ async def check_invite(request: Request, payload: InviteCheckRequest) -> InviteC
 
 @router.post("/waitlist", response_model=WaitlistResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
-async def submit_waitlist(request: Request, payload: WaitlistCreate) -> WaitlistResponse:
-    """Store an email for the next cohort. No auth; 5 per minute per address."""
-    return await join_waitlist(payload, waitlist_collection)
+async def submit_waitlist(request: Request, payload: WaitlistCreate, background_tasks: BackgroundTasks) -> WaitlistResponse:
+    """Store an email for the next cohort; tell the mailbox when it is a new one. No auth; 5 per minute per address."""
+    doc, is_new = await upsert_waitlist(payload, waitlist_collection)
+    if is_new:
+        background_tasks.add_task(notify, *waitlist_notification(doc))
+    return WaitlistResponse(message=WAITLIST_ACK)
