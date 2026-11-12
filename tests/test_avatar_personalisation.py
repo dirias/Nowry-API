@@ -513,3 +513,10 @@ class TestDefaultSpeciesIsTheSpiral:
 
         assert "spiral" in SPECIES_PERSONALITY_HINTS
         assert "breathes" in ANIMATION_MOTION_PROMPTS["spiral"]
+
+
+def test_the_portrait_prompt_carries_nothing_about_the_account():
+    """GTM-017: no name, handle or initials go to the image service; the policy says it gets the companion's description."""
+    prompt, _seed = _build_avatar_prompt(build_user(username="Didier Irias"), 2)
+    assert "Didier" not in prompt and "Irias" not in prompt
+    assert "known only to" not in prompt and " DI" not in prompt

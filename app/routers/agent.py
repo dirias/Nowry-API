@@ -1071,7 +1071,6 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     interests = [_canonical_topic(i) for i in (general.get("interests") or [])[:MAX_AVATAR_TOPICS]]
     study_goal = general.get("study_goal") or "general"
     primary_topic = _canonical_topic(general.get("primary_topic"))
-    full_name = user_doc.get("username") or ""
     avatar_seed = pet.get("avatar_seed") or str(_uuid.uuid4())
 
     # Rank 1 shapes the creature; ranks 2-5 each add a single accent, so a
@@ -1106,10 +1105,6 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     # Topic scene — exact lookup on the canonical topic.
     scene = AVATAR_TOPIC_SCENES.get(primary_topic, "")
 
-    # Initials for uniqueness
-    name_parts = full_name.strip().split()
-    initials = "".join(p[0].upper() for p in name_parts if p)[:3] or "NW"
-
     # Build prompt
     parts_list = [
         f"a {stage_name} — {stage_desc} {species} companion",
@@ -1120,7 +1115,8 @@ def _build_avatar_prompt(user_doc: dict, stage: int) -> tuple[str, int]:
     ]
     if scene:
         parts_list.append(scene.strip(", "))
-    parts_list.append(f"a unique companion known only to {initials}")
+    # Nothing about the account goes to the image service: no name, no handle,
+    # no initials (GTM-017). Uniqueness comes from the per-companion seed.
     parts_list.append(AVATAR_STYLE_SUFFIX)
 
     prompt = ", ".join(p for p in parts_list if p)
