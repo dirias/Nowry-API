@@ -136,6 +136,9 @@ async def register_user(
             "status": "active"
         },
         "wizard_completed": False,
+        # ADR-076: what Firebase says of the email today, and how the account was made.
+        "email_verified": bool(firebase_user.get("email_verified")),
+        "signup_provider": firebase_user.get("sign_in_provider"),
         "preferences": {
             "pet": {
                 # New accounts start with the pet inactive; it auto-activates

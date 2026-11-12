@@ -416,7 +416,9 @@ async def invite_collaborator(
         raise HTTPException(status_code=403, detail="only_owner_can_invite")
 
     # Look up the invitee by email in the users collection (T-07-02-05 mitigation)
-    invitee = await db.users.find_one({"email": body.invitee_email})
+    # ADR-076: only an address its holder has proved. An unverified account
+    # answers as an unknown address does, so the answer tells nothing more.
+    invitee = await db.users.find_one({"email": body.invitee_email, "email_verified": True})
     if not invitee:
         raise HTTPException(status_code=404, detail="user_not_found")
 

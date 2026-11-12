@@ -321,8 +321,9 @@ async def test_invite_collaborator_success(mock_blackboards_collection, mock_fir
 
     assert result == {"ok": True}
     # Invitee is resolved by email, never trusted from the request body as an id.
+    # ADR-076: and only an account whose email Firebase has verified.
     mock_db.users.find_one.assert_awaited_once_with(
-        {"email": mock_invitation["invitee_email"]}
+        {"email": mock_invitation["invitee_email"], "email_verified": True}
     )
     filter_arg, update_arg = mock_db.blackboards.update_one.await_args.args
     assert filter_arg == {"_id": board["_id"]}

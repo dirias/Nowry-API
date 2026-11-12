@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import HTTPException, Header, Request, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pymongo.errors import DuplicateKeyError
+from app.auth.email_verification import session_is_cut, verification_update
 from app.config.firebase_config import verify_firebase_token
 from app.config.subscription_plans import SubscriptionTier
 from app.config.beta import INVITE_HEADER, gate_new_account
@@ -41,6 +42,29 @@ _CACHE_TTL = 300  # 5 minutes cache
 
 # HTTP Bearer for optional auth
 security = HTTPBearer(auto_error=False)
+
+
+# uid -> sessions_valid_after, for accounts whose older sessions were cut in
+# this process (ADR-076): a token cached before the cut is refused at once
+# here, and within the cache's five minutes on another process.
+_sessions_cut: dict = {}
+
+def _refuse_a_cut_session(valid_after, token_data: dict) -> None:
+    """401 when the token's sign-in is older than the account's cut (ADR-076)."""
+    if session_is_cut(valid_after, token_data):
+        raise HTTPException(status_code=401, detail="This session has ended. Sign in again.")
+
+
+async def _record_verification(users_collection, user: dict, token_data: dict) -> None:
+    """Store what Firebase says about the email, and cut older sessions when it calls for it (ADR-076)."""
+    update = verification_update(user, token_data)
+    if not update:
+        return
+    await users_collection.update_one({"_id": user["_id"]}, {"$set": update})
+    user.update(update)
+    if update.get("sessions_valid_after"):
+        _sessions_cut[token_data["firebase_uid"]] = update["sessions_valid_after"]
+        logger.warning("auth: a sign-in by %s verified an account made unverified; older sessions are cut", token_data.get("sign_in_provider"))
 
 
 def _get_cached_token(token: str) -> dict | None:
@@ -100,6 +124,7 @@ async def get_firebase_user(request: Request) -> dict:
     # Check cache first
     cached_data = _get_cached_token(token)
     if cached_data:
+        _refuse_a_cut_session(_sessions_cut.get(cached_data.get("firebase_uid")), cached_data)
         return cached_data
     
     try:
@@ -121,6 +146,9 @@ async def get_firebase_user(request: Request) -> dict:
             "email_verified": decoded_token.get("email_verified", False),
             "name": decoded_token.get("name"),
             "picture": decoded_token.get("picture"),
+            # ADR-076: who signed in and when, to tell an owner's sign-in from an earlier session.
+            "sign_in_provider": (decoded_token.get("firebase") or {}).get("sign_in_provider"),
+            "auth_time": decoded_token.get("auth_time"),
         }
 
         # --- Resolve MongoDB user_id ---
@@ -138,6 +166,12 @@ async def get_firebase_user(request: Request) -> dict:
         # Firebase account to whichever Nowry account holds that address.
         if not user and token_data.get("email") and token_data.get("email_verified"):
             user = await users_collection.find_one({"email": token_data["email"]})
+
+        if user:
+            # ADR-076: record the email's standing first, so the request that
+            # verifies an account also sets the mark older sessions fail.
+            await _record_verification(users_collection, user, token_data)
+            _refuse_a_cut_session(user.get("sessions_valid_after"), token_data)
 
         if user and not user.get("deleted_at"):
             # Normal path: active user doc found.
@@ -218,6 +252,9 @@ async def get_firebase_user(request: Request) -> dict:
                     "subscription_status_updated_at": now,
                 },
                 "wizard_completed": False,
+                # ADR-076: what Firebase says of the email today, and how the account was made.
+                "email_verified": bool(token_data.get("email_verified")),
+                "signup_provider": token_data.get("sign_in_provider"),
                 "beta": beta_stamp,  # ADR-038: cohort and code when the gate let them in
                 "preferences": {
                     "pet": {
@@ -369,6 +406,7 @@ async def optional_auth(
             "email_verified": decoded_token.get("email_verified", False),
             "name": decoded_token.get("name"),
             "picture": decoded_token.get("picture"),
+            "auth_time": decoded_token.get("auth_time"),
         }
         
         # Fetch MongoDB user ID
@@ -376,6 +414,9 @@ async def optional_auth(
         user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"]})
         
         if user:
+            # ADR-076: a session cut on this account is nobody here either.
+            if session_is_cut(user.get("sessions_valid_after"), token_data):
+                return None
             token_data["user_id"] = str(user["_id"])
         
         # Cache it
