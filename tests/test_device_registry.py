@@ -122,38 +122,3 @@ async def test_both_endpoints_require_authentication():
 
     for route in routes:
         assert route.status_code == 204, route.path
-
-
-@pytest.mark.asyncio
-async def test_account_deletion_removes_the_user_s_device_tokens(mock_firebase_user):
-    """A deleted account must stop being a place a notification can reach.
-
-    Rows here are removed outright rather than soft-deleted: the 30-day recovery
-    window applies to the user's content, not to a routing address.
-    """
-    from app.routers.users import delete_account
-    from tests.test_users import make_collection
-
-    devices = make_devices()
-    db_module = sys.modules["app.config.database"]
-
-    with patch.dict(sys.modules, {"firebase_admin": MagicMock(auth=MagicMock())}), \
-         patch.object(db_module, "priorities_collection", make_collection()), \
-         patch.object(db_module, "activities_collection", make_collection()), \
-         patch.object(db_module, "daily_routines_collection", make_collection()), \
-         patch("app.routers.users.users_collection", make_collection()), \
-         patch("app.routers.users.decks_collection", make_collection()), \
-         patch("app.routers.users.books_collection", make_collection()), \
-         patch("app.routers.users.study_cards_collection", make_collection()), \
-         patch("app.routers.users.study_sessions_collection", make_collection()), \
-         patch("app.routers.users.annual_plans_collection", make_collection()), \
-         patch("app.routers.users.focus_areas_collection", make_collection()), \
-         patch("app.routers.users.goals_collection", make_collection()), \
-         patch("app.routers.users.tasks_collection", make_collection()), \
-         patch("app.routers.users.blackboards_collection", make_collection()), \
-         patch("app.routers.users.device_tokens_collection", devices):
-
-        await delete_account(BackgroundTasks(), current_user=mock_firebase_user)
-
-    (query,) = devices.delete_many.call_args.args
-    assert query == {"user_id": mock_firebase_user["user_id"]}

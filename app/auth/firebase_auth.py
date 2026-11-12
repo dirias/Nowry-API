@@ -164,13 +164,16 @@ async def get_firebase_user(request: Request) -> dict:
         # Try by firebase_uid first, then fall back to email (covers the case where
         # Firebase deleted the user and re-issued a new UID on re-registration with
         # the same Google account — same email, different UID).
-        user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"]})
+        # ADR-081: a deleted account is never found here. Its identity was
+        # released when it was deleted, and the filter says so as well, so a
+        # sign-in with the same address is a new account that sees nothing old.
+        user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"], "deleted_at": None})
         # Only a verified email may claim an existing account (QA-008): the case
         # this serves is a Google account, whose email Firebase has verified.
         # An unverified email is anyone's word, and would have resolved a new
         # Firebase account to whichever Nowry account holds that address.
         if not user and token_data.get("email") and token_data.get("email_verified"):
-            user = await users_collection.find_one({"email": token_data["email"]})
+            user = await users_collection.find_one({"email": token_data["email"], "deleted_at": None})
 
         if user:
             # ADR-076: record the email's standing first, so the request that
@@ -178,31 +181,9 @@ async def get_firebase_user(request: Request) -> dict:
             await _record_verification(users_collection, user, token_data)
             _refuse_a_cut_session(user.get("sessions_valid_after"), token_data)
 
-        if user and not user.get("deleted_at"):
-            # Normal path: active user doc found.
-            token_data["user_id"] = str(user["_id"])
-        elif user and user.get("deleted_at"):
-            # Soft-deleted account: the user deleted their account but is signing
-            # back in with the same Google identity (same or new Firebase UID but
-            # same email).  Reactivate the existing document and update the
-            # firebase_uid to the current one — do NOT insert a new doc, which
-            # would hit the unique index on firebase_uid/email and raise a
-            # DuplicateKeyError (causing a 500).
-            now = datetime.now(timezone.utc)
-            await users_collection.update_one(
-                {"_id": user["_id"]},
-                {
-                    "$unset": {"deleted_at": "", "deleted_by": ""},
-                    "$set": {
-                        # Always sync firebase_uid in case it changed (new Firebase
-                        # account after hard-delete on the Firebase side).
-                        "firebase_uid": token_data["firebase_uid"],
-                        "photo_url": token_data.get("picture") or user.get("photo_url"),
-                        "wizard_completed": False,
-                        "updated_at": now,
-                    },
-                },
-            )
+        if user:
+            # Normal path: an active account. A deleted one is never read here
+            # (ADR-081): nothing brings it back on its own.
             token_data["user_id"] = str(user["_id"])
         else:
             # Valid Firebase token but no MongoDB document — first-time sign-in
@@ -285,65 +266,79 @@ async def get_firebase_user(request: Request) -> dict:
                 result = await users_collection.insert_one(new_user_doc)
                 token_data["user_id"] = str(result.inserted_id)
             except DuplicateKeyError:
-                # A unique index (firebase_uid/email/username) collided with an
-                # already-existing active user document. This happens when:
-                #   - two concurrent first-login requests race the insert, or
-                #   - the token's uid/email no longer matches the stored doc
-                #     (e.g. re-auth issued a new uid for the same email).
-                # Recover instead of 500ing: re-fetch the real existing doc by
-                # email (most reliable unique key here) and sync firebase_uid
-                # onto it so this and future logins resolve correctly.
-                #
-                # By email only when Firebase has verified it (QA-008): this
-                # branch re-points the account at the caller's uid, so an
-                # unverified address would hand someone else's account over.
-                #
-                # The same uid is the race above (sign-up's /users/me and
-                # /auth/register both provision), not a claim: a brand-new
-                # email account is always unverified, so refusing it broke
-                # every email sign-up (found by the QA-010 end-to-end run).
-                if email and not token_data.get("email_verified"):
-                    holder = await users_collection.find_one({"email": email}, {"firebase_uid": 1})
-                    if holder and holder.get("firebase_uid") != token_data["firebase_uid"]:
-                        raise HTTPException(
-                            status_code=409,
-                            detail={"code": "email_unverified"},
+                # ADR-081: a record deleted before its identity was released at
+                # deletion still holds this address or sign-in id. Release it
+                # now and make the new account; the old one stays deleted.
+                stale = await users_collection.find_one({
+                    "$or": [{"email": email}, {"firebase_uid": token_data["firebase_uid"]}],
+                    "deleted_at": {"$ne": None},
+                })
+                if stale:
+                    from app.services.account_deletion import release_identity
+
+                    await release_identity(stale, stale["deleted_at"], keep_existing=True)
+                    result = await users_collection.insert_one(new_user_doc)
+                    token_data["user_id"] = str(result.inserted_id)
+                if "user_id" not in token_data:
+                    # A unique index (firebase_uid/email/username) collided with an
+                    # already-existing active user document. This happens when:
+                    #   - two concurrent first-login requests race the insert, or
+                    #   - the token's uid/email no longer matches the stored doc
+                    #     (e.g. re-auth issued a new uid for the same email).
+                    # Recover instead of 500ing: re-fetch the real existing doc by
+                    # email (most reliable unique key here) and sync firebase_uid
+                    # onto it so this and future logins resolve correctly.
+                    #
+                    # By email only when Firebase has verified it (QA-008): this
+                    # branch re-points the account at the caller's uid, so an
+                    # unverified address would hand someone else's account over.
+                    #
+                    # The same uid is the race above (sign-up's /users/me and
+                    # /auth/register both provision), not a claim: a brand-new
+                    # email account is always unverified, so refusing it broke
+                    # every email sign-up (found by the QA-010 end-to-end run).
+                    if email and not token_data.get("email_verified"):
+                        holder = await users_collection.find_one({"email": email, "deleted_at": None}, {"firebase_uid": 1})
+                        if holder and holder.get("firebase_uid") != token_data["firebase_uid"]:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={"code": "email_unverified"},
+                            )
+                    existing = await users_collection.find_one({"email": email, "deleted_at": None}) if email else None
+                    if not existing:
+                        existing = await users_collection.find_one(
+                            {"firebase_uid": token_data["firebase_uid"], "deleted_at": None}
                         )
-                existing = await users_collection.find_one({"email": email}) if email else None
-                if not existing:
-                    existing = await users_collection.find_one(
-                        {"firebase_uid": token_data["firebase_uid"]}
-                    )
-                if existing:
-                    if existing.get("firebase_uid") != token_data["firebase_uid"]:
-                        await users_collection.update_one(
-                            {"_id": existing["_id"]},
-                            {
-                                "$set": {
-                                    "firebase_uid": token_data["firebase_uid"],
-                                    "updated_at": now,
-                                }
-                            },
+                    if existing:
+                        if existing.get("firebase_uid") != token_data["firebase_uid"]:
+                            await users_collection.update_one(
+                                {"_id": existing["_id"]},
+                                {
+                                    "$set": {
+                                        "firebase_uid": token_data["firebase_uid"],
+                                        "updated_at": now,
+                                    }
+                                },
+                            )
+                        token_data["user_id"] = str(existing["_id"])
+                    else:
+                        # No matching doc by email/uid — this was a genuine
+                        # username collision between two different accounts that
+                        # happen to share a display name. Disambiguate and retry
+                        # once rather than 500ing on a brand-new sign-up.
+                        # Truncated: `username` is already sanitized to at most
+                        # USERNAME_MAX_LENGTH chars, but appending "-{uid[:6]}"
+                        # could otherwise push the result past that limit.
+                        new_user_doc["username"] = (
+                            f"{username}-{token_data['firebase_uid'][:6]}"[:USERNAME_MAX_LENGTH]
                         )
-                    token_data["user_id"] = str(existing["_id"])
-                else:
-                    # No matching doc by email/uid — this was a genuine
-                    # username collision between two different accounts that
-                    # happen to share a display name. Disambiguate and retry
-                    # once rather than 500ing on a brand-new sign-up.
-                    # Truncated: `username` is already sanitized to at most
-                    # USERNAME_MAX_LENGTH chars, but appending "-{uid[:6]}"
-                    # could otherwise push the result past that limit.
-                    new_user_doc["username"] = (
-                        f"{username}-{token_data['firebase_uid'][:6]}"[:USERNAME_MAX_LENGTH]
-                    )
-                    try:
-                        result = await users_collection.insert_one(new_user_doc)
-                        token_data["user_id"] = str(result.inserted_id)
-                    except DuplicateKeyError:
-                        # Still colliding (e.g. firebase_uid/email race resolved
-                        # elsewhere in the meantime) — surface the failure.
-                        raise
+                        try:
+                            result = await users_collection.insert_one(new_user_doc)
+                            token_data["user_id"] = str(result.inserted_id)
+                        except DuplicateKeyError:
+                            # Still colliding (e.g. firebase_uid/email race resolved
+                            # elsewhere in the meantime) — surface the failure.
+                            raise
 
         # ADR-077: a personal invitation now belongs to the account it made.
         await settle_personal_invite(beta_stamp, token_data["user_id"], token_data["firebase_uid"])
@@ -426,7 +421,10 @@ async def optional_auth(
         
         # Fetch MongoDB user ID
         from app.config.database import users_collection
-        user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"]})
+        # ADR-081: a deleted account is never found here. Its identity was
+        # released when it was deleted, and the filter says so as well, so a
+        # sign-in with the same address is a new account that sees nothing old.
+        user = await users_collection.find_one({"firebase_uid": token_data["firebase_uid"], "deleted_at": None})
         
         if user:
             # ADR-076: a session cut on this account is nobody here either.

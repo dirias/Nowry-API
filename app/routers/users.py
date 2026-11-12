@@ -1159,31 +1159,28 @@ async def delete_account(
     current_user: dict = Depends(get_firebase_user),
 ):
     """
-    Soft delete user account and all associated data.
-    Data can be recovered within 30 days before permanent deletion.
+    Delete the account (ADR-081, FR-029).
 
-    The account's images are not recoverable content: every media ledger row
-    of the account is swept from storage after the response (ADR-062 point 2),
-    orphans from before the ledger included, best effort and logged.
+    Every row the account owns is marked at once and erased by the database 30
+    days later, the account record included (`app/services/account_deletion.py`
+    holds the one list). The account's email, username and sign-in id are
+    released at once, so the address can sign up again the same day as a new
+    account that never sees the old rows. Removed at once: notification tokens,
+    the place on other people's boards, stored images (swept after the
+    response), the Firebase sign-in and the Stripe customer. Nothing is
+    restored on its own; a mistake is handled by support within the 30 days.
 
-    Order per D-08: MongoDB soft-deletes are committed FIRST, then Firebase
-    credentials are revoked. Firebase deletion failure is caught and logged
-    (MongoDB is source of truth).
+    Order per D-08: every MongoDB write is committed FIRST, then Firebase and
+    Stripe are told. Their failures are logged and never undo the deletion.
     """
-    from app.config.database import (
-        priorities_collection,
-        activities_collection,
-        daily_routines_collection,
-    )
+    from app.services import account_deletion
 
     user_id = current_user.get("user_id")
     firebase_uid: str = current_user.get("firebase_uid", "")
     now = datetime.now(timezone.utc)
 
     # 0. Guard: block deletion if user has public decks or books.
-    #    The Browse/Fork feature (Phase 6) will create community dependencies on
-    #    public content — deleting without unpublishing first would break those.
-    #    Users must unpublish manually before deleting their account.
+    #    Other people may have copied them; unpublishing is the person's choice.
     public_deck_count = await decks_collection.count_documents(
         {"user_id": user_id, "is_public": True, "deleted_at": None}
     )
@@ -1199,136 +1196,30 @@ async def delete_account(
             ),
         )
 
-    # 1. Soft delete user account
-    user_update = await users_collection.update_one(
-        {"_id": ObjectId(user_id)},
-        {
-            "$set": {
-                "deleted_at": now,
-                "deleted_by": user_id,
-                "updated_at": now
-            }
-        }
-    )
-    
-    if user_update.matched_count == 0:
+    user = await users_collection.find_one({"_id": ObjectId(user_id), "deleted_at": None})
+    if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # 2. Cascade soft delete to all user content
-    soft_delete_update = {
-        "$set": {
-            "deleted_at": now,
-            "deleted_by": user_id,
-            "is_public": False,  # Auto-unpublish
-            "updated_at": now
-        }
-    }
-    
-    # Books (and their public metadata)
-    await books_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-    
-    # Decks (and auto-unpublish)
-    await decks_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-    
-    # Study Cards
-    await study_cards_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
 
-    # Study Sessions (performance history)
-    await study_sessions_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        {"$set": {"deleted_at": now, "deleted_by": user_id, "updated_at": now}}
-    )
+    # 1. Every owned row, marked; the database erases them 30 days from now.
+    marked = await account_deletion.mark_everything(user_id, now)
+    logger.info("account deletion: rows marked per collection: %s", {k: v for k, v in marked.items() if v})
 
-    # Annual Plans
-    plans_cursor = annual_plans_collection.find({"user_id": user_id, "deleted_at": None})
-    plans = await plans_cursor.to_list(length=100)
-    plan_ids = [str(p["_id"]) for p in plans]
-    
-    await annual_plans_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-    
-    if plan_ids:
-        # Focus Areas
-        areas_cursor = focus_areas_collection.find({"annual_plan_id": {"$in": plan_ids}, "deleted_at": None})
-        areas = await areas_cursor.to_list(length=300)
-        area_ids = [str(a["_id"]) for a in areas]
-        
-        await focus_areas_collection.update_many(
-            {"annual_plan_id": {"$in": plan_ids}, "deleted_at": None},
-            soft_delete_update
-        )
-        
-        if area_ids:
-            # Goals
-            goals_cursor = goals_collection.find({"focus_area_id": {"$in": area_ids}, "deleted_at": None})
-            goals = await goals_cursor.to_list(length=1000)
-            goal_ids = [str(g["_id"]) for g in goals]
-            
-            await goals_collection.update_many(
-                {"focus_area_id": {"$in": area_ids}, "deleted_at": None},
-                soft_delete_update
-            )
-            
-            # Priorities
-            await priorities_collection.update_many(
-                {"focus_area_id": {"$in": area_ids}, "deleted_at": None},
-                soft_delete_update
-            )
-            
-            if goal_ids:
-                # Activities
-                await activities_collection.update_many(
-                    {"goal_id": {"$in": goal_ids}, "deleted_at": None},
-                    soft_delete_update
-                )
-    
-    # Tasks
-    await tasks_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-
-    # Daily Routines
-    await daily_routines_collection.update_many(
-        {"user_id": user_id, "deleted_at": None},
-        soft_delete_update
-    )
-
-    # Blackboards — owned boards are soft-deleted; the deleted user is also
-    # pulled from every OTHER board's collaborators array so no stale reference
-    # lingers on someone else's shared board. Blackboard has no is_public field,
-    # so soft_delete_update is deliberately not reused here.
-    await blackboards_collection.update_many(
-        {"owner_user_id": user_id, "deleted_at": None},
-        {"$set": {"deleted_at": now, "deleted_by": user_id, "updated_at": now}}
-    )
-
+    # 2. Gone at once: the person's place on other people's boards, and their
+    #    phones' notification addresses (a routing address, not content).
     await blackboards_collection.update_many(
         {"collaborators": user_id},
         {"$pull": {"collaborators": user_id}, "$set": {"updated_at": now}}
     )
-
-    # Push targets — removed outright, not soft-deleted. A token is a routing
-    # address, not content: leaving one for the recovery window would leave a
-    # deleted account reachable by a notification.
     await device_tokens_collection.delete_many({"user_id": user_id})
 
     # Stored images — every ledger row of the account, swept after the response.
     await media_ledger.condemn_for({"user_id": user_id}, f"user {user_id}")  # durable before the response (ADR-065)
     background_tasks.add_task(media_ledger.sweep_user, user_id)
 
-    # 3. Revoke Firebase credentials AFTER all MongoDB soft-deletes (D-08)
+    # 3. The account record last: marked, and its identity released (ADR-081 point 5).
+    await account_deletion.release_identity(user, now)
+
+    # 4. Revoke Firebase credentials AFTER all MongoDB writes (D-08)
     if firebase_uid:
         try:
             from firebase_admin import auth as firebase_auth_sdk
@@ -1348,9 +1239,12 @@ async def delete_account(
                 exc,
             )
 
+    # 5. The Stripe customer, which holds the email (ADR-081 point 4). Never raises.
+    await account_deletion.delete_stripe_customer(user.get("stripe_customer_id"))
+
     return AccountDeleteResponse(
-        message="Account deleted successfully. Your data will be retained for 30 days before permanent removal.",
-        recovery_deadline=(now + timedelta(days=30)).isoformat(),
+        message="Your account is deleted. Everything in it is erased after 30 days.",
+        recovery_deadline=(now + timedelta(days=account_deletion.RETENTION_DAYS)).isoformat(),
     )
 
 

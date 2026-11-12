@@ -368,17 +368,12 @@ async def create_indexes():
     await sheets_collection.create_index("user_id")
     await sheets_collection.create_index("updated_at")
 
-    _collection_ttl_map = [
-        ("books",         books_collection),
-        ("decks",         decks_collection),
-        ("cards",         cards_collection),
-        ("tasks",         tasks_collection),
-        ("annual_plans",  annual_plans_collection),
-        ("goals",         goals_collection),
-        ("sheets",        sheets_collection),
-        ("blackboards",   blackboards_collection),
-        ("comments",      comments_collection),
-    ]
+    # ADR-081: every collection an account owns, its plan's children and the
+    # account record expire 30 days after they are marked deleted. The list
+    # lives with the deletion that marks them, so the two cannot drift.
+    from app.services.account_deletion import EXPIRING
+
+    _collection_ttl_map = [(name, db[name]) for name in EXPIRING]
 
     for collection_name, collection in _collection_ttl_map:
         existing_indexes = await collection.index_information()

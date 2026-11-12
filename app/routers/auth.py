@@ -76,11 +76,13 @@ async def register_user(
         )
     
     # Check if user already exists
+    # ADR-081: a deleted account is not "existing"; its identity was released.
     existing_user = await users_collection.find_one({
         "$or": [
             {"firebase_uid": request.firebase_uid},
             {"email": request.email}
-        ]
+        ],
+        "deleted_at": None,
     })
     
     if existing_user:
