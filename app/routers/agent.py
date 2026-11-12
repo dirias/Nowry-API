@@ -36,6 +36,7 @@ from pydantic.alias_generators import to_camel
 
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import cards_collection, decks_collection, study_sessions_collection, users_collection
+from app.config.entitlements import ACCESS_PROJECTION, access_limit, resolve_access
 from app.config.subscription_plans import (
     AGENT_MODELS,
     SUBSCRIPTION_PLANS,
@@ -281,11 +282,7 @@ class NudgeResponse(BaseModel):
 
 def _resolve_tier(user: dict) -> SubscriptionTier:
     """Extract the subscription tier from the user document safely."""
-    raw_tier = user.get("subscription", {}).get("tier", "free")
-    try:
-        return SubscriptionTier(raw_tier)
-    except ValueError:
-        return SubscriptionTier.FREE
+    return resolve_access(user).plan
 
 
 def _get_agent_prefs(user: dict) -> tuple[bool, bool, CompanionStyle]:
@@ -1611,7 +1608,7 @@ async def grant_xp(user_id: str, amount: int) -> dict:
         user_doc = await users_collection.find_one(
             {"_id": ObjectId(user_id)},
             {"agent.xp": 1, "preferences.pet.avatar_url": 1,
-             "preferences.pet.stage_avatars": 1, "subscription.tier": 1},
+             "preferences.pet.stage_avatars": 1, **ACCESS_PROJECTION},
         )
         xp_before: int = (user_doc or {}).get("agent", {}).get("xp", 0) if user_doc else 0
         level_before: int = _calculate_level(xp_before)
@@ -2994,8 +2991,7 @@ async def get_agent_state(
         raise HTTPException(status_code=404, detail="User not found")
 
     tier = _resolve_tier(user)
-    plan = SUBSCRIPTION_PLANS[tier]
-    messages_limit: int = plan["limits"]["agent_messages_per_month"]
+    messages_limit: int = access_limit(resolve_access(user), "agent_messages_per_month")
 
     agent_data = user.get("agent", {})
     cards_reviewed: int = user.get("stats", {}).get("total_cards_reviewed", 0)
@@ -3670,7 +3666,7 @@ async def chat(
 
     tier = _resolve_tier(user)
     plan_features = SUBSCRIPTION_PLANS[tier]["features"]
-    messages_limit: int = SUBSCRIPTION_PLANS[tier]["limits"]["agent_messages_per_month"]
+    messages_limit: int = access_limit(resolve_access(user), "agent_messages_per_month")
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
 
     # Atomic message cap enforcement (race-condition safe — replaces non-atomic read-check-write)

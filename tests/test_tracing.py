@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sys
 
-from tests._stubs import stub_if_missing, use_stub_if_missing
+from tests._stubs import stub_if_missing, use_stub_if_missing, stored_access
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1037,7 +1037,7 @@ async def test_generate_tts_happy_path_traces_tts_amagic(mock_langfuse_client):
         mock_books_collection.find_one = AsyncMock(return_value=fake_book)
 
         response = await tts_module.generate_tts(
-            book_id="abc123", body=body, tier="pro", current_user=current_user
+            book_id="abc123", body=body, tier="pro", access=stored_access("pro"), current_user=current_user
         )
 
     assert response.body == b"fake-mp3-bytes"
@@ -1082,7 +1082,7 @@ async def test_generate_tts_langfuse_unreachable(broken_langfuse_client, caplog)
 
         with caplog.at_level(logging.WARNING):
             response = await tts_module.generate_tts(
-                book_id="abc123", body=body, tier="pro", current_user=current_user
+                book_id="abc123", body=body, tier="pro", access=stored_access("pro"), current_user=current_user
             )
 
     assert response.body == b"fake-mp3-bytes"

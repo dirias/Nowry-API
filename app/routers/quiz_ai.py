@@ -45,6 +45,7 @@ from app.config.database import (
     decks_collection,
     users_collection,
 )
+from app.config.entitlements import ACCESS_PROJECTION, effective_tier, resolve_access
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from app.core.limiter import limiter
 from app.models.book_generation import (
@@ -90,11 +91,7 @@ _LANGUAGE_NAMES: dict[str, str] = {
 
 def _resolve_tier(user: dict) -> SubscriptionTier:
     """Extract the SubscriptionTier from a user document safely."""
-    raw_tier: str = user.get("subscription", {}).get("tier", "free")
-    try:
-        return SubscriptionTier(raw_tier)
-    except ValueError:
-        return SubscriptionTier.FREE
+    return resolve_access(user).plan
 
 
 def _resolve_question_count(
@@ -378,13 +375,13 @@ async def start_ai_quiz_session(
     # Fetch user for preference resolution (subscription tier read from this doc — single source)
     user_doc = await users_collection.find_one(
         {"_id": ObjectId(user_id)},
-        {"subscription": 1, "preferences.agent.ai_quiz_question_count": 1},
+        {**ACCESS_PROJECTION, "preferences.agent.ai_quiz_question_count": 1},
     )
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
 
     # Single tier source: derived from the already-fetched user_doc (CR-02, CR-03)
-    tier: str = user_doc.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(user_doc)
     effective_count: int = _resolve_question_count(body.question_count, user_doc, tier)
 
     # Validate tier before calling _generate_questions (fail-fast)

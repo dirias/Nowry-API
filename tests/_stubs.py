@@ -72,3 +72,10 @@ def fake_request():
 
     scope = {"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 0), "query_string": b""}
     return Request(scope)
+
+
+def stored_access(tier: str):
+    """The access of an account answered by its stored plan, for handlers called directly (ADR-079)."""
+    from app.config.entitlements import Access
+
+    return Access(tier=tier, source="free" if tier == "free" else "paid", paid_tier=tier)

@@ -23,10 +23,10 @@ from google.auth import exceptions as google_auth_exceptions
 from google.cloud import texttospeech
 
 from app.ai_orchestrator.llm_clients.tts_client import get_tts_client
-from app.auth.dependencies import get_subscription_tier
+from app.auth.dependencies import get_access, get_subscription_tier
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import books_collection, users_collection
-from app.config.subscription_plans import plan_limit
+from app.config.entitlements import Access, access_limit
 from app.models.tts import TextSegment, TTSRequest
 from app.services.tts.audio_stitching import concatenate_mp3_segments
 from app.services.tts.segmentation import segment_text
@@ -144,6 +144,7 @@ async def generate_tts(
     body: TTSRequest,
     tier: str = Depends(get_subscription_tier),
     current_user: dict = Depends(get_firebase_user),
+    access: Access = Depends(get_access),
 ) -> Response:
     """Generate TTS audio for a book section or full book text.
 
@@ -214,7 +215,7 @@ async def generate_tts(
         detail=_TTS_RATE_LIMIT_DETAIL,
     )
     # ADR-041 fair use, after the access checks so a bad id or a stranger's book keeps its 400/404.
-    await reserve_tts_characters(user_id, len(body.text or ""), plan_limit(tier, "tts_chars_per_month"))
+    await reserve_tts_characters(user_id, len(body.text or ""), access_limit(access, "tts_chars_per_month"))
 
     # Pro-only language override; Plus always uses en-US (T-6-02 mitigation)
     language_code: str = body.language_code if tier == "pro" else "en-US"

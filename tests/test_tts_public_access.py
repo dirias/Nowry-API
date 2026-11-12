@@ -13,6 +13,7 @@ real assertion rather than a restatement of the mock's return value.
 """
 from __future__ import annotations
 
+from tests._stubs import stored_access
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -162,7 +163,7 @@ async def _call(book_id, user_id: str, tier: str = "plus"):
     return await tts_module.generate_tts(
         book_id=str(book_id),
         body=TTSRequest(text="Hello world", language_code="en-US"),
-        tier=tier,
+        tier=tier, access=stored_access(tier),
         current_user={"user_id": user_id},
     )
 
@@ -272,7 +273,7 @@ async def test_pro_owner_keeps_language_override(fake_books, fake_tts_client):
         await tts_module.generate_tts(
             book_id=str(PRIVATE_BOOK_ID),
             body=TTSRequest(text="Bonjour", language_code="fr-FR"),
-            tier="pro",
+            tier="pro", access=stored_access("pro"),
             current_user={"user_id": OWNER_ID},
         )
         pro_kwargs = mock_texttospeech.VoiceSelectionParams.call_args.kwargs
@@ -280,7 +281,7 @@ async def test_pro_owner_keeps_language_override(fake_books, fake_tts_client):
         await tts_module.generate_tts(
             book_id=str(PRIVATE_BOOK_ID),
             body=TTSRequest(text="Bonjour", language_code="fr-FR"),
-            tier="plus",
+            tier="plus", access=stored_access("plus"),
             current_user={"user_id": OWNER_ID},
         )
         plus_kwargs = mock_texttospeech.VoiceSelectionParams.call_args.kwargs

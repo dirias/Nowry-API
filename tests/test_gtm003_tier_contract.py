@@ -115,7 +115,7 @@ async def test_no_ceiling_means_no_condition():
     users = _users({"tier": "pro", "ai_usage_count": 5000, "ai_usage_reset_date": OPEN_UNTIL},
                    updated={"_id": ObjectId(USER), "subscription": {"tier": "pro"}})
     with patch.object(dependencies, "users_collection", users), patch.dict(dependencies.__dict__, {}):
-        with patch("app.config.subscription_plans.AI_USAGE_LIMITS", {**AI_USAGE_LIMITS, SubscriptionTier.PRO: -1}):
+        with patch.object(dependencies, "access_limit", return_value=-1):
             await dependencies.track_ai_usage({"user_id": USER})
     assert "$or" not in users.find_one_and_update.call_args[0][0]
 

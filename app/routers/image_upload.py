@@ -18,10 +18,10 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.auth.dependencies import get_subscription_tier
+from app.auth.dependencies import get_access
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import books_collection
-from app.config.subscription_plans import plan_limit
+from app.config.entitlements import Access, access_limit
 from app.models.common import MessageResponse
 from app.utils import media_ledger
 from app.utils.logger import get_logger
@@ -93,9 +93,9 @@ async def require_own_book(book_id: str, user_id: str) -> dict:
     return book
 
 
-async def require_image_quota(user_id: str, tier: str) -> None:
+async def require_image_quota(user_id: str, access: Access) -> None:
     """402 when the account has stored as many images this month as its plan allows."""
-    limit = plan_limit(tier, "images_per_month")
+    limit = access_limit(access, "images_per_month")
     if limit < 0:
         return
     if await media_ledger.count_this_month(user_id) >= limit:
@@ -129,13 +129,13 @@ async def upload_image(
     file: UploadFile = File(...),
     book_id: str = Form(...),
     current_user: dict = Depends(get_firebase_user),
-    tier: str = Depends(get_subscription_tier),
+    access: Access = Depends(get_access),
 ) -> ImageUploadResponse:
     """Store an image under the caller's book and record it in the media ledger."""
     user_id = current_user.get("user_id")
     validate_image_file(file)
     await require_own_book(book_id, user_id)
-    await require_image_quota(user_id, tier)
+    await require_image_quota(user_id, access)
     file_content = await read_bounded_upload(file, MAX_FILE_SIZE)
     require_image_bytes(file_content)
 

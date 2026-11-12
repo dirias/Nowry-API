@@ -10,6 +10,7 @@ from bson import ObjectId
 from datetime import datetime, timezone
 from pymongo.errors import DuplicateKeyError
 
+from app.config.entitlements import access_fields, resolve_access
 from app.config.database import users_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.config.subscription_plans import SubscriptionTier
@@ -207,5 +208,8 @@ async def login_user(
         "username": user.get("username"),
         "role": user.get("role", "user"),
         "wizard_completed": user.get("wizard_completed", False),
-        "subscription": user.get("subscription", {"tier": "free", "status": "active"})
+        "subscription": {
+            **(user.get("subscription") or {"status": "active"}),
+            **access_fields(resolve_access(user)),  # ADR-079
+        },
     }

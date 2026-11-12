@@ -209,9 +209,8 @@ async def _get_remaining_quota(user_id: str) -> int:
         if not user_data:
             return 0
 
-        subscription_data = user_data.get("subscription", {"tier": "free"})
-        tier_key = subscription_data.get("tier", "free")
-        plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
+        from app.config.entitlements import resolve_access
+        plan = SUBSCRIPTION_PLANS[resolve_access(user_data).plan]
         # ADR-041: the import has its own ceiling, counted on imported cards only;
         # manual cards are unlimited on every tier.
         limit = plan["limits"].get("import_cards", -1)

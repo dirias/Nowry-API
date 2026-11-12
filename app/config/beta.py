@@ -18,6 +18,12 @@ fallbacks cover the entries that set none. Unset means no limit:
     BETA_CODE_MAX_USES=50         for entries with no ceiling of their own
     BETA_CODE_EXPIRES=2026-12-31  for entries with no last day of their own
 
+Full access for testers (ADR-079, FR-025) is one more flag and an optional
+last day, read on each request like the others:
+
+    BETA_FULL_ACCESS=true               a stamped account is answered as Pro
+    BETA_FULL_ACCESS_UNTIL=2027-01-31   optional last day (UTC, inclusive)
+
 `gate_new_account` is the one check that account creation runs. It takes the
 header and a function that counts a code's accounts, so it is tested without
 Firebase or Mongo.
@@ -67,6 +73,35 @@ def beta_config() -> BetaConfig:
         "invite_required": _flag("BETA_INVITE_REQUIRED", False),
         "upgrades_open": _flag("BETA_UPGRADES_OPEN", True),
     }
+
+
+def full_access_open(now: Optional[datetime] = None) -> bool:
+    """Is the testers' full access on right now? (ADR-079 point 3)
+
+    Off when the flag is unset. A last day that cannot be read closes it: the
+    day was meant to end the grant, so a typo must not leave it open for good.
+    """
+    if not _flag("BETA_FULL_ACCESS", False):
+        return False
+    try:
+        last_day = _read_day(os.getenv("BETA_FULL_ACCESS_UNTIL"))
+    except ValueError:
+        return False
+    if last_day is None:
+        return True
+    return (now or datetime.now(timezone.utc)).astimezone(timezone.utc).date() <= last_day
+
+
+def describe_full_access() -> str:
+    """One line for the start-up log: whether testers have full access, and until when."""
+    if not _flag("BETA_FULL_ACCESS", False):
+        return "full access for testers: off"
+    raw = os.getenv("BETA_FULL_ACCESS_UNTIL")
+    try:
+        last_day = _read_day(raw)
+    except ValueError:
+        return "full access for testers: UNREADABLE last day, the grant is closed"
+    return f"full access for testers: on, last day {last_day or 'none'}"
 
 
 @dataclass(frozen=True)

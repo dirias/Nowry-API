@@ -1,5 +1,6 @@
 import asyncio
 from fastapi import APIRouter, HTTPException, Depends, Request
+from app.config.entitlements import effective_tier
 from app.core.limiter import limiter
 from pydantic import BaseModel
 from app.ai_orchestrator.orchestrator import orchestrator
@@ -30,7 +31,7 @@ async def generate_visual(
 ) -> dict:
     # The monthly ceiling is enforced by track_ai_usage (GTM-003); `request` is
     # the HTTP request the rate limiter reads, `body` the visual to make.
-    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(current_user)
     logger.info(f"[visualizer] tier={tier}")
     try:
         inputs = {"text": body.text, "viz_type": body.viz_type, "tier": tier}

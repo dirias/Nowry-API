@@ -21,6 +21,7 @@ module may have registered first.
 """
 from __future__ import annotations
 
+from tests._stubs import stored_access
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -98,7 +99,7 @@ async def _call(*, tier: str, auto_detect: bool, text: str, language_code: str =
     return await tts_module.generate_tts(
         book_id=str(BOOK_ID),
         body=TTSRequest(**request_kwargs),
-        tier=tier,
+        tier=tier, access=stored_access(tier),
         current_user={"user_id": OWNER_ID},
     )
 
@@ -254,7 +255,7 @@ async def test_non_auto_detect_request_unchanged_single_call_path():
         response = await tts_module.generate_tts(
             book_id=str(BOOK_ID),
             body=TTSRequest(text="Some book text.", language_code="fr-FR"),
-            tier="pro",
+            tier="pro", access=stored_access("pro"),
             current_user={"user_id": OWNER_ID},
         )
 

@@ -116,7 +116,8 @@ async def get_current_user_profile(
         avatar_url=user.get("avatar_url"),
         photo_url=user.get("photo_url"),
         role=user.get("role", "user"),
-        subscription=user.get("subscription", {}),
+        # ADR-079: `tier` is the plan in effect; `access` says why, `paid_tier` what is paid for.
+        subscription={**(user.get("subscription") or {}), **access_fields(resolve_access(user))},
         preferences=user.get("preferences", {}),
         created_at=user.get("created_at"),
         wizard_completed=user.get("wizard_completed", False),
@@ -350,6 +351,7 @@ class GeneralPreferencesResponse(BaseModel):
 
 
 
+from app.config.entitlements import ACCESS_PROJECTION, access_fields, access_limits, resolve_access
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 
 
@@ -488,20 +490,17 @@ async def get_profile(
 
     # Get subscription info
     stored_sub = user.get("subscription", {"tier": "free", "status": "active"})
-    tier_key = stored_sub.get("tier", "free")
-
-    # Map stored tier to plan configuration
-    plan_details = SUBSCRIPTION_PLANS.get(
-        tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE]
-    )
+    # ADR-079: the plan in effect, which for a tester is Pro with the beta caps.
+    access = resolve_access(user)
+    plan_details = SUBSCRIPTION_PLANS[access.plan]
 
     # Construct full subscription object
     subscription = {
-        "tier": tier_key,
+        **access_fields(access),
         "status": stored_sub.get("status", "active"),
         "name": plan_details["name"],
         "features": plan_details["features"],
-        "limits": plan_details["limits"],
+        "limits": access_limits(access),
         "usage": {
             "books": stats["books_created"],
             "flashcards": stats["flashcards_count"],
@@ -1511,10 +1510,10 @@ PAID_PET_FIELDS: frozenset[str] = frozenset({"pet_name", "pet_species"})
 
 async def _require_paid_pet_customization(user_id: str) -> None:
     """Refuse a free account's change to the companion's name or species."""
-    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)}, {"subscription.tier": 1})
+    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)}, ACCESS_PROJECTION)
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
-    if (user_doc.get("subscription") or {}).get("tier", "free") not in (SubscriptionTier.PLUS, SubscriptionTier.PRO):
+    if resolve_access(user_doc).plan is SubscriptionTier.FREE:
         raise HTTPException(status_code=403, detail="pet_customization_requires_plus")
 
 

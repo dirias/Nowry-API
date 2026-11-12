@@ -7,6 +7,7 @@ import time
 from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from app.config.entitlements import effective_tier
 from app.core.limiter import limiter
 from app.config.subscription_plans import FREE_PER_CALL
 from fastapi.responses import StreamingResponse
@@ -108,7 +109,7 @@ async def generate_card(
     # which routes to Groq for 'free' or Gemini for 'plus'/'pro'.
     # No caps or quotas are applied per D-01 (CONTEXT.md).
     # TODO: AI usage limit enforcement is pending (Phase 4 deferred — WR-01)
-    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(current_user)
     # None sampleNumber => adaptive mode: deterministic content-derived cap.
     effective_cap: int = compute_effective_cap(payload.sampleText, payload.sampleNumber)
     if tier == "free":
@@ -167,7 +168,7 @@ async def generate_card_stream(
     # Auth: the router-level Depends(get_firebase_user) plus track_ai_usage
     # resolve BEFORE this handler returns a StreamingResponse, so auth
     # failures surface as plain HTTP 401/403 with no SSE bytes.
-    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(current_user)
     # None sampleNumber => adaptive mode: deterministic content-derived cap,
     # computed here BEFORE the orchestrator is invoked.
     effective_cap: int = compute_effective_cap(payload.sampleText, payload.sampleNumber)

@@ -6,6 +6,7 @@ from typing import List, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File, Form
 from pymongo.collection import Collection
 from bson import ObjectId
+from app.config.entitlements import effective_tier
 from app.models.Book import Book, BookLibraryPage, BookSummary
 from app.services import book_library, book_search, import_parser
 from pymongo.errors import DuplicateKeyError
@@ -801,7 +802,7 @@ async def ai_expand_text(
 ) -> AIExpandResponse:
     """Expand selected text using tier-appropriate LLM. All tiers have access; model quality differs."""
     user_id: str = current_user.get("user_id", "")
-    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(current_user)
     if tier not in ("free", "plus", "pro"):
         tier = "free"
 

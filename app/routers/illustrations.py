@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Request
+from app.config.entitlements import effective_tier
 from app.core.limiter import limiter
 
 from app.ai_orchestrator.orchestrator import orchestrator
@@ -42,7 +43,7 @@ async def generate_diagram(
     Free tier: capped at 2 diagrams per book (tracked in MongoDB).
     Plus/Pro: no per-book cap.
     """
-    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(current_user)
     user_id: str = current_user.get("user_id", "")
 
     # Ownership check (T-6-04)
@@ -102,7 +103,7 @@ async def confirm_diagram_insert(
     (race condition guard — the generate endpoint also checks, but a concurrent
     session could have filled the last slot between generate and insert).
     """
-    tier: str = current_user.get("subscription", {}).get("tier", "free")
+    tier: str = effective_tier(current_user)
     user_id: str = current_user.get("user_id", "")
 
     try:

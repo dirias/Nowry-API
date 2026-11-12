@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import sys
-from tests._stubs import fake_request, stub_if_missing, use_stub_if_missing
+from tests._stubs import fake_request, stub_if_missing, use_stub_if_missing, stored_access
 from unittest.mock import MagicMock
 
 import pytest
@@ -308,7 +308,7 @@ async def test_tts_free_403(mock_book_doc_with_counter):
             await generate_tts(
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
-                tier="free",
+                tier="free", access=stored_access("free"),
                 current_user=user,
             )
 
@@ -332,7 +332,7 @@ async def test_tts_plus_returns_audio(mock_book_doc_with_counter, mock_user_doc_
             response = await generate_tts(
                 book_id="60b8d295f1d2c17f4e4b1234",
                 body=body,
-                tier="plus",
+                tier="plus", access=stored_access("plus"),
                 current_user=user,
             )
 
@@ -364,7 +364,7 @@ async def test_tts_pro_language_code(mock_book_doc_with_counter, mock_user_doc_p
                 await generate_tts(
                     book_id="60b8d295f1d2c17f4e4b1234",
                     body=body,
-                    tier="pro",
+                    tier="pro", access=stored_access("pro"),
                     current_user=user,
                 )
 
@@ -393,7 +393,7 @@ async def test_tts_plus_ignores_language(mock_book_doc_with_counter, mock_user_d
                 await generate_tts(
                     book_id="60b8d295f1d2c17f4e4b1234",
                     body=body,
-                    tier="plus",
+                    tier="plus", access=stored_access("plus"),
                     current_user=user,
                 )
 

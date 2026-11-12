@@ -15,6 +15,7 @@ logger = get_logger(__name__)
 
 from app.auth.dependencies import track_ai_usage
 from app.config.database import users_collection
+from app.config.entitlements import resolve_access
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 from bson import ObjectId
 
@@ -31,9 +32,7 @@ async def generate_quiz(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    subscription_data = user.get("subscription", {"tier": "free"})
-    tier_key = subscription_data.get("tier", "free")
-    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
+    plan = SUBSCRIPTION_PLANS[resolve_access(user).plan]
 
     if not plan["features"]["ai_content_generation"]:
         raise HTTPException(

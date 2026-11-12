@@ -13,6 +13,7 @@ import os
 import stripe
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, ConfigDict
+from app.config.entitlements import ACCESS_PROJECTION, access_fields, resolve_access
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import users_collection
 from app.config.beta import require_upgrades_open
@@ -61,6 +62,8 @@ class SubscriptionStatusResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     tier: str
+    access: str = "free"
+    paid_tier: str = "free"
     status: str
     ai_usage_count: int
     next_billing_date: str | None
@@ -166,13 +169,13 @@ async def get_subscription_status(
     via the webhook handler (stripe_webhooks.py). This endpoint is a fast read-only path.
     """
     user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)}, {"subscription": 1})
+    user = await users_collection.find_one({"_id": ObjectId(user_id)}, ACCESS_PROJECTION)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     sub = user.get("subscription", {})
     return SubscriptionStatusResponse(
-        tier=sub.get("tier", "free"),
+        **access_fields(resolve_access(user)),  # ADR-079: the plan in effect, why, and the paid one
         status=sub.get("status", "active"),
         ai_usage_count=sub.get("ai_usage_count", 0),
         next_billing_date=(

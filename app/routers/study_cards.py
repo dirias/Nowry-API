@@ -497,9 +497,8 @@ async def create_study_card(
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
 
-    subscription_data = user_data.get("subscription", {"tier": "free"})
-    tier_key = subscription_data.get("tier", "free")
-    plan = SUBSCRIPTION_PLANS.get(tier_key, SUBSCRIPTION_PLANS[SubscriptionTier.FREE])
+    from app.config.entitlements import resolve_access
+    plan = SUBSCRIPTION_PLANS[resolve_access(user_data).plan]
 
     # Determine card type and applicable limit
     limit_key = "flashcards"  # default

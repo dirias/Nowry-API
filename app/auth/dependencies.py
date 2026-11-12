@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from app.auth.firebase_auth import get_firebase_user
 from app.config.database import users_collection
+from app.config.entitlements import ACCESS_PROJECTION, Access, access_limit, resolve_access
 
 def require_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
     """
@@ -108,25 +109,22 @@ async def track_ai_usage(
     """
     Count one AI generation call against the user's monthly ceiling (GTM-003, ADR-041).
 
-    The ceiling is the plan's `ai_calls_per_month` (-1 for none). The window is
+    The ceiling is `ai_calls_per_month` of the plan in effect (-1 for none;
+    ADR-079: a tester's own cap). It is taken once per request, before any
+    model is asked, so an answer that came from the fallback counts once. The window is
     the calendar month, kept in `subscription.ai_usage_reset_date` and rolled
     here when it has passed. The increment is conditional on being under the
     ceiling, so a refused call is never counted, and the refusal is
     `429 {"code": "ai_limit_reached", "limit", "resets_at"}`.
     """
-    from app.config.subscription_plans import AI_USAGE_LIMITS, SubscriptionTier
-
     user_id = current_user.get("user_id")
     now = datetime.now(timezone.utc)
-    current = await users_collection.find_one({"_id": ObjectId(user_id)}, {"subscription": 1})
+    current = await users_collection.find_one({"_id": ObjectId(user_id)}, ACCESS_PROJECTION)
     if not current:
         raise HTTPException(status_code=404, detail="User not found")
     subscription: dict = current.get("subscription") or {}
-    try:
-        tier = SubscriptionTier(subscription.get("tier", "free"))
-    except ValueError:
-        tier = SubscriptionTier.FREE
-    limit: int = int(AI_USAGE_LIMITS.get(tier, AI_USAGE_LIMITS[SubscriptionTier.FREE]))
+    # ADR-079: the ceiling is the one of the plan in effect, a tester's cap included.
+    limit: int = access_limit(resolve_access(current, now), "ai_calls_per_month")
     resets_at = await _roll_usage_window(user_id, subscription, now)
 
     query: dict = {"_id": ObjectId(user_id)}
@@ -155,18 +153,22 @@ async def track_ai_usage(
     return user
 
 
+async def get_access(
+    current_user: dict = Depends(get_firebase_user),
+) -> Access:
+    """The plan this account is answered as, and why (ADR-079)."""
+    user_id = current_user.get("user_id")
+    user = await users_collection.find_one({"_id": ObjectId(user_id)}, ACCESS_PROJECTION)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return resolve_access(user)
+
+
 async def get_subscription_tier(
     current_user: dict = Depends(get_firebase_user),
 ) -> str:
-    """Returns the user's current subscription tier as a string: 'free', 'plus', or 'pro'."""
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one(
-        {"_id": ObjectId(user_id)},
-        {"subscription.tier": 1},
-    )
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user.get("subscription", {}).get("tier", "free")
+    """The plan in effect as a string: 'free', 'plus', or 'pro' (ADR-079)."""
+    return (await get_access(current_user)).tier
 
 
 def require_public_or_ownership(get_collection_dependency: Callable, id_param_name: str = "id"):
