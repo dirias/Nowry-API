@@ -11,8 +11,8 @@ from pymongo.errors import DuplicateKeyError
 from app.auth.email_verification import session_is_cut, verification_update
 from app.config.firebase_config import verify_firebase_token
 from app.config.subscription_plans import SubscriptionTier
-from app.config.beta import INVITE_HEADER, gate_new_account
-from app.services.beta_invites import count_code_uses
+from app.config.beta import INVITE_HEADER
+from app.services.beta_invites import gate_account_creation, release_personal_invite, settle_personal_invite
 from app.models.User import USERNAME_MAX_LENGTH, sanitize_username
 from functools import lru_cache
 from typing import Optional
@@ -140,6 +140,10 @@ async def get_firebase_user(request: Request) -> dict:
             detail="Invalid Firebase token."
         )
 
+    # ADR-077: the stamp of a personal invitation spent by this request, so it
+    # can be given back if the account is never written.
+    beta_stamp: Optional[dict] = None
+    token_data: dict = {}
     try:
         token_data = {
             "firebase_uid": decoded_token.get("uid"),
@@ -210,7 +214,10 @@ async def get_firebase_user(request: Request) -> dict:
             # being, for the email flow and the Google flow alike, so the beta
             # invite is enforced here. A refusal is raised before anything is
             # written; an existing account never reaches this branch.
-            beta_stamp: Optional[dict] = await gate_new_account(request.headers.get(INVITE_HEADER), count_code_uses)
+            #
+            # ADR-077: the header is a cohort code or a personal invitation.
+            # A personal one is spent here, only by its own verified address.
+            beta_stamp = await gate_account_creation(request.headers.get(INVITE_HEADER), token_data)
             display_name: str = token_data.get("name") or ""
             email: str = token_data.get("email") or ""
             raw_username: str = display_name or (email.split("@")[0] if email else "user")
@@ -338,6 +345,9 @@ async def get_firebase_user(request: Request) -> dict:
                         # elsewhere in the meantime) — surface the failure.
                         raise
 
+        # ADR-077: a personal invitation now belongs to the account it made.
+        await settle_personal_invite(beta_stamp, token_data["user_id"], token_data["firebase_uid"])
+
         # uid is an alias for firebase_uid (Firebase authentication identifier only)
         # NEVER use uid for MongoDB storage — always use user_id (MongoDB ObjectId string)
         token_data["uid"] = token_data.get("firebase_uid")
@@ -347,8 +357,12 @@ async def get_firebase_user(request: Request) -> dict:
 
         return token_data
     except HTTPException:
+        if "user_id" not in token_data:
+            await release_personal_invite(beta_stamp, token_data.get("firebase_uid") or "")
         raise
     except Exception as e:
+        if "user_id" not in token_data:
+            await release_personal_invite(beta_stamp, token_data.get("firebase_uid") or "")
         # Log the full traceback server-side — the client only ever sees the
         # generic detail string below (no exception text: it can carry database
         # internals, QA-006), but without this, an unhandled error

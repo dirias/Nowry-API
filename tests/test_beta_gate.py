@@ -126,7 +126,7 @@ def test_provisioning_reads_the_gate_before_writing(monkeypatch):
     from app.auth import firebase_auth
 
     source = inspect.getsource(firebase_auth.get_firebase_user)
-    gate_at = source.index("await gate_new_account(request.headers.get(INVITE_HEADER), count_code_uses)")
+    gate_at = source.index("await gate_account_creation(request.headers.get(INVITE_HEADER), token_data)")
     insert_at = source.index("users_collection.insert_one(new_user_doc)")
     assert gate_at < insert_at
     assert '"beta": beta_stamp' in source

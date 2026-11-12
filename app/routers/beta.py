@@ -30,7 +30,8 @@ from app.models.Beta import (
     WaitlistCreate,
     WaitlistResponse,
 )
-from app.services.beta_invites import count_code_uses
+from app.config.invites import is_personal_token
+from app.services.beta_invites import count_code_uses, personal_invite_usable
 from app.services.notifications import notify, waitlist_notification
 
 router = APIRouter(prefix="/beta", tags=["beta"])
@@ -86,6 +87,9 @@ async def check_invite(request: Request, payload: InviteCheckRequest) -> InviteC
     An unknown, full or expired code gets the same answer, and the cohort is
     not named: the endpoint is public (ADR-077, FR-020).
     """
+    if is_personal_token(payload.code):
+        # ADR-077: usable or not, and nothing else. No address is taken or given.
+        return InviteCheckResponse(valid=await personal_invite_usable(payload.code))
     rule = await open_code_rule(payload.code, count_code_uses)
     return InviteCheckResponse(valid=rule is not None)
 
