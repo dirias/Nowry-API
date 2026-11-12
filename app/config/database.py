@@ -62,6 +62,7 @@ comments_collection = db["comments"]
 # Per-user fixed-window rate limit counters (app/utils/rate_limit.py).
 # Shared across Uvicorn workers; buckets self-purge via a TTL on expires_at.
 rate_limits_collection = db["rate_limits"]
+email_suppressions_collection = db["email_suppressions"]  # bounced or complained, by hash; never an address (ADR-080)
 email_sends_collection = db["email_sends"]  # the send ledger: kind, class, day, outcome; never an address (ADR-078)
 
 # Fork idempotency records — one per (content type, source, user) (ADR-005).
@@ -430,6 +431,8 @@ async def create_indexes():
 
     # The beta waitlist upserts by email (ADR-038); the index makes that the key.
     await waitlist_collection.create_index("email", unique=True, name="waitlist_email")
+    # ADR-080: the leave link finds its row by token; rows older than it have none.
+    await waitlist_collection.create_index("leave_token", unique=True, sparse=True, name="waitlist_leave_token")
 
     # The media ledger (ADR-062): the monthly count reads an owner's rows by
     # date; a book's deletion reads its rows by book.

@@ -22,6 +22,8 @@ DEFAULT_LOCALE = "en"
 KINDS: dict[str, dict[str, str]] = {
     "account.verify": {"class": "account", "sender": "account"},
     "account.reset": {"class": "account", "sender": "account"},
+    # A letter to a person who asked to wait (ADR-078 point 1b): no button, and a way to leave.
+    "waitlist.confirm": {"class": "confirmation", "sender": "personal"},
 }
 
 _P = '<p style="margin:0 0 14px;">{}</p>'
@@ -32,6 +34,9 @@ _BUTTON = (
     '<a href="{href}" style="display:inline-block;padding:12px 18px;font-size:15px;font-weight:600;'
     'color:#FCFBF8;text-decoration:none;">{label}</a></td></tr></table>'
 )
+
+
+_LEAVE = '{prompt} <a class="muted" href="{href}" style="color:#4A5558;text-decoration:underline;">{label}</a>'
 
 
 @dataclass(frozen=True)
@@ -78,23 +83,31 @@ def _footer(words: dict, common: dict, values: Mapping[str, str], postal: str) -
     return lines
 
 
-def _text_part(words: dict, common: dict, values: Mapping[str, str], postal: str) -> str:
+def _text_part(words: dict, common: dict, values: Mapping[str, str], postal: str, visitor: bool) -> str:
     body = [_fill(p, values) for p in words["before"]]
-    body.append(values["link"])  # alone on its line, so plain-text clients keep it whole
-    body += [_fill(p, values) for p in words["after"]]
+    if "button" in words:
+        body.append(values["link"])  # alone on its line, so plain-text clients keep it whole
+    body += [_fill(p, values) for p in words.get("after", [])]
     body.append(words["signature"])
-    footer = "\n".join(_footer(words, common, values, postal))
+    lines = _footer(words, common, values, postal)
+    if visitor:
+        # The address alone on its line, like the button's.
+        lines += [f"{common['leave_prompt']} {common['leave_label']}:", values["leave_link"]]
+    footer = "\n".join(lines)
     return _layout("layout.txt").substitute(body="\n\n".join(body), footer=footer)
 
 
-def _html_part(words: dict, common: dict, values: Mapping[str, str], postal: str, locale: str, logo_url: str) -> str:
+def _html_part(words: dict, common: dict, values: Mapping[str, str], postal: str, locale: str, logo_url: str, visitor: bool) -> str:
     safe = {key: html.escape(str(value), quote=True) for key, value in values.items()}
     blocks = [_P.format(_fill(html.escape(p), safe)) for p in words["before"]]
-    blocks.append(_BUTTON.format(href=safe["link"], label=html.escape(words["button"])))
-    blocks.append(_LINK.format(_fill(html.escape(common["or_open"]), safe)))
-    blocks += [_P.format(_fill(html.escape(p), safe)) for p in words["after"]]
+    if "button" in words:
+        blocks.append(_BUTTON.format(href=safe["link"], label=html.escape(words["button"])))
+        blocks.append(_LINK.format(_fill(html.escape(common["or_open"]), safe)))
+    blocks += [_P.format(_fill(html.escape(p), safe)) for p in words.get("after", [])]
     blocks.append(_P.format(html.escape(words["signature"])))
     footer = "<br>".join(html.escape(line) for line in _footer(words, common, values, postal))
+    if visitor:
+        footer += "<br>" + _LEAVE.format(prompt=html.escape(common["leave_prompt"]), href=safe["leave_link"], label=html.escape(common["leave_label"]))
     return _layout("layout.html").substitute(
         lang=locale, subject=html.escape(words["subject"]), logo_url=html.escape(logo_url, quote=True),
         blocks="\n".join(blocks), footer=footer,
@@ -102,17 +115,22 @@ def _html_part(words: dict, common: dict, values: Mapping[str, str], postal: str
 
 
 def render_email(kind: str, locale: Optional[str], values: Mapping[str, str], *, logo_url: str, postal: str = "") -> RenderedEmail:
-    """Both parts of one email. `values` needs `email`, `link` and `support`.
+    """Both parts of one email. `values` needs `email` and `support`; `link` when the
+    kind has a button; `leave_link` when it is a letter to a visitor.
 
     Raises KeyError for an unknown kind or a value the words ask for and were not given.
     """
     if kind not in KINDS:
         raise KeyError(kind)
+    # A letter to a visitor always carries the way to leave (ADR-078 point 1b); account email never does.
+    visitor = KINDS[kind]["sender"] == "personal"
+    if visitor and not values.get("leave_link"):
+        raise KeyError("leave_link")
     code = resolve_locale(locale)
     words, common = _words(kind, code)
     return RenderedEmail(
         subject=_fill(words["subject"], values),
-        text=_text_part(words, common, values, postal),
-        html=_html_part(words, common, values, postal, code, logo_url),
+        text=_text_part(words, common, values, postal, visitor),
+        html=_html_part(words, common, values, postal, code, logo_url, visitor),
         locale=code,
     )

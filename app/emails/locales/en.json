@@ -1,7 +1,10 @@
 {
   "common": {
     "or_open": "Or open $link",
-    "questions": "Questions: $support"
+    "questions": "Questions: $support",
+    "sender_personal": "Didier from Nowry",
+    "leave_prompt": "Didn't ask for this, or changed your mind?",
+    "leave_label": "Leave the list"
   },
   "account": {
     "verify": {
@@ -29,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "Sent to $email because a password reset was requested for this address."
+    }
+  },
+  "waitlist": {
+    "confirm": {
+      "subject": "You're on the Nowry waitlist",
+      "before": [
+        "Hi,",
+        "You asked for early access to Nowry. You're on the list.",
+        "Nowry turns what you read into flashcards and schedules every review, on the web and on Android. It is free during the beta.",
+        "We invite people in small groups. You will get one more email from us, with a link of your own, when your place opens."
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "Sent to $email because this address was added to the Nowry waitlist."
     }
   }
 }

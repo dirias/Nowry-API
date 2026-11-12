@@ -151,7 +151,8 @@ async def test_waitlist_upserts_by_email():
     args, kwargs = collection.find_one_and_update.call_args
     assert args[0] == {"email": "ana@example.com"}
     assert args[1]["$set"]["email"] == "ana@example.com"
-    assert args[1]["$setOnInsert"] == {"created_at": NOW}
+    # ADR-080: a new row is given its leave token with its first time.
+    assert args[1]["$setOnInsert"]["created_at"] == NOW and len(args[1]["$setOnInsert"]["leave_token"]) >= 40
     assert kwargs["upsert"] is True
 
 
@@ -200,6 +201,8 @@ def _waitlist_client(monkeypatch, before):
     notify = AsyncMock(return_value=True)
     monkeypatch.setattr(beta_module, "waitlist_collection", collection)
     monkeypatch.setattr(beta_module, "notify", notify)
+    # WAIT-004's confirmation has its own tests; here it would read the scripted collection.
+    monkeypatch.setattr(beta_module.waitlist, "send_confirmation", AsyncMock(return_value="skipped"))
     limiter.reset()
     api = FastAPI()
     api.state.limiter = limiter
@@ -245,6 +248,7 @@ def test_a_notification_that_fails_is_logged_and_the_sign_up_still_succeeds(monk
     collection = MagicMock()
     collection.find_one_and_update = AsyncMock(return_value=None)
     monkeypatch.setattr(beta_module, "waitlist_collection", collection)
+    monkeypatch.setattr(beta_module.waitlist, "send_confirmation", AsyncMock(return_value="skipped"))  # WAIT-004 has its own tests
     monkeypatch.setattr(notifications.httpx, "AsyncClient", MagicMock(side_effect=RuntimeError("resend is down")))
     limiter.reset()
     api = FastAPI()

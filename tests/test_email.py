@@ -57,13 +57,15 @@ def test_every_locale_has_every_key_english_has():
 
 def test_every_kind_has_its_words():
     english = json.loads((LOCALE_DIR / "en.json").read_text(encoding="utf-8"))
-    for kind in KINDS:
+    for kind, traits in KINDS.items():
         group, name = kind.split(".")
-        assert {"subject", "before", "button", "after", "signature", "footer"} <= set(english[group][name])
+        # An account email has one button; a letter to a visitor has none (its tests are in test_mail008_wait004).
+        action = {"button", "after"} if traits["sender"] == "account" else set()
+        assert {"subject", "before", "signature", "footer"} | action <= set(english[group][name])
 
 
 @pytest.mark.parametrize("locale", LOCALES)
-@pytest.mark.parametrize("kind", sorted(KINDS))
+@pytest.mark.parametrize("kind", sorted(kind for kind, traits in KINDS.items() if traits["sender"] == "account"))
 def test_both_parts_render_in_every_language_with_nothing_left_unfilled(kind, locale):
     rendered = render_email(kind, locale, VALUES, logo_url="https://nowry.app/logo192.png")
     assert rendered.locale == locale and rendered.subject

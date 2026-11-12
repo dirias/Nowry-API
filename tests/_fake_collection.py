@@ -1,7 +1,8 @@
 """A small in-memory stand-in for a Motor collection, for the invitation tests.
 
-It understands the filters those tests use (equality, `$or`, `$gt`, `$lte`) and
-applies `$set`, so the atomic claim is exercised as a query, not as a mock that
+It understands the filters those tests use (equality, `$or`, `$gt`, `$lte`,
+`$lt`, `$ne`, `$exists`) and applies `$set`, `$unset` and, on an upsert,
+`$setOnInsert`, so an atomic claim is exercised as a query, not as a mock that
 returns whatever the test told it to.
 """
 from __future__ import annotations
@@ -24,9 +25,21 @@ def _matches(row: Dict[str, Any], query: Dict[str, Any]) -> bool:
                 return False
             if "$lte" in wanted and not (value is not None and value <= wanted["$lte"]):
                 return False
+            if "$lt" in wanted and not (value is not None and value < wanted["$lt"]):
+                return False
+            if "$ne" in wanted and value == wanted["$ne"]:
+                return False
+            if "$exists" in wanted and (key in row) != bool(wanted["$exists"]):
+                return False
         elif row.get(key) != wanted:
             return False
     return True
+
+
+def _apply(row: Dict[str, Any], update: Dict[str, Any]) -> None:
+    row.update(update.get("$set", {}))
+    for key in update.get("$unset", {}):
+        row.pop(key, None)
 
 
 class _Cursor:
@@ -67,15 +80,28 @@ class FakeCollection:
             row.update(update["$set"])
         return SimpleNamespace(modified_count=len(hits))
 
-    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any]) -> SimpleNamespace:
+    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False) -> SimpleNamespace:
         row = next((row for row in self.rows if _matches(row, query)), None)
+        if row is None and upsert:
+            fresh = {"_id": ObjectId(), **{k: v for k, v in query.items() if not k.startswith("$")}, **update.get("$setOnInsert", {})}
+            _apply(fresh, update)
+            self.rows.append(fresh)
+            return SimpleNamespace(modified_count=0)
         if row is not None:
-            row.update(update["$set"])
+            _apply(row, update)
         return SimpleNamespace(modified_count=int(row is not None))
 
-    async def find_one_and_update(self, query: Dict[str, Any], update: Dict[str, Any], return_document: Any = None, **_: Any) -> Optional[Dict[str, Any]]:
+    async def find_one_and_update(
+        self, query: Dict[str, Any], update: Dict[str, Any], return_document: Any = None, upsert: bool = False, **_: Any
+    ) -> Optional[Dict[str, Any]]:
+        """The row after the write; as it was before only when `return_document` is pymongo's BEFORE (False)."""
         row = next((row for row in self.rows if _matches(row, query)), None)
         if row is None:
+            if upsert:
+                fresh = {"_id": ObjectId(), **{k: v for k, v in query.items() if not k.startswith("$")}, **update.get("$setOnInsert", {})}
+                _apply(fresh, update)
+                self.rows.append(fresh)
             return None
-        row.update(update["$set"])
-        return copy.deepcopy(row)
+        before = copy.deepcopy(row)
+        _apply(row, update)
+        return before if return_document is False else copy.deepcopy(row)

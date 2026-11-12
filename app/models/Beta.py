@@ -42,6 +42,19 @@ class WaitlistResponse(BaseModel):
     message: str
 
 
+class WaitlistLeaveHint(BaseModel):
+    """What the leave page may show: the address with all but its first letter hidden, and the row's language."""
+
+    email_hint: Optional[str] = None
+    locale: Optional[str] = None
+
+
+class WaitlistLeft(BaseModel):
+    """The one answer to a request to leave, whatever the token."""
+
+    left: bool = True
+
+
 class WaitlistEntry(BaseModel):
     """The stored row, one per email, for whoever invites the next cohort."""
 

@@ -1,7 +1,10 @@
 {
   "common": {
     "or_open": "または次のリンクを開いてください：$link",
-    "questions": "お問い合わせ：$support"
+    "questions": "お問い合わせ：$support",
+    "sender_personal": "Nowry の Didier",
+    "leave_prompt": "お心当たりがない場合や、気が変わった場合は",
+    "leave_label": "リストから外れる"
   },
   "account": {
     "verify": {
@@ -29,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "このアドレスのパスワード再設定が依頼されたため、$email にお送りしました。"
+    }
+  },
+  "waitlist": {
+    "confirm": {
+      "subject": "Nowryの順番待ちリストに登録されました",
+      "before": [
+        "こんにちは。",
+        "Nowryの先行アクセスにお申し込みいただき、リストに登録しました。",
+        "Nowryは、読んだ内容から暗記カードを作り、復習のたびに次の予定を組みます。ウェブとAndroidで使えます。ベータ期間中は無料です。",
+        "少人数ずつご招待しています。順番が来たら、専用のリンクを載せたメールをもう一通お送りします。"
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "このメールは、$email がNowryの順番待ちリストに登録されたためお送りしています。"
     }
   }
 }

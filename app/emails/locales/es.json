@@ -1,7 +1,10 @@
 {
   "common": {
     "or_open": "O abre $link",
-    "questions": "Dudas: $support"
+    "questions": "Dudas: $support",
+    "sender_personal": "Didier de Nowry",
+    "leave_prompt": "¿No lo pediste o cambiaste de opinión?",
+    "leave_label": "Salir de la lista"
   },
   "account": {
     "verify": {
@@ -29,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "Enviado a $email porque se pidió restablecer la contraseña de esta dirección."
+    }
+  },
+  "waitlist": {
+    "confirm": {
+      "subject": "Estás en la lista de espera de Nowry",
+      "before": [
+        "Hola:",
+        "Pediste acceso anticipado a Nowry. Ya estás en la lista.",
+        "Nowry convierte lo que lees en tarjetas de estudio y programa cada repaso, en la web y en Android. Es gratis durante la beta.",
+        "Invitamos a la gente en grupos pequeños. Recibirás un correo más, con tu propio enlace, cuando se abra tu lugar."
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "Enviado a $email porque esta dirección se añadió a la lista de espera de Nowry."
     }
   }
 }
