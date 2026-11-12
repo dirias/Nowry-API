@@ -11,7 +11,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Literal, Optional, List
+from typing import Any, Dict, Literal, Optional, List
 import bcrypt
 import os
 import secrets
@@ -176,6 +176,22 @@ class PasswordChange(BaseModel):
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters long")
         return v
+
+
+# No account is opted in to an email it did not choose (MAIL-002, FR-017):
+# `email_digest` is off until someone turns it on. Nothing sends a digest yet.
+DEFAULT_NOTIFICATION_PREFERENCES: Dict[str, bool] = {
+    "email_digest": False,
+    "study_reminders": True,
+    "news_updates": False,
+    "marketing": False,
+}
+
+
+def notification_preferences_of(user: Dict[str, Any]) -> Dict[str, bool]:
+    """A complete preference set: what the account stored, over the defaults."""
+    stored = user.get("notification_preferences")
+    return {**DEFAULT_NOTIFICATION_PREFERENCES, **(stored if isinstance(stored, dict) else {})}
 
 
 class NotificationPreferences(BaseModel):
@@ -512,15 +528,7 @@ async def get_profile(
     }
 
     # Get notification preferences
-    notification_preferences = user.get(
-        "notification_preferences",
-        {
-            "email_digest": True,
-            "study_reminders": True,
-            "news_updates": False,
-            "marketing": False,
-        },
-    )
+    notification_preferences = notification_preferences_of(user)
 
     # Get general preferences
     preferences = user.get(

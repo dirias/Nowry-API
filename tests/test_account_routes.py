@@ -84,6 +84,37 @@ def test_notification_preferences_are_written_field_by_field(world):
     assert _user(world)["notification_preferences"] == {"email_digest": False, "marketing": True, "study_reminders": False}
 
 
+def test_no_account_is_opted_in_to_the_email_digest_by_default(world):
+    """MAIL-002: the digest is off until chosen, and the answer is a complete set."""
+    from app.routers.users import DEFAULT_NOTIFICATION_PREFERENCES, notification_preferences_of
+
+    assert DEFAULT_NOTIFICATION_PREFERENCES["email_digest"] is False
+    assert notification_preferences_of({}) == DEFAULT_NOTIFICATION_PREFERENCES
+    assert notification_preferences_of({"notification_preferences": None}) == DEFAULT_NOTIFICATION_PREFERENCES
+    partly = notification_preferences_of({"notification_preferences": {"marketing": True}})
+    assert partly == {**DEFAULT_NOTIFICATION_PREFERENCES, "marketing": True}
+    chosen = notification_preferences_of({"notification_preferences": {"email_digest": True}})
+    assert chosen["email_digest"] is True
+
+
+def test_the_migration_turns_a_stored_digest_off_and_nothing_else(world):
+    """MAIL-002: dry run changes nothing; apply turns stored true off; a second run finds none."""
+    from app.migrations.email_digest_default_off import email_digest_default_off
+
+    users = world.raw["users"]
+    world.run(users.update_one({"_id": world.uid}, {"$set": {"notification_preferences": {"email_digest": True, "marketing": True}}}))
+    world.run(users.insert_one({"email": "off@x.io", "username": "off", "firebase_uid": "u-off", "notification_preferences": {"email_digest": False}}))
+    world.run(users.insert_one({"email": "none@x.io", "username": "none", "firebase_uid": "u-none"}))
+
+    assert world.run(email_digest_default_off(collection=users)) == {"found": 1, "changed": 0}
+    assert _user(world)["notification_preferences"]["email_digest"] is True
+
+    assert world.run(email_digest_default_off(apply_changes=True, collection=users)) == {"found": 1, "changed": 1}
+    assert _user(world)["notification_preferences"] == {"email_digest": False, "marketing": True}
+    assert "notification_preferences" not in world.run(users.find_one({"email": "none@x.io"}))
+    assert world.run(email_digest_default_off(apply_changes=True, collection=users)) == {"found": 0, "changed": 0}
+
+
 # ── avatar ──────────────────────────────────────────────────────────────────
 
 class _FakeStorage:
