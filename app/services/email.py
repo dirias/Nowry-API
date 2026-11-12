@@ -14,7 +14,8 @@ to Firebase's own).
     EMAIL_POSTAL_ADDRESS  a footer line; absent while empty
     EMAIL_DAILY_BUDGET    sends a day for this environment (default 90)
     EMAIL_ALLOWLIST       development: the only addresses or @domains written to
-    FRONTEND_URL          where links and the mark point
+    FRONTEND_URL          where links point
+    EMAIL_MARK_URL        the mark image; a public PNG (default: production's)
 """
 from __future__ import annotations
 
@@ -46,6 +47,17 @@ def _env(name: str) -> str:
 
 def frontend_url() -> str:
     return (_env("FRONTEND_URL") or "http://localhost:3000").rstrip("/")
+
+
+# The mark is fetched by mail providers' own servers (Gmail's image proxy), not
+# by the reader, so it must be public. A preview site behind a login, such as
+# development's, answers them with a redirect and the image shows broken. So
+# every environment uses production's file unless told otherwise.
+DEFAULT_MARK_URL = "https://www.nowry.app/logo192.png"
+
+
+def mark_url() -> str:
+    return _env("EMAIL_MARK_URL") or DEFAULT_MARK_URL
 
 
 def sender_config(kind: str) -> Optional[dict]:
@@ -111,7 +123,7 @@ async def send_email(kind: str, to: str, locale: Optional[str], values: Mapping[
         return UNCONFIGURED  # tests, a fresh checkout: nothing is sent and nothing is recorded
     email_class = KINDS[kind]["class"]
     filled = {"email": to, "support": config["reply_to"] or config["from"], **values}
-    rendered = render_email(kind, locale, filled, logo_url=f"{frontend_url()}/logo192.png", postal=_env("EMAIL_POSTAL_ADDRESS"))
+    rendered = render_email(kind, locale, filled, logo_url=mark_url(), postal=_env("EMAIL_POSTAL_ADDRESS"))
     if not allowed_recipient(to, _env("EMAIL_ALLOWLIST")):
         outcome = NOT_ALLOWED
     elif not may_send(email_class, await email_ledger.sent_today(), parse_budget(os.getenv("EMAIL_DAILY_BUDGET"))):

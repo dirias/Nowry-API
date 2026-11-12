@@ -14,7 +14,7 @@ from app.services import email_ledger, notifications
 LOCALE_DIR = Path(__file__).resolve().parents[1] / "app" / "emails" / "locales"
 VALUES = {"email": "ana@example.com", "link": "https://nowry.app/auth/action?mode=verifyEmail&oobCode=abc", "support": "support@nowry.app"}
 ENV = {"RESEND_API_KEY": "re_test", "EMAIL_FROM_ACCOUNT": "Nowry <account@nowry.app>", "EMAIL_REPLY_TO": "support@nowry.app", "FRONTEND_URL": "https://nowry.app"}
-ALL_ENV = (*ENV, "EMAIL_FROM_PERSONAL", "EMAIL_POSTAL_ADDRESS", "EMAIL_DAILY_BUDGET", "EMAIL_ALLOWLIST", "NOTIFY_TO_EMAIL", "NOTIFY_FROM_EMAIL")
+ALL_ENV = (*ENV, "EMAIL_MARK_URL", "EMAIL_FROM_PERSONAL", "EMAIL_POSTAL_ADDRESS", "EMAIL_DAILY_BUDGET", "EMAIL_ALLOWLIST", "NOTIFY_TO_EMAIL", "NOTIFY_FROM_EMAIL")
 
 
 def _shape(node, path=""):
@@ -153,7 +153,8 @@ async def test_an_account_email_goes_out_with_both_parts_its_sender_and_reply_to
     assert (payload["from"], payload["to"], payload["reply_to"]) == ("Nowry <account@nowry.app>", ["ana@example.com"], "support@nowry.app")
     assert payload["subject"] == "Confirma tu correo para Nowry"
     assert VALUES["link"] in payload["text"] and "support@nowry.app" in payload["text"]
-    assert 'src="https://nowry.app/logo192.png"' in payload["html"]
+    # The mark is production's public file whatever FRONTEND_URL is: a preview site behind a login breaks it in Gmail.
+    assert 'src="https://www.nowry.app/logo192.png"' in payload["html"]
     assert set(payload) == {"from", "to", "subject", "text", "html", "reply_to"}  # no tracking, no tags
     ledger.record.assert_awaited_once_with("account.verify", "account", "sent", "es", "ana@example.com")
     ledger.note_resend_count.assert_awaited_once_with("7")
@@ -225,3 +226,12 @@ async def test_a_notice_past_its_share_of_the_day_is_not_sent(monkeypatch):
     with patch.object(notifications.httpx, "AsyncClient", return_value=_resend()):
         assert await notifications.notify("s", "t") is True
     assert record.await_args.args[2] == "sent"
+
+
+def test_the_mark_is_a_public_png_that_does_not_follow_the_site_address(monkeypatch):
+    monkeypatch.delenv("EMAIL_MARK_URL", raising=False)
+    monkeypatch.setenv("FRONTEND_URL", "https://www.dev.nowry.app")
+    assert email_service.mark_url() == "https://www.nowry.app/logo192.png"
+    assert email_service.mark_url().startswith("https://") and email_service.mark_url().endswith(".png")
+    monkeypatch.setenv("EMAIL_MARK_URL", "https://cdn.example.com/mark.png")
+    assert email_service.mark_url() == "https://cdn.example.com/mark.png"
