@@ -32,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "Enviado a $email porque se pidió restablecer la contraseña de esta dirección."
+    },
+    "google": {
+      "subject": "Tu cuenta de Nowry inicia sesión con Google",
+      "before": [
+        "Hola:",
+        "Alguien pidió restablecer la contraseña de la cuenta de Nowry con esta dirección. Esta cuenta inicia sesión con Google, no con una contraseña, así que no hay nada que restablecer. Usa Iniciar sesión con Google en la página de inicio de sesión:"
+      ],
+      "button": "Iniciar sesión en Nowry",
+      "after": [
+        "Si no lo pediste, ignora este correo. No ha cambiado nada."
+      ],
+      "signature": "Nowry",
+      "footer": "Enviado a $email porque se pidió restablecer la contraseña de esta dirección."
     }
   },
   "waitlist": {

@@ -87,10 +87,28 @@ async def send_verification(email: str, language: Optional[str]) -> str:
     return SENT
 
 
+def _providers(user) -> set:
+    return {getattr(provider, "provider_id", "") for provider in (getattr(user, "provider_data", None) or [])}
+
+
 def _has_password(user) -> bool:
-    return not getattr(user, "disabled", False) and any(
-        getattr(provider, "provider_id", "") == "password" for provider in (getattr(user, "provider_data", None) or [])
-    )
+    return not getattr(user, "disabled", False) and "password" in _providers(user)
+
+
+def _google_only(user) -> bool:
+    """Signs in with Google and has no password (ADR-083): told so, not sent a reset."""
+    return not getattr(user, "disabled", False) and _providers(user) == {"google.com"}
+
+
+async def send_google_notice(email: str, language: Optional[str]) -> None:
+    """`account.google`: this account signs in with Google. No Firebase fallback: Firebase has nothing to send."""
+    try:
+        link = f"{email_service.frontend_url()}/login"
+        outcome = await email_service.send_email("account.google", email, language, {"link": link})
+    except Exception as exc:  # noqa: BLE001 - runs after the answer; nothing to raise to
+        outcome = f"failed: {type(exc).__name__}"
+    if outcome != email_service.SENT:
+        logger.warning("account email: the Google sign-in notice was not sent (%s)", outcome)
 
 
 async def firebase_sends_reset(email: str, language: Optional[str]) -> bool:
@@ -112,7 +130,7 @@ async def firebase_sends_reset(email: str, language: Optional[str]) -> bool:
 
 
 async def send_reset(email: str, language: Optional[str]) -> None:
-    """Runs after the answer. Sends only to an address with a password account. Never raises."""
+    """Runs after the answer. A password account gets the reset; a Google-only one the notice (ADR-083). Never raises."""
     try:
         user = await asyncio.to_thread(firebase_admin_auth.get_user_by_email, email)
     except firebase_admin_auth.UserNotFoundError:
@@ -121,6 +139,8 @@ async def send_reset(email: str, language: Optional[str]) -> None:
         logger.warning("account email: could not look the address up: %s", type(exc).__name__)
         return
     if not _has_password(user):
+        if _google_only(user):
+            await send_google_notice(email, language)
         return
     try:
         firebase_link = await asyncio.to_thread(firebase_admin_auth.generate_password_reset_link, email)

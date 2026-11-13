@@ -32,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "Envoyé à $email parce qu'une réinitialisation du mot de passe a été demandée pour cette adresse."
+    },
+    "google": {
+      "subject": "Votre compte Nowry se connecte avec Google",
+      "before": [
+        "Bonjour,",
+        "Quelqu'un a demandé à réinitialiser le mot de passe du compte Nowry lié à cette adresse. Ce compte se connecte avec Google, pas avec un mot de passe : il n'y a rien à réinitialiser. Utilisez Continuer avec Google sur la page de connexion :"
+      ],
+      "button": "Se connecter à Nowry",
+      "after": [
+        "Si vous n'avez rien demandé, ignorez cet e-mail. Rien n'a changé."
+      ],
+      "signature": "Nowry",
+      "footer": "Envoyé à $email parce qu'une réinitialisation du mot de passe a été demandée pour cette adresse."
     }
   },
   "waitlist": {

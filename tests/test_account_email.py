@@ -126,8 +126,9 @@ async def test_only_an_address_with_a_password_is_sent_a_reset(quiet):
     make = MagicMock(return_value=FIREBASE_LINK.replace("verifyEmail", "resetPassword"))
     cases = {
         "nobody": service.firebase_admin_auth.UserNotFoundError("none"),
-        "google only": _user("google.com"),
         "disabled": _user("password", disabled=True),
+        "disabled google": _user("google.com", disabled=True),
+        "neither": _user("apple.com"),
         "lookup down": RuntimeError("network"),
     }
     for name, answer in cases.items():
@@ -142,6 +143,31 @@ async def test_only_an_address_with_a_password_is_sent_a_reset(quiet):
             patch.object(service.email_service, "send_email", send):
         await service.send_reset("ana@example.com", "es")
     send.assert_awaited_once_with("account.reset", "ana@example.com", "es", {"link": OURS.replace("verifyEmail", "resetPassword")})
+
+
+async def test_a_google_only_address_is_told_it_signs_in_with_google_and_gets_no_reset(quiet):
+    """SIGNIN-004, FR-033, ADR-083: the notice, on the layout, with one button to the sign-in page."""
+    send = AsyncMock(return_value="sent")
+    make = MagicMock()
+    firebase = AsyncMock()
+    with patch.object(service.firebase_admin_auth, "get_user_by_email", MagicMock(return_value=_user("google.com"))), \
+            patch.object(service.firebase_admin_auth, "generate_password_reset_link", make), \
+            patch.object(service.email_service, "send_email", send), \
+            patch.object(service, "firebase_sends_reset", firebase):
+        await service.send_reset("ana@example.com", "fr")
+    send.assert_awaited_once_with("account.google", "ana@example.com", "fr", {"link": "https://nowry.app/login"})
+    make.assert_not_called()
+    firebase.assert_not_awaited()
+
+
+async def test_the_google_notice_never_raises_and_has_no_firebase_fallback(quiet):
+    firebase = AsyncMock()
+    for answer in (AsyncMock(return_value="over_budget"), AsyncMock(side_effect=RuntimeError("ledger down"))):
+        with patch.object(service.firebase_admin_auth, "get_user_by_email", MagicMock(return_value=_user("google.com"))), \
+                patch.object(service.email_service, "send_email", answer), \
+                patch.object(service, "firebase_sends_reset", firebase):
+            await service.send_reset("ana@example.com", "en")
+    firebase.assert_not_awaited()
 
 
 @pytest.mark.parametrize("fault", ["send", "link"])

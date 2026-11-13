@@ -32,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "Sent to $email because a password reset was requested for this address."
+    },
+    "google": {
+      "subject": "Your Nowry account signs in with Google",
+      "before": [
+        "Hi,",
+        "Someone asked to reset the password for the Nowry account with this address. This account signs in with Google, not a password, so there is nothing to reset. Use Sign in with Google on the sign-in page:"
+      ],
+      "button": "Sign in to Nowry",
+      "after": [
+        "If you didn't ask, ignore this email. Nothing has changed."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email because a password reset was requested for this address."
     }
   },
   "waitlist": {

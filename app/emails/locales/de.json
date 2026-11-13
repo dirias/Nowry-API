@@ -32,6 +32,19 @@
       ],
       "signature": "Nowry",
       "footer": "Gesendet an $email, weil für diese Adresse ein neues Passwort angefordert wurde."
+    },
+    "google": {
+      "subject": "Dein Nowry-Konto meldet sich mit Google an",
+      "before": [
+        "Hallo,",
+        "jemand möchte das Passwort des Nowry-Kontos mit dieser Adresse zurücksetzen. Dieses Konto meldet sich mit Google an, nicht mit einem Passwort, es gibt also nichts zurückzusetzen. Nutze auf der Anmeldeseite „Mit Google anmelden“:"
+      ],
+      "button": "Bei Nowry anmelden",
+      "after": [
+        "Wenn du das nicht warst, ignoriere diese E-Mail. Es hat sich nichts geändert."
+      ],
+      "signature": "Nowry",
+      "footer": "Gesendet an $email, weil für diese Adresse ein neues Passwort angefordert wurde."
     }
   },
   "waitlist": {
