@@ -211,6 +211,13 @@ app.include_router(contact.router)        # The public contact form — POST /co
 app.include_router(beta_admin.router)     # Personal invitations, admin-only (ADR-077)
 app.include_router(email_webhooks.router) # Resend: bounces and complaints, by signature (ADR-080)
 app.include_router(beta.router)           # The beta gate — GET /beta/config, invites, waitlist (ADR-038)
+
+# The dev-only outbox (ADR-090): never mounted in production.
+from app.services import dev_outbox as _dev_outbox  # noqa: E402
+if _dev_outbox.should_mount():
+    from app.routers import dev_outbox as dev_outbox_router  # noqa: E402
+
+    app.include_router(dev_outbox_router.router)
 app.include_router(copyright.router)      # Takedown notices — POST /copyright-notices (GTM-008)
 app.include_router(blocks.router)        # Blocks — the one object for time (PLAN-001, ADR-045)
 

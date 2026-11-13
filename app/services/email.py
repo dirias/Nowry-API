@@ -27,6 +27,7 @@ import httpx
 from app.emails.budget import may_send, parse_budget
 from email.utils import formataddr, parseaddr
 
+from app.services import dev_outbox
 from app.emails.render import KINDS, RenderedEmail, load_strings, render_email, resolve_locale
 from app.services import email_ledger, email_suppressions
 from app.utils.logger import get_logger
@@ -159,4 +160,5 @@ async def send_email(
     if outcome != SENT:
         logger.warning("send_email: %s not sent (%s)", kind, outcome)
     await email_ledger.record(kind, email_class, outcome, rendered.locale, to)
+    await dev_outbox.keep(kind, to, rendered, outcome)  # off production only (ADR-090)
     return outcome
