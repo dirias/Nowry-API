@@ -126,6 +126,8 @@ async def lifespan(app: FastAPI):
     reaper.cancel()
     traces.cancel()
     await _flush_langfuse_queue()
+    # The trace IDs recorded since the last write, so a redeploy loses none (ADR-081 amendment).
+    await ai_traces.flush_on_shutdown()
 
 
 app = FastAPI(lifespan=lifespan)

@@ -9,6 +9,7 @@ account is deleted, together with any the observations API still finds for it.
 
     should_export_span(span)       Langfuse's export hook: records, then defers to the default filter
     flush_loop()                   writes recorded pairs to `ai_traces`; retries pending deletions
+    flush_on_shutdown()            writes what is still waiting when the app stops; never raises
     delete_user_traces(user_id)    at account deletion; never raises
 
 Nothing but the two ids and a time is stored here: no prompt, no answer.
@@ -82,7 +83,12 @@ async def flush_recorded() -> int:
         UpdateOne({"trace_id": trace_id}, {"$setOnInsert": {"trace_id": trace_id, "user_id": user_id, "created_at": now}}, upsert=True)
         for trace_id, user_id in by_trace.items()
     ]
-    await ai_traces_collection.bulk_write(ops, ordered=False)
+    try:
+        await ai_traces_collection.bulk_write(ops, ordered=False)
+    except Exception:
+        for pair in pairs:  # back on the queue for the next flush; a write that failed loses nothing
+            _recorded.put(pair)
+        raise
     return len(ops)
 
 
@@ -120,6 +126,10 @@ async def _delete(client: httpx.AsyncClient, base: str, trace_ids: Iterable[str]
     ids = sorted(set(trace_ids))
     for start in range(0, len(ids), BATCH):
         response = await client.request("DELETE", f"{base}/api/public/traces", json={"traceIds": ids[start : start + BATCH]})
+        # "Not found" means there is nothing left to delete (a trace already gone,
+        # or one in a project that was replaced): done, not a failure to retry.
+        if response.status_code == 404:
+            continue
         response.raise_for_status()
 
 
@@ -181,6 +191,15 @@ async def retry_pending() -> None:
             await ai_trace_deletions_collection.update_one({"_id": row["_id"]}, {"$set": {"attempts": attempts}})
             if attempts >= MAX_ATTEMPTS:
                 logger.error("Langfuse traces of a deleted account could not be deleted after %d attempts: %s", attempts, type(exc).__name__)
+
+
+async def flush_on_shutdown() -> None:
+    """Write every recorded pair still waiting, so a redeploy loses none. Never raises."""
+    try:
+        while not _recorded.empty():
+            await flush_recorded()
+    except Exception as exc:  # noqa: BLE001 - shutdown must finish
+        logger.warning("ai_traces: final flush failed: %s", type(exc).__name__)
 
 
 async def flush_loop() -> None:

@@ -119,3 +119,47 @@ async def test_batches_deletions_by_a_thousand(monkeypatch):
     _langfuse(monkeypatch, handler)
     assert await ai_traces.delete_user_traces("u1") is True
     assert sizes == [1000, 1000, 500]
+
+
+@pytest.mark.asyncio
+async def test_a_trace_langfuse_no_longer_has_counts_as_deleted(monkeypatch):
+    traces, deletions = _collections(monkeypatch, remembered=["gone"])
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [], "meta": {}})
+        return httpx.Response(404, json={"message": "Trace not found"})
+
+    _langfuse(monkeypatch, handler)
+    assert await ai_traces.delete_user_traces("u1") is True
+    traces.delete_many.assert_awaited_once_with({"user_id": "u1"})
+    deletions.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_writes_every_pair_still_waiting(monkeypatch):
+    traces, _ = _collections(monkeypatch, remembered=[])
+    for i in range(7000):  # more than one flush takes at a time
+        ai_traces._recorded.put(("u1", f"t{i}"))
+    await ai_traces.flush_on_shutdown()
+    assert ai_traces._recorded.empty()
+    written = sum(len(call.args[0]) for call in traces.bulk_write.await_args_list)
+    assert written == 7000
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_puts_the_pairs_back(monkeypatch):
+    traces, _ = _collections(monkeypatch, remembered=[])
+    traces.bulk_write = AsyncMock(side_effect=RuntimeError("database away"))
+    ai_traces._recorded.put(("u1", "t1"))
+    with pytest.raises(RuntimeError):
+        await ai_traces.flush_recorded()
+    assert ai_traces._drain() == [("u1", "t1")]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_never_raises_when_the_database_is_away(monkeypatch):
+    traces, _ = _collections(monkeypatch, remembered=[])
+    traces.bulk_write = AsyncMock(side_effect=RuntimeError("database away"))
+    ai_traces._recorded.put(("u1", "t1"))
+    await ai_traces.flush_on_shutdown()
