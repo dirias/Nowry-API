@@ -193,8 +193,9 @@ async def login_user(
             detail="Firebase UID mismatch"
         )
     
-    # Find user in MongoDB by Firebase UID
-    user = await users_collection.find_one({"firebase_uid": request.firebase_uid})
+    # The account the dependency resolved (ADR-083), not a second lookup by uid.
+    user_id = firebase_user.get("user_id")
+    user = await users_collection.find_one({"_id": ObjectId(user_id), "deleted_at": None}) if user_id and ObjectId.is_valid(user_id) else None
     
     if not user:
         raise HTTPException(

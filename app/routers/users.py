@@ -101,8 +101,10 @@ async def get_current_user_profile(
     if not firebase_uid:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
-    # Find user by firebase_uid
-    user = await users_collection.find_one({"firebase_uid": firebase_uid})
+    # The account the dependency resolved (ADR-083): by `user_id`, so a sign-in
+    # matched by verified email is answered like every other route answers it.
+    user_id = current_user.get("user_id")
+    user = await users_collection.find_one({"_id": ObjectId(user_id), "deleted_at": None}) if user_id and ObjectId.is_valid(user_id) else None
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

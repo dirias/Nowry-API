@@ -18,6 +18,7 @@ from functools import lru_cache
 from typing import Optional
 from datetime import datetime, timezone
 import asyncio
+import re
 import logging
 import os
 import time
@@ -66,6 +67,79 @@ async def _record_verification(users_collection, user: dict, token_data: dict) -
     if update.get("sessions_valid_after"):
         _sessions_cut[token_data["firebase_uid"]] = update["sessions_valid_after"]
         logger.warning("auth: a sign-in by %s verified an account made unverified; older sessions are cut", token_data.get("sign_in_provider"))
+
+
+#: The 409 when two live Firebase identities claim one account (ADR-083).
+ACCOUNT_CONFLICT_CODE: str = "account_conflict"
+
+
+def _firebase_identity_exists(firebase_uid: str) -> Optional[bool]:
+    """True or False from Firebase; None when Firebase could not be asked."""
+    from firebase_admin import auth as firebase_admin_auth
+
+    try:
+        firebase_admin_auth.get_user(firebase_uid)
+        return True
+    except firebase_admin_auth.UserNotFoundError:
+        return False
+    except Exception as exc:  # noqa: BLE001 - an unanswered lookup changes nothing
+        logger.warning("auth: could not ask Firebase about a stored sign-in id: %s", type(exc).__name__)
+        return None
+
+
+async def _account_by_email(users_collection, email: str) -> Optional[dict]:
+    """The active account holding this address, ignoring case; a deleted one never (ADR-081, ADR-083).
+
+    Exact first, on the unique index; a case-insensitive anchored match only
+    when that misses, which is the rare fallback path, never the normal one.
+    """
+    address = email.strip()
+    user = await users_collection.find_one({"email": address, "deleted_at": None})
+    if user:
+        return user
+    pattern = {"$regex": f"^{re.escape(address)}$", "$options": "i"}
+    return await users_collection.find_one({"email": pattern, "deleted_at": None})
+
+
+async def _alert_conflict() -> None:
+    """Tell the operator, at most once an hour, that two live identities claim one account."""
+    from app.services.notifications import notify
+    from app.utils.keyed_rate_limit import seconds_to_wait
+
+    logger.error("auth: two live Firebase identities claim one account; not merged (ADR-083)")
+    try:
+        if await seconds_to_wait("auth_conflict_notice", "all", 1, 3600) == 0:
+            await notify(
+                "[Nowry] Sign-in conflict: two identities, one account",
+                "A verified sign-in matched an account whose own Firebase id is still alive. "
+                "Nothing was merged; the person was told to write to support. Check the API logs.",
+            )
+    except Exception as exc:  # noqa: BLE001 - an alert never changes the answer
+        logger.warning("auth: the conflict notice was not sent: %s", type(exc).__name__)
+
+
+async def _relink_if_identity_gone(users_collection, user: dict, token_uid: str) -> None:
+    """A verified email found this account under another Firebase id (ADR-083, FR-030).
+
+    The stored id gone from Firebase: write the token's id on the account. Still
+    alive: two identities claim one account, refused 409 and nothing written.
+    Firebase unreachable: nothing written; the request is served by `user_id`.
+    """
+    stored_uid = user.get("firebase_uid")
+    if not token_uid or stored_uid == token_uid:
+        return
+    exists = await asyncio.to_thread(_firebase_identity_exists, stored_uid) if stored_uid else False
+    if exists is None:
+        return
+    if exists:
+        await _alert_conflict()
+        raise HTTPException(status_code=409, detail={"code": ACCOUNT_CONFLICT_CODE})
+    await users_collection.update_one(
+        {"_id": user["_id"], "firebase_uid": stored_uid},
+        {"$set": {"firebase_uid": token_uid, "updated_at": datetime.now(timezone.utc)}},
+    )
+    user["firebase_uid"] = token_uid
+    logger.info("auth: re-linked an account whose Firebase id no longer exists")
 
 
 def _get_cached_token(token: str) -> dict | None:
@@ -172,8 +246,18 @@ async def get_firebase_user(request: Request) -> dict:
         # this serves is a Google account, whose email Firebase has verified.
         # An unverified email is anyone's word, and would have resolved a new
         # Firebase account to whichever Nowry account holds that address.
-        if not user and token_data.get("email") and token_data.get("email_verified"):
-            user = await users_collection.find_one({"email": token_data["email"], "deleted_at": None})
+        if not user and token_data.get("email"):
+            user = await _account_by_email(users_collection, token_data["email"])
+            # The same uid is sign-up's own race (QA-010: /users/me and
+            # /auth/register both provision), not a claim: use it.
+            if user and user.get("firebase_uid") != token_data["firebase_uid"] and not token_data.get("email_verified"):
+                # ADR-083 case 2: the address has an account, and this identity
+                # has not proven it owns the address. Confirm first; the
+                # verified sign-in that follows re-links. Before the invite
+                # gate, so the answer is "confirm", not "private beta".
+                raise HTTPException(status_code=409, detail={"code": "email_unverified"})
+            if user:
+                await _relink_if_identity_gone(users_collection, user, token_data["firebase_uid"])
 
         if user:
             # ADR-076: record the email's standing first, so the request that
