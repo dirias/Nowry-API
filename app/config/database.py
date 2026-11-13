@@ -64,6 +64,9 @@ comments_collection = db["comments"]
 rate_limits_collection = db["rate_limits"]
 email_suppressions_collection = db["email_suppressions"]  # bounced or complained, by hash; never an address (ADR-080)
 email_sends_collection = db["email_sends"]  # the send ledger: kind, class, day, outcome; never an address (ADR-078)
+# Which Langfuse trace belongs to which account id, so deleting an account deletes its traces (ADR-081 amendment).
+ai_traces_collection = db["ai_traces"]
+ai_trace_deletions_collection = db["ai_trace_deletions"]  # deletions Langfuse refused, retried in the background
 
 # Fork idempotency records — one per (content type, source, user) (ADR-005).
 content_forks_collection = db["content_forks"]
@@ -231,6 +234,10 @@ async def create_indexes():
     # The email ledger (ADR-078): counted by day, kept 90 days. The quota row has no created_at and stays.
     await email_sends_collection.create_index("day")
     await email_sends_collection.create_index("created_at", expireAfterSeconds=90 * 24 * 3600)
+    # ADR-081 amendment: a trace is remembered once; an account's traces are found by its id.
+    await ai_traces_collection.create_index("trace_id", unique=True)
+    await ai_traces_collection.create_index("user_id")
+    await ai_trace_deletions_collection.create_index("user_id", unique=True)
 
     # Data indexes for performance
     await books_collection.create_index("user_id")

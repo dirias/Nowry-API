@@ -55,10 +55,15 @@ _langfuse_client = None
 if _LANGFUSE_SECRET_KEY and _LANGFUSE_PUBLIC_KEY:
     try:
         from langfuse import Langfuse
+        from app.services.ai_traces import should_export_span
+
         _langfuse_client = Langfuse(
             secret_key=_LANGFUSE_SECRET_KEY,
             public_key=_LANGFUSE_PUBLIC_KEY,
             base_url=_LANGFUSE_BASE_URL,
+            # ADR-081 amendment: remember which trace is whose, so a deleted
+            # account's traces can be deleted; the default filter still decides.
+            should_export_span=should_export_span,
             # SDK defaults: propagate_exceptions=False (no crash on network errors)
         )
         logger.info("Langfuse client initialized successfully.")

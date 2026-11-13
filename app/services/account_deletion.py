@@ -70,6 +70,8 @@ HANDLED_OTHERWISE: Dict[str, str] = {
     "invites": "the operator's record of who was invited; the account id it names is gone with the account",
     "bugs": "a report the person chose to send to the operator",
     "content_forks": "legacy, read by one migration only",
+    "ai_traces": "two ids per Langfuse trace; the account's rows go when its traces are deleted at Langfuse, at once (ai_traces.py)",
+    "ai_trace_deletions": "a deletion Langfuse refused, retried until it succeeds; holds only the account id",
 }
 
 #: Collections that may hold `is_public`; deletion unpublishes as it marks.

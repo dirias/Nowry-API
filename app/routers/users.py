@@ -1242,6 +1242,11 @@ async def delete_account(
     # 5. The Stripe customer, which holds the email (ADR-081 point 4). Never raises.
     await account_deletion.delete_stripe_customer(user.get("stripe_customer_id"))
 
+    # 6. The account's AI request records at Langfuse (ADR-081 amendment). Never raises; retried on failure.
+    from app.services import ai_traces
+
+    await ai_traces.delete_user_traces(str(user_id))
+
     return AccountDeleteResponse(
         message="Your account is deleted. Everything in it is erased after 30 days.",
         recovery_deadline=(now + timedelta(days=account_deletion.RETENTION_DAYS)).isoformat(),
