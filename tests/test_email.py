@@ -59,8 +59,9 @@ def test_every_kind_has_its_words():
     english = json.loads((LOCALE_DIR / "en.json").read_text(encoding="utf-8"))
     for kind, traits in KINDS.items():
         group, name = kind.split(".")
-        # An account email has one button; a letter to a visitor has none (its tests are in test_mail008_wait004).
-        action = {"button", "after"} if traits["sender"] == "account" else set()
+        # An account email has one button unless it says it has none (ADR-089's notice);
+        # a letter to a visitor has none (its tests are in test_mail008_wait004).
+        action = {"button", "after"} if traits["sender"] == "account" and traits.get("button") != "none" else set()
         assert {"subject", "before", "signature", "footer"} | action <= set(english[group][name])
 
 
@@ -71,8 +72,11 @@ def test_both_parts_render_in_every_language_with_nothing_left_unfilled(kind, lo
     assert rendered.locale == locale and rendered.subject
     for part in (rendered.subject, rendered.text, rendered.html):
         assert "$" not in part
-    assert VALUES["link"] in rendered.text.splitlines()  # the link alone on its line
-    assert 'href="https://nowry.app/auth/action?mode=verifyEmail&amp;oobCode=abc"' in rendered.html
+    if KINDS[kind].get("button") == "none":  # a notice: no link at all (ADR-089)
+        assert VALUES["link"] not in rendered.text and "href=" not in rendered.html.split("</table>")[-1]
+    else:
+        assert VALUES["link"] in rendered.text.splitlines()  # the link alone on its line
+        assert 'href="https://nowry.app/auth/action?mode=verifyEmail&amp;oobCode=abc"' in rendered.html
     assert f'<html lang="{locale}">' in rendered.html and "ana@example.com" in rendered.html
     assert rendered.html.count("<img ") == 1 and 'alt="Nowry"' in rendered.html
 

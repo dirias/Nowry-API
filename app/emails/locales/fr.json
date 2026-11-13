@@ -45,6 +45,15 @@
       ],
       "signature": "Nowry",
       "footer": "Envoyé à $email parce qu'une réinitialisation du mot de passe a été demandée pour cette adresse."
+    },
+    "deleted": {
+      "subject": "Votre compte Nowry a été supprimé",
+      "before": [
+        "Bonjour,",
+        "Votre compte Nowry a été supprimé. Si ce n'était pas vous, écrivez à $support dans les 30 jours."
+      ],
+      "signature": "Nowry",
+      "footer": "Envoyé à $email parce que le compte Nowry lié à cette adresse a été supprimé."
     }
   },
   "waitlist": {

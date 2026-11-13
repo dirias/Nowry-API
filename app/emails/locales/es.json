@@ -45,6 +45,15 @@
       ],
       "signature": "Nowry",
       "footer": "Enviado a $email porque se pidió restablecer la contraseña de esta dirección."
+    },
+    "deleted": {
+      "subject": "Tu cuenta de Nowry se ha eliminado",
+      "before": [
+        "Hola:",
+        "Tu cuenta de Nowry se ha eliminado. Si no fuiste tú, escribe a $support en un plazo de 30 días."
+      ],
+      "signature": "Nowry",
+      "footer": "Enviado a $email porque se eliminó la cuenta de Nowry con esta dirección."
     }
   },
   "waitlist": {

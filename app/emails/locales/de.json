@@ -45,6 +45,15 @@
       ],
       "signature": "Nowry",
       "footer": "Gesendet an $email, weil für diese Adresse ein neues Passwort angefordert wurde."
+    },
+    "deleted": {
+      "subject": "Dein Nowry-Konto wurde gelöscht",
+      "before": [
+        "Hallo,",
+        "dein Nowry-Konto wurde gelöscht. Wenn du das nicht warst, schreib innerhalb von 30 Tagen an $support."
+      ],
+      "signature": "Nowry",
+      "footer": "Gesendet an $email, weil das Nowry-Konto mit dieser Adresse gelöscht wurde."
     }
   },
   "waitlist": {

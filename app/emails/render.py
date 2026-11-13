@@ -24,6 +24,8 @@ KINDS: dict[str, dict[str, str]] = {
     "account.reset": {"class": "account", "sender": "account"},
     # A reset asked for an address whose only sign-in is Google (ADR-083, FR-033).
     "account.google": {"class": "account", "sender": "account"},
+    # The notice right after a deletion (ADR-089, FR-039): no button; a reply reaches support.
+    "account.deleted": {"class": "account", "sender": "account", "button": "none"},
     # A letter to a person who asked to wait (ADR-078 point 1b): no button, and a way to leave.
     "waitlist.confirm": {"class": "confirmation", "sender": "personal"},
     # The form met an address that already has an account (ADR-084): the waitlist's look and sender, but not a list email, so no leave link.

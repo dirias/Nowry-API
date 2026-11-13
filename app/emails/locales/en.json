@@ -45,6 +45,15 @@
       ],
       "signature": "Nowry",
       "footer": "Sent to $email because a password reset was requested for this address."
+    },
+    "deleted": {
+      "subject": "Your Nowry account was deleted",
+      "before": [
+        "Hi,",
+        "Your Nowry account was deleted. If this wasn't you, write to $support within 30 days."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email because the Nowry account with this address was deleted."
     }
   },
   "waitlist": {

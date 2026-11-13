@@ -9,6 +9,7 @@ creates (ADR-049 point 3, amended for QA-007).
 """
 import asyncio
 import contextlib
+import time
 import sys
 from dataclasses import dataclass, field
 
@@ -74,8 +75,9 @@ class World:
                "username": f"{label}{str(uid)[-6:]}", "subscription": {"tier": "pro", "status": "active"}}
         doc.update(fields)
         self.run(self.raw["users"].insert_one(doc))
+        # A token just issued: `auth_time` is now, as after a real sign-in (ADR-089 reads it).
         self.users[uid] = {"user_id": str(uid), "firebase_uid": doc["firebase_uid"],
-                           "email": doc["email"], "email_verified": True}
+                           "email": doc["email"], "email_verified": True, "auth_time": int(time.time())}
         return uid
 
     def act_as(self, uid: ObjectId) -> None:

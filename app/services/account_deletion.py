@@ -16,17 +16,25 @@ it: every old row carries the old account's id, which no one can sign in as.
     mark_everything(user_id, now)     every owned row, one call per collection
     release_identity(user, now)       the account record, last
     delete_stripe_customer(id)        never raises
+
+ADR-089 adds three things around it: a deletion needs a sign-in less than five
+minutes old (`signed_in_recently`), the address is told once afterwards
+(`send_deletion_notice`), and a new account with the same address learns of
+the old one within the 30 days (`previous_account`).
 """
 from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime
+import re
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from bson import ObjectId
 
 from app.config import database
+from app.services.email import send_email
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -169,3 +177,92 @@ async def delete_stripe_customer(customer_id: Optional[str]) -> bool:
     except Exception as exc:  # noqa: BLE001 - a Stripe failure must not undo a deletion
         logger.error("account deletion: the Stripe customer could not be deleted: %s", type(exc).__name__)
         return False
+
+
+# ── ADR-089: a fresh sign-in, the notice, the re-registration notice ────────
+
+#: How old a sign-in may be when the account is deleted (FR-038).
+RECENT_SIGN_IN_SECONDS = 300
+
+#: The refusal the clients answer by asking for the sign-in again.
+REAUTH_REQUIRED_CODE = "reauth_required"
+
+
+def signed_in_recently(auth_time: Any, now_epoch: Optional[float] = None) -> bool:
+    """Whether the token's `auth_time` (seconds since the epoch) is less than five minutes old.
+
+    A token without one is refused: every Firebase ID token carries it.
+    """
+    if not isinstance(auth_time, (int, float)) or isinstance(auth_time, bool):
+        return False
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    return now_epoch - auth_time <= RECENT_SIGN_IN_SECONDS
+
+
+def notice_locale(requested: Optional[str], user: dict) -> Optional[str]:
+    """The language of the notice: the client's, else the stored one; the renderer falls back to English."""
+    stored = ((user.get("preferences") or {}).get("general") or {}).get("language")
+    return (requested or "").strip() or stored or None
+
+
+async def send_deletion_notice(user: dict, locale: Optional[str], now: datetime) -> str:
+    """Tell the account's address that it was deleted (FR-039), once, and store the outcome.
+
+    `user` is the record as it was before its identity was released. Only a
+    verified address is written to (ADR-076). Never raises.
+    """
+    address = (user.get("email") or "").strip()
+    if user.get("email_verified") is not True or not address:
+        outcome = "unverified"
+    else:
+        try:
+            outcome = await send_email("account.deleted", address, locale, {})
+        except Exception as exc:  # noqa: BLE001 - the deletion is done; a notice failure must not surface
+            logger.error("account deletion: the notice could not be sent: %s", type(exc).__name__)
+            outcome = "failed"
+    await database.db["users"].update_one(
+        {"_id": user["_id"]}, {"$set": {"deletion_notice": {"outcome": outcome, "at": now}}}
+    )
+    return outcome
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+async def previous_account(user: dict, now: Optional[datetime] = None) -> Optional[Dict[str, str]]:
+    """The deletion this new account should hear about (FR-041), or None.
+
+    Only for a verified address, an account created after that deletion, a
+    deletion less than 30 days old, and while the notice is not dismissed.
+    """
+    if user.get("email_verified") is not True or not user.get("email"):
+        return None
+    if (user.get("notices") or {}).get("previous_account_dismissed_at"):
+        return None
+    now = now or datetime.now(timezone.utc)
+    window: Dict[str, Any] = {"$gte": now - timedelta(days=RETENTION_DAYS)}
+    created = user.get("created_at")
+    if isinstance(created, datetime):
+        window["$lte"] = _aware(created)
+    query = {
+        "deleted_identity.email": {"$regex": f"^{re.escape(user['email'].strip())}$", "$options": "i"},
+        "deleted_at": window,
+        "_id": {"$ne": user["_id"]},
+    }
+    rows = await database.db["users"].find(query, {"deleted_at": 1}).sort("deleted_at", -1).to_list(length=1)
+    if not rows:
+        return None
+    deleted_at = _aware(rows[0]["deleted_at"])
+    if deleted_at < now - timedelta(days=RETENTION_DAYS):
+        return None
+    return {
+        "deleted_at": deleted_at.isoformat(),
+        "erased_at": (deleted_at + timedelta(days=RETENTION_DAYS)).isoformat(),
+    }
+
+
+async def dismiss_previous_account(user_id: str, now: datetime) -> None:
+    await database.db["users"].update_one(
+        {"_id": ObjectId(user_id)}, {"$set": {"notices.previous_account_dismissed_at": now}}
+    )

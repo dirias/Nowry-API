@@ -45,6 +45,15 @@
       ],
       "signature": "Nowry",
       "footer": "このアドレスのパスワード再設定が依頼されたため、$email にお送りしました。"
+    },
+    "deleted": {
+      "subject": "Nowry アカウントが削除されました",
+      "before": [
+        "こんにちは。",
+        "Nowry アカウントが削除されました。心当たりがない場合は、30日以内に $support までご連絡ください。"
+      ],
+      "signature": "Nowry",
+      "footer": "このアドレスの Nowry アカウントが削除されたため、$email にお送りしました。"
     }
   },
   "waitlist": {

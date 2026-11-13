@@ -66,6 +66,7 @@ from app.config.database import (
     blackboards_collection,
 )
 from app.auth.firebase_auth import get_firebase_user
+from app.services import account_deletion
 from app.services.companion_style import LEGACY_SOCRATIC, resolve_style
 
 router = APIRouter(
@@ -88,6 +89,8 @@ class UserMeResponse(BaseModel):
     preferences: dict
     created_at: Optional[datetime] = None
     wizard_completed: bool
+    # ADR-089, FR-041: an account with this address deleted less than 30 days ago.
+    previous_account: Optional[Dict[str, str]] = None
 
 
 @router.get("/me", response_model=UserMeResponse)
@@ -123,7 +126,14 @@ async def get_current_user_profile(
         preferences=user.get("preferences", {}),
         created_at=user.get("created_at"),
         wizard_completed=user.get("wizard_completed", False),
+        previous_account=await account_deletion.previous_account(user),
     )
+
+
+@router.post("/me/notices/previous-account/dismiss", status_code=204)
+async def dismiss_previous_account_notice(current_user: dict = Depends(get_firebase_user)) -> None:
+    """The re-registration notice was read (ADR-089, FR-041); it is not shown again."""
+    await account_deletion.dismiss_previous_account(current_user.get("user_id"), datetime.now(timezone.utc))
 
 
 # Pydantic Models
@@ -1159,6 +1169,7 @@ async def disable_2fa(current_user: dict = Depends(get_firebase_user)):
 @router.delete("/account", response_model=AccountDeleteResponse)
 async def delete_account(
     background_tasks: BackgroundTasks,
+    locale: Optional[str] = Query(default=None, max_length=10),
     current_user: dict = Depends(get_firebase_user),
 ):
     """
@@ -1175,8 +1186,16 @@ async def delete_account(
 
     Order per D-08: every MongoDB write is committed FIRST, then Firebase and
     Stripe are told. Their failures are logged and never undo the deletion.
+
+    ADR-089: the sign-in must be less than five minutes old (`401
+    reauth_required` otherwise, before anything is read), and the verified
+    address is told once afterwards, in `locale` or the stored language.
     """
-    from app.services import account_deletion
+    if not account_deletion.signed_in_recently(current_user.get("auth_time")):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": account_deletion.REAUTH_REQUIRED_CODE, "max_age_seconds": account_deletion.RECENT_SIGN_IN_SECONDS},
+        )
 
     user_id = current_user.get("user_id")
     firebase_uid: str = current_user.get("firebase_uid", "")
@@ -1221,6 +1240,9 @@ async def delete_account(
 
     # 3. The account record last: marked, and its identity released (ADR-081 point 5).
     await account_deletion.release_identity(user, now)
+
+    # The notice to the address it had (ADR-089, FR-039), after the response.
+    background_tasks.add_task(account_deletion.send_deletion_notice, user, account_deletion.notice_locale(locale, user), now)
 
     # 4. Revoke Firebase credentials AFTER all MongoDB writes (D-08)
     if firebase_uid:
