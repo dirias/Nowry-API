@@ -177,3 +177,6 @@ data/
 
 # Anki deck exports (personal/test data, not app assets)
 *.apkg
+
+# The dev end-to-end suite's Vercel bypass secret (never committed)
+.env.e2e.local
