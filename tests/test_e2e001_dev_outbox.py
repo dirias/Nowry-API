@@ -56,19 +56,32 @@ def test_the_outbox_is_read_only_with_the_key(monkeypatch):
     monkeypatch.setenv("DEV_OUTBOX_KEY", KEY)
     with fake_world() as world:
         _send(world, monkeypatch)
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
         from app.routers import dev_outbox as route
-        from app.main import app
 
-        if not any(getattr(r, "path", "") == "/dev/outbox" for r in app.routes):
-            app.include_router(route.router)
-        assert world.http.get("/dev/outbox").status_code == 404
-        assert world.http.get("/dev/outbox", headers={"X-Dev-Outbox-Key": "wrong"}).status_code == 404
-        response = world.http.get("/dev/outbox", params={"to": "RIKYDIER+e2e@example.com"}, headers={"X-Dev-Outbox-Key": KEY})
-        assert response.status_code == 200, response.text
-        items = response.json()["items"]
-        assert len(items) == 1 and items[0]["kind"] == "account.deleted"
-        monkeypatch.setenv("ENV", "production")
-        assert world.http.get("/dev/outbox", headers={"X-Dev-Outbox-Key": KEY}).status_code == 404
+        # Its own app: the shared one must not gain a route for the rest of the suite.
+        app = FastAPI()
+        app.include_router(route.router)
+        client = TestClient(app)
+        # The route's reads run on the fake world's loop, like every other request in it.
+        from app.services import dev_outbox as service
+
+        kept = world.run(service.read("rikydier+e2e@example.com", None, 20))
+        assert len(kept) == 1  # the service's own read, on the world's loop
+
+        async def read(to, kind, limit):  # the route's call, on the client's loop
+            return kept if (to or "").strip().lower() == "rikydier+e2e@example.com" else []
+
+        with patch.object(service, "read", read):
+            assert client.get("/dev/outbox").status_code == 404
+            assert client.get("/dev/outbox", headers={"X-Dev-Outbox-Key": "wrong"}).status_code == 404
+            response = client.get("/dev/outbox", params={"to": "RIKYDIER+e2e@example.com"}, headers={"X-Dev-Outbox-Key": KEY})
+            assert response.status_code == 200, response.text
+            items = response.json()["items"]
+            assert len(items) == 1 and items[0]["kind"] == "account.deleted"
+            monkeypatch.setenv("ENV", "production")
+            assert client.get("/dev/outbox", headers={"X-Dev-Outbox-Key": KEY}).status_code == 404
 
 
 def test_production_does_not_mount_the_route(monkeypatch):
