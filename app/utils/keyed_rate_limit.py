@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from app.config.database import rate_limits_collection
 from app.utils.logger import get_logger
@@ -53,3 +54,26 @@ async def longest_wait(checks: list[tuple[str, str, int, int]]) -> int:
     """Take a slot in every (feature, key, limit, window) and return the longest wait among them."""
     waits = [await seconds_to_wait(*check) for check in checks]
     return max(waits, default=0)
+
+
+async def claim_rolling(feature: str, key: str, window_seconds: int, now: datetime | None = None) -> bool:
+    """Once per key in any `window_seconds` (a rolling window, not a fixed one). True when the caller may go on.
+
+    One atomic write: the row is taken when it is missing or older than the
+    window; a row inside the window makes the upsert collide, which is a no.
+    A store that cannot be read says no.
+    """
+    at = now or datetime.now(timezone.utc)
+    row_id = f"{feature}:{key}"
+    try:
+        await rate_limits_collection.find_one_and_update(
+            {"_id": row_id, "$or": [{"last_at": {"$exists": False}}, {"last_at": {"$lt": at - timedelta(seconds=window_seconds)}}]},
+            {"$set": {"feature": feature, "last_at": at, "expires_at": at + timedelta(seconds=window_seconds)}},
+            upsert=True,
+        )
+        return True
+    except DuplicateKeyError:
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("keyed_rate_limit: rolling claim unavailable for %s: %s", feature, exc)
+        return False

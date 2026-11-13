@@ -58,6 +58,20 @@
       ],
       "signature": "Didier, Nowry",
       "footer": "Gesendet an $email, weil diese Adresse auf die Nowry-Warteliste gesetzt wurde."
+    },
+    "account": {
+      "subject": "Du hast schon ein Nowry-Konto",
+      "before": [
+        "Hallo,",
+        "diese Adresse wurde gerade auf der Nowry-Warteliste eingetragen, hat aber schon ein Nowry-Konto. Du musst nicht warten: Melde dich hier an."
+      ],
+      "button": "Bei Nowry anmelden",
+      "after": [
+        "Wenn du dich mit Google registriert hast, hast du kein Passwort: Nutze „Mit Google anmelden“.",
+        "Wenn du das nicht warst, ignoriere diese E-Mail. Es hat sich nichts geändert."
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "Gesendet an $email, weil diese Adresse auf der Nowry-Warteliste eingetragen wurde."
     }
   }
 }

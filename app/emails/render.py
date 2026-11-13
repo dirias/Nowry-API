@@ -26,6 +26,8 @@ KINDS: dict[str, dict[str, str]] = {
     "account.google": {"class": "account", "sender": "account"},
     # A letter to a person who asked to wait (ADR-078 point 1b): no button, and a way to leave.
     "waitlist.confirm": {"class": "confirmation", "sender": "personal"},
+    # The form met an address that already has an account (ADR-084): the waitlist's look and sender, but not a list email, so no leave link.
+    "waitlist.account": {"class": "confirmation", "sender": "personal", "leave": "none"},
 }
 
 _P = '<p style="margin:0 0 14px;">{}</p>'
@@ -125,7 +127,7 @@ def render_email(kind: str, locale: Optional[str], values: Mapping[str, str], *,
     if kind not in KINDS:
         raise KeyError(kind)
     # A letter to a visitor always carries the way to leave (ADR-078 point 1b); account email never does.
-    visitor = KINDS[kind]["sender"] == "personal"
+    visitor = KINDS[kind]["sender"] == "personal" and KINDS[kind].get("leave") != "none"
     if visitor and not values.get("leave_link"):
         raise KeyError("leave_link")
     code = resolve_locale(locale)

@@ -12,11 +12,11 @@ checked before an account exists, and the waitlist is for people who were not
 let in. The two writes are rate-limited like `/contact`. The enforcement of
 the invite is not here; it is where accounts are created (`firebase_auth`).
 
-A first submission to the waitlist tells the operator's mailbox (WAIT-001,
-FR-013); a repeat tells no one. The visitor gets the same answer either way,
-so the form cannot be used to learn whether an address is on the list. After
-the answer, the address is sent its one confirmation if it is owed one
-(WAIT-004, FR-027).
+The waitlist form answers every address alike before anything is looked up
+(ADR-084, FR-034); after the answer, an address with an account is sent a
+letter and not added, a new one tells the operator's mailbox (WAIT-001,
+FR-013), and each is sent its one confirmation if it is owed one (WAIT-004,
+FR-027).
 
 Leaving (MAIL-008, FR-026, ADR-080): reading a token removes no one, since
 mail scanners open links; only the POST does, and it answers the same for any
@@ -28,7 +28,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Request, status
 
 from app.config.beta import beta_config, open_code_rule
-from app.config.database import waitlist_collection
+from app.config.database import users_collection, waitlist_collection
 from app.core.limiter import limiter
 from app.models.Beta import (
     BetaConfigResponse,
@@ -43,11 +43,15 @@ from app.config.invites import is_personal_token
 from app.services.beta_invites import count_code_uses, personal_invite_usable
 from app.services.notifications import notify, waitlist_notification
 from app.services import waitlist
+from app.services.account_lookup import active_account_by_email
+from app.utils.logger import get_logger
 from app.services.waitlist import join as upsert_waitlist, waitlist_document  # noqa: F401 - the names earlier callers import
 
 router = APIRouter(prefix="/beta", tags=["beta"])
+logger = get_logger(__name__)
 
-WAITLIST_ACK = "You're on the list. We'll write when a place opens."
+# ADR-084: one answer for every address; the clients show their own translation of it.
+WAITLIST_ACK = "Done. If this is your first time, we've sent you a confirmation email. If you were already on the list, you're still on it; nothing else to do."
 
 
 async def join_waitlist(payload: WaitlistCreate, collection, now: Optional[datetime] = None) -> WaitlistResponse:
@@ -81,12 +85,31 @@ async def check_invite(request: Request, payload: InviteCheckRequest) -> InviteC
 @limiter.limit("5/minute")
 async def submit_waitlist(request: Request, payload: WaitlistCreate, background_tasks: BackgroundTasks) -> WaitlistResponse:
     """Store an email for the next cohort; tell the mailbox when it is a new one. No auth; 5 per minute per address."""
-    doc, is_new = await upsert_waitlist(payload, waitlist_collection)
-    if is_new:
-        background_tasks.add_task(notify, *waitlist_notification(doc))
-    # Every submission asks; the row decides whether a confirmation is owed (once per address, ever).
-    background_tasks.add_task(waitlist.send_confirmation, doc["email"], waitlist_collection)
+    # ADR-084: nothing is looked up or written before the answer, so every
+    # address gets the same answer at the same point.
+    background_tasks.add_task(after_waitlist_form, payload)
     return WaitlistResponse(message=WAITLIST_ACK)
+
+
+async def after_waitlist_form(payload: WaitlistCreate, collection=None, users=None) -> None:
+    """What a submission does once it is answered (ADR-084, FR-034). Never raises.
+
+    An address with an active account is told so and not added. Any other is
+    upserted; a new one tells the operator; every one asks for its confirmation,
+    which the row grants once per address, ever (FR-027).
+    """
+    collection = waitlist_collection if collection is None else collection
+    users = users_collection if users is None else users
+    try:
+        if await active_account_by_email(users, payload.email):
+            await waitlist.send_account_letter(payload.email, payload.locale)
+            return
+        doc, is_new = await upsert_waitlist(payload, collection)
+        if is_new:
+            await notify(*waitlist_notification(doc))
+        await waitlist.send_confirmation(doc["email"], collection)
+    except Exception as exc:  # noqa: BLE001 - the visitor already has their answer
+        logger.warning("waitlist: a submission could not be completed: %s", type(exc).__name__)
 
 
 @router.get("/waitlist/leave/{token}", response_model=WaitlistLeaveHint)

@@ -10,9 +10,11 @@ ever sent, and records when its one confirmation left.
     leave_hint         what the leave page shows before anything changes
     leave              the page's key and a mail provider's one-click request
     mark_suppressed    Resend said this address bounced or complained
+    send_account_letter  the form met an address that has an account (ADR-084)
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -23,6 +25,7 @@ from pymongo import ReturnDocument
 from app.models.Beta import WaitlistCreate
 from app.services import email as email_service
 from app.services import email_suppressions
+from app.utils.keyed_rate_limit import claim_rolling
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -30,6 +33,9 @@ logger = get_logger(__name__)
 WAITING = "waiting"
 LEFT = "left"
 CONFIRMATION_KIND = "waitlist.confirm"
+ACCOUNT_KIND = "waitlist.account"
+#: One account letter per address in this many seconds (ADR-084 point 5).
+ACCOUNT_LETTER_WINDOW = 24 * 3600
 
 #: A claim older than this was left by a worker that died mid-send, and may be taken again.
 CLAIM_TTL = timedelta(minutes=10)
@@ -186,3 +192,24 @@ async def mark_suppressed(address: str, reason: str, collection, suppressions=No
     at = now or datetime.now(timezone.utc)
     await email_suppressions.suppress(address, reason, suppressions, at)
     await collection.update_one({"email": address.strip().lower()}, {"$set": {"suppressed": reason, "suppressed_at": at}})
+
+
+def _address_key(address: str) -> str:
+    """The limit is counted on a hash, so the counter never holds an address."""
+    return hashlib.sha256(address.strip().lower().encode("utf-8")).hexdigest()[:32]
+
+
+async def send_account_letter(address: str, locale: Optional[str]) -> str:
+    """Tell an address that already has an account so, at most once a day (ADR-084). Never raises.
+
+    `limited` inside the 24 hours. A suppressed address and a spent
+    confirmation share are refused by `send_email` itself.
+    """
+    try:
+        if not await claim_rolling("waitlist_account", _address_key(address), ACCOUNT_LETTER_WINDOW):
+            return "limited"
+        link = f"{email_service.frontend_url()}/login"
+        return await email_service.send_email(ACCOUNT_KIND, address.strip().lower(), locale, {"link": link})
+    except Exception as exc:  # noqa: BLE001 - runs after the answer; nothing is waiting for it
+        logger.warning("waitlist: the account letter could not be sent: %s", type(exc).__name__)
+        return email_service.FAILED

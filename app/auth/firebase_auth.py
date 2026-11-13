@@ -14,11 +14,11 @@ from app.config.subscription_plans import SubscriptionTier
 from app.config.beta import INVITE_HEADER
 from app.services.beta_invites import gate_account_creation, release_personal_invite, settle_personal_invite
 from app.models.User import USERNAME_MAX_LENGTH, sanitize_username
+from app.services.account_lookup import active_account_by_email
 from functools import lru_cache
 from typing import Optional
 from datetime import datetime, timezone
 import asyncio
-import re
 import logging
 import os
 import time
@@ -85,20 +85,6 @@ def _firebase_identity_exists(firebase_uid: str) -> Optional[bool]:
     except Exception as exc:  # noqa: BLE001 - an unanswered lookup changes nothing
         logger.warning("auth: could not ask Firebase about a stored sign-in id: %s", type(exc).__name__)
         return None
-
-
-async def _account_by_email(users_collection, email: str) -> Optional[dict]:
-    """The active account holding this address, ignoring case; a deleted one never (ADR-081, ADR-083).
-
-    Exact first, on the unique index; a case-insensitive anchored match only
-    when that misses, which is the rare fallback path, never the normal one.
-    """
-    address = email.strip()
-    user = await users_collection.find_one({"email": address, "deleted_at": None})
-    if user:
-        return user
-    pattern = {"$regex": f"^{re.escape(address)}$", "$options": "i"}
-    return await users_collection.find_one({"email": pattern, "deleted_at": None})
 
 
 async def _alert_conflict() -> None:
@@ -247,7 +233,7 @@ async def get_firebase_user(request: Request) -> dict:
         # An unverified email is anyone's word, and would have resolved a new
         # Firebase account to whichever Nowry account holds that address.
         if not user and token_data.get("email"):
-            user = await _account_by_email(users_collection, token_data["email"])
+            user = await active_account_by_email(users_collection, token_data["email"])
             # The same uid is sign-up's own race (QA-010: /users/me and
             # /auth/register both provision), not a claim: use it.
             if user and user.get("firebase_uid") != token_data["firebase_uid"] and not token_data.get("email_verified"):

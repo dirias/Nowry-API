@@ -1,7 +1,7 @@
 """A small in-memory stand-in for a Motor collection, for the invitation tests.
 
 It understands the filters those tests use (equality, `$or`, `$gt`, `$lte`,
-`$lt`, `$ne`, `$exists`) and applies `$set`, `$unset` and, on an upsert,
+`$lt`, `$ne`, `$exists`, `$regex`) and applies `$set`, `$unset` and, on an upsert,
 `$setOnInsert`, so an atomic claim is exercised as a query, not as a mock that
 returns whatever the test told it to.
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 from types import SimpleNamespace
+import re
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
@@ -31,6 +32,10 @@ def _matches(row: Dict[str, Any], query: Dict[str, Any]) -> bool:
                 return False
             if "$exists" in wanted and (key in row) != bool(wanted["$exists"]):
                 return False
+            if "$regex" in wanted:
+                flags = re.IGNORECASE if "i" in wanted.get("$options", "") else 0
+                if not (isinstance(value, str) and re.search(wanted["$regex"], value, flags)):
+                    return False
         elif row.get(key) != wanted:
             return False
     return True

@@ -355,6 +355,7 @@ def client(world, monkeypatch):
     from app.core.limiter import limiter
 
     monkeypatch.setattr(beta_module, "waitlist_collection", world.rows)
+    monkeypatch.setattr(beta_module, "users_collection", FakeCollection())  # ADR-084: no account holds these addresses
     monkeypatch.setattr(beta_module, "notify", AsyncMock(return_value=True))
     monkeypatch.setattr(email_webhooks, "waitlist_collection", world.rows)
     monkeypatch.setenv("RESEND_WEBHOOK_SECRET", SECRET)

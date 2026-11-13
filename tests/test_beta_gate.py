@@ -200,6 +200,7 @@ def _waitlist_client(monkeypatch, before):
     collection.find_one_and_update = AsyncMock(side_effect=before)
     notify = AsyncMock(return_value=True)
     monkeypatch.setattr(beta_module, "waitlist_collection", collection)
+    monkeypatch.setattr(beta_module, "users_collection", MagicMock(find_one=AsyncMock(return_value=None)))  # ADR-084: no account
     monkeypatch.setattr(beta_module, "notify", notify)
     # WAIT-004's confirmation has its own tests; here it would read the scripted collection.
     monkeypatch.setattr(beta_module.waitlist, "send_confirmation", AsyncMock(return_value="skipped"))
@@ -248,6 +249,7 @@ def test_a_notification_that_fails_is_logged_and_the_sign_up_still_succeeds(monk
     collection = MagicMock()
     collection.find_one_and_update = AsyncMock(return_value=None)
     monkeypatch.setattr(beta_module, "waitlist_collection", collection)
+    monkeypatch.setattr(beta_module, "users_collection", MagicMock(find_one=AsyncMock(return_value=None)))  # ADR-084: no account
     monkeypatch.setattr(beta_module.waitlist, "send_confirmation", AsyncMock(return_value="skipped"))  # WAIT-004 has its own tests
     monkeypatch.setattr(notifications.httpx, "AsyncClient", MagicMock(side_effect=RuntimeError("resend is down")))
     limiter.reset()

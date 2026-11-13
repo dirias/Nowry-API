@@ -58,6 +58,20 @@
       ],
       "signature": "Didier, Nowry",
       "footer": "Sent to $email because this address was added to the Nowry waitlist."
+    },
+    "account": {
+      "subject": "You already have a Nowry account",
+      "before": [
+        "Hi,",
+        "This address was just entered on the Nowry waitlist, but it already has a Nowry account. There is no need to wait: sign in here."
+      ],
+      "button": "Sign in to Nowry",
+      "after": [
+        "If you signed up with Google, there is no password: use Sign in with Google.",
+        "If this wasn't you, ignore this email. Nothing has changed."
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "Sent to $email because this address was entered on the Nowry waitlist."
     }
   }
 }

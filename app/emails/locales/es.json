@@ -58,6 +58,20 @@
       ],
       "signature": "Didier, Nowry",
       "footer": "Enviado a $email porque esta dirección se añadió a la lista de espera de Nowry."
+    },
+    "account": {
+      "subject": "Ya tienes una cuenta de Nowry",
+      "before": [
+        "Hola:",
+        "Alguien acaba de escribir esta dirección en la lista de espera de Nowry, pero ya tiene una cuenta de Nowry. No hace falta esperar: inicia sesión aquí."
+      ],
+      "button": "Iniciar sesión en Nowry",
+      "after": [
+        "Si te registraste con Google, no tienes contraseña: usa Iniciar sesión con Google.",
+        "Si no fuiste tú, ignora este correo. No ha cambiado nada."
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "Enviado a $email porque esta dirección se escribió en la lista de espera de Nowry."
     }
   }
 }
