@@ -38,6 +38,36 @@ class RegisterRequest(BaseModel):
     photo_url: str | None = None
 
 
+#: ADR-085: an auto-provisioned account's name was derived from the token; one a person picked is chosen.
+USERNAME_DERIVED = "derived"
+USERNAME_CHOSEN = "chosen"
+
+
+async def _apply_chosen_username(existing_user: dict, requested: str | None, firebase_uid: str) -> str:
+    """Set the sign-up's chosen name on an account that still carries a derived one; else change nothing.
+
+    The update is conditional on the marker, so a request that loses a race,
+    or comes from a later sign-in, cannot rename the account (ADR-085).
+    """
+    current: str = existing_user.get("username")
+    if existing_user.get("username_source") != USERNAME_DERIVED or not requested:
+        return current
+    now = datetime.now(timezone.utc)
+    for candidate in (requested, f"{requested}-{firebase_uid[:6]}"[:USERNAME_MAX_LENGTH]):
+        try:
+            result = await users_collection.update_one(
+                {"_id": existing_user["_id"], "username_source": USERNAME_DERIVED},
+                {"$set": {"username": candidate, "username_source": USERNAME_CHOSEN, "updated_at": now}},
+            )
+        except DuplicateKeyError:
+            continue  # another account owns it: the clash suffix (NAME-002 will change it)
+        if result.modified_count:
+            return candidate
+        fresh = await users_collection.find_one({"_id": existing_user["_id"]}, {"username": 1})
+        return (fresh or {}).get("username", current)
+    return current
+
+
 class LoginRequest(BaseModel):
     firebase_uid: str
     email: EmailStr
@@ -86,36 +116,12 @@ async def register_user(
     })
     
     if existing_user:
-        # User already exists — this is the expected race with
-        # get_firebase_user's auto-provisioning: the dependency above ran
-        # BEFORE this handler body and may have already inserted a doc with
-        # a username derived from the Firebase token (e.g. the email prefix,
-        # if the ID token's `name` claim wasn't populated yet). If the
-        # username the signup form actually submitted differs from what got
-        # auto-provisioned, reconcile it now instead of silently discarding
-        # the value the user actually typed.
-        final_username = existing_user.get("username")
-        if request.username and request.username != final_username:
-            now = datetime.now(timezone.utc)
-            try:
-                await users_collection.update_one(
-                    {"_id": existing_user["_id"]},
-                    {"$set": {"username": request.username, "updated_at": now}},
-                )
-                final_username = request.username
-            except DuplicateKeyError:
-                # Another account already owns this exact username — disambiguate
-                # the same way firebase_auth.py's auto-provision collision
-                # handling does, rather than losing the reconciliation entirely.
-                # Truncated to USERNAME_MAX_LENGTH: request.username is already
-                # validated at up to 30 chars, so appending "-{uid[:6]}" could
-                # otherwise exceed the same limit we just started enforcing.
-                disambiguated = f"{request.username}-{request.firebase_uid[:6]}"[:USERNAME_MAX_LENGTH]
-                await users_collection.update_one(
-                    {"_id": existing_user["_id"]},
-                    {"$set": {"username": disambiguated, "updated_at": now}},
-                )
-                final_username = disambiguated
+        # The expected race with get_firebase_user's auto-provisioning: the
+        # dependency ran before this handler and may have written the account
+        # with a name derived from the token. Only that account, marked
+        # `derived`, takes the name the sign-up chose. Any other account keeps
+        # its username: a sign-in never renames anyone (ADR-085, FR-035).
+        final_username = await _apply_chosen_username(existing_user, request.username, request.firebase_uid)
 
         return {
             "message": "User already exists",
@@ -132,6 +138,7 @@ async def register_user(
         "firebase_uid": request.firebase_uid,
         "email": request.email,
         "username": request.username,
+        "username_source": USERNAME_CHOSEN,  # ADR-085
         "photo_url": request.photo_url,
         "role": "user",
         "subscription": {

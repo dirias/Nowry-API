@@ -102,3 +102,11 @@ def test_login_reads_the_resolved_account_not_the_uid_again(world):
     world.current["user"] = {"firebase_uid": "fb-new", "email": "didier@example.com", "user_id": str(old)}
     ok = world.http.post("/auth/login", json={"firebase_uid": "fb-new", "email": "didier@example.com"})
     assert ok.status_code == 200 and ok.json()["user_id"] == str(old)
+
+
+def test_an_auto_provisioned_account_is_marked_derived(world):
+    """NAME-001, ADR-085: only this marker lets /auth/register set the chosen name."""
+    with patch.object(firebase_auth, "gate_account_creation", AsyncMock(return_value=None)):
+        resolved, _ = _resolve(world, _google("fb-brand-new", "new@example.com"))
+    doc = world.run(world.raw["users"].find_one({"firebase_uid": "fb-brand-new"}))
+    assert resolved["user_id"] == str(doc["_id"]) and doc["username_source"] == "derived"

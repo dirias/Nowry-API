@@ -65,14 +65,58 @@ def test_register_cannot_claim_another_accounts_email(world):
 
 
 def test_register_again_keeps_the_account_and_takes_the_typed_username(world):
-    uid = world.new_user("returning", username="auto_from_token")
+    uid = world.new_user("returning", username="auto_from_token", username_source="derived")
     token = _token(world, uid)
     response = world.http.post("/auth/register", json={
         "firebase_uid": token["firebase_uid"], "email": token["email"], "username": "typed_name",
     })
     assert response.status_code == 200
     assert response.json()["user_id"] == str(uid)
-    assert world.run(world.raw["users"].find_one({"_id": uid}))["username"] == "typed_name"
+    doc = world.run(world.raw["users"].find_one({"_id": uid}))
+    assert doc["username"] == "typed_name" and doc["username_source"] == "chosen"
+
+
+@pytest.mark.parametrize("source", ["chosen", None])
+def test_a_later_sign_in_never_renames_an_existing_account(world, source):
+    """NAME-001, ADR-085: Google sign-in posts /auth/register with the Google name every time."""
+    fields = {"username": "my_edited_name"}
+    if source:
+        fields["username_source"] = source
+    uid = world.new_user("member", **fields)
+    token = _token(world, uid)
+    response = world.http.post("/auth/register", json={
+        "firebase_uid": token["firebase_uid"], "email": token["email"], "username": "GoogleName",
+    })
+    assert response.status_code == 200 and response.json()["username"] == "my_edited_name"
+    doc = world.run(world.raw["users"].find_one({"_id": uid}))
+    assert doc["username"] == "my_edited_name" and doc.get("username_source") == source
+
+
+def test_the_chosen_name_is_applied_once_then_never_again(world):
+    uid = world.new_user("fresh", username="derived_name", username_source="derived")
+    token = _token(world, uid)
+    first = world.http.post("/auth/register", json={"firebase_uid": token["firebase_uid"], "email": token["email"], "username": "picked"})
+    later = world.http.post("/auth/register", json={"firebase_uid": token["firebase_uid"], "email": token["email"], "username": "GoogleName"})
+    assert first.json()["username"] == "picked" and later.json()["username"] == "picked"
+
+
+def test_a_clash_on_the_chosen_name_still_gets_the_suffix_and_is_marked_chosen(world):
+    world.run(world.raw["users"].create_index("username", unique=True))
+    world.new_user("other", username="picked")
+    uid = world.new_user("fresh", username="derived_name", username_source="derived")
+    token = _token(world, uid)
+    response = world.http.post("/auth/register", json={"firebase_uid": token["firebase_uid"], "email": token["email"], "username": "picked"})
+    doc = world.run(world.raw["users"].find_one({"_id": uid}))
+    assert response.json()["username"] == doc["username"] == f"picked-{token['firebase_uid'][:6]}"
+    assert doc["username_source"] == "chosen"
+
+
+def test_a_settings_edit_marks_the_name_chosen(world):
+    uid = world.new_user("fresh", username="derived_name", username_source="derived")
+    _token(world, uid)
+    assert world.http.patch("/users/profile", json={"username": "edited"}).status_code == 200
+    doc = world.run(world.raw["users"].find_one({"_id": uid}))
+    assert doc["username"] == "edited" and doc["username_source"] == "chosen"
 
 
 def test_login_returns_the_tokens_account_and_404s_an_unknown_one(world):

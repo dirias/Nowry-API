@@ -610,6 +610,7 @@ async def patch_user_profile(
         if existing is not None:
             raise HTTPException(status_code=409, detail="Username already taken")
         update_dict["username"] = body.username
+        update_dict["username_source"] = "chosen"  # ADR-085: no sign-in renames it after this
 
     updated_at = datetime.now(timezone.utc)
     update_dict["updated_at"] = updated_at
