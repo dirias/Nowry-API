@@ -208,7 +208,7 @@ class AgentStateResponse(BaseModel):
     animation_regen_pending: bool = False
     pet_active: bool = True
     pet_revealed: bool = True
-    agent_roaming_enabled: bool = True
+    agent_roaming_enabled: bool = False  # ROAM-001, FR-036: still unless turned on
     agent_intervention_frequency: str = 'balanced'
     agent_focus_mode: bool = False
     agent_intervention_wrong_answer: bool = True
@@ -2997,7 +2997,7 @@ async def get_agent_state(
     knowledge_access, proactive_nudging, style = _get_agent_prefs(user)
 
     prefs: dict = user.get("preferences", {}).get("agent", {})
-    agent_roaming_enabled: bool = bool(prefs.get("roaming_enabled", True))
+    agent_roaming_enabled: bool = bool(prefs.get("roaming_enabled", False))
     intervention_frequency: str = prefs.get("intervention_frequency", "balanced")
     focus_mode: bool = bool(prefs.get("focus_mode", False))
     intervention_wrong_answer: bool = bool(prefs.get("intervention_wrong_answer", True))

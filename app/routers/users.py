@@ -320,7 +320,7 @@ class GeneralPreferencesResponse(BaseModel):
     agent_conciseness: str = 'balanced'
     agent_tone: str = 'friendly'
     agent_teaching_style: str = 'show'
-    agent_roaming_enabled: bool = True
+    agent_roaming_enabled: bool = False  # ROAM-001, FR-036: still unless turned on
     agent_intervention_frequency: str = 'balanced'
     agent_focus_mode: bool = False
     agent_intervention_wrong_answer: bool = True
@@ -790,7 +790,7 @@ async def get_general_preferences(
         agent_knowledge_access=agent_prefs.get("knowledge_access", False),
         agent_proactive_nudging=agent_prefs.get("proactive_nudging", False),
         **_style_response_fields(agent_prefs),
-        agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", True)),
+        agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", False)),
         agent_intervention_frequency=agent_prefs.get("intervention_frequency", "balanced"),
         agent_focus_mode=bool(agent_prefs.get("focus_mode", False)),
         agent_intervention_wrong_answer=bool(agent_prefs.get("intervention_wrong_answer", True)),
@@ -905,7 +905,7 @@ async def update_general_preferences(
         agent_knowledge_access=agent_prefs.get("knowledge_access", False),
         agent_proactive_nudging=agent_prefs.get("proactive_nudging", False),
         **_style_response_fields(agent_prefs),
-        agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", True)),
+        agent_roaming_enabled=bool(agent_prefs.get("roaming_enabled", False)),
         agent_intervention_frequency=agent_prefs.get("intervention_frequency", "balanced"),
         agent_focus_mode=bool(agent_prefs.get("focus_mode", False)),
         agent_intervention_wrong_answer=bool(agent_prefs.get("intervention_wrong_answer", True)),
