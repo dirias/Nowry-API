@@ -151,14 +151,11 @@ async def register_user(
         "signup_provider": firebase_user.get("sign_in_provider"),
         "preferences": {
             "pet": {
-                # New accounts start with the pet inactive; it auto-activates
-                # the first time the user completes a study session, via
-                # POST /agent/pet/reveal. This is the only place `False` is
-                # ever written for these fields — legacy docs and the
-                # PetPreferencesResponse model both default to True so
-                # existing accounts keep behaving as already active.
-                "pet_active": False,
-                "pet_revealed": False,
+                # ROAM-002, FR-037: the study buddy is on from the first screen,
+                # resting in one place (roaming is off, FR-036). The person can
+                # turn it off in companion settings; that choice is kept.
+                "pet_active": True,
+                "pet_revealed": True,
             }
         },
         "created_at": datetime.now(timezone.utc),

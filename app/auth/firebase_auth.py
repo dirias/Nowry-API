@@ -319,15 +319,11 @@ async def get_firebase_user(request: Request) -> dict:
                 "preferences": {
                     "pet": {
                         # Mirror register_user's new-account defaults (auth.py):
-                        # the pet starts inactive and un-revealed, auto-activating
-                        # on the user's first completed study session via
-                        # POST /agent/pet/reveal. Without this, an account
-                        # auto-provisioned here (first-time Google sign-in,
-                        # racing ahead of /auth/register) would fall through to
-                        # PetPreferencesResponse's True default and show the pet
-                        # as already active on a brand-new account.
-                        "pet_active": False,
-                        "pet_revealed": False,
+                        # ROAM-002, FR-037: the study buddy is on and revealed
+                        # from the first screen, resting in one place (roaming
+                        # is off, FR-036), whichever request makes the account.
+                        "pet_active": True,
+                        "pet_revealed": True,
                     }
                 },
                 "created_at": now,

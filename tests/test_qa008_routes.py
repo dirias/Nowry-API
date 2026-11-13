@@ -36,13 +36,13 @@ def _token(world, uid, **overrides):
 # ── /auth/register and /auth/login ──────────────────────────────────────────
 
 
-def test_register_creates_a_free_account_with_the_pet_asleep(world):
+def test_register_creates_a_free_account_with_the_study_buddy_on(world):
     world.current["user"] = {"firebase_uid": "fb-new", "email": "new@example.com", "email_verified": True}
     response = world.http.post("/auth/register", json={"firebase_uid": "fb-new", "email": "new@example.com", "username": "newcomer"})
     assert response.status_code == 200, response.text
     doc = world.run(world.raw["users"].find_one({"firebase_uid": "fb-new"}))
     assert doc["subscription"]["tier"] == "free"
-    assert doc["preferences"]["pet"] == {"pet_active": False, "pet_revealed": False}
+    assert doc["preferences"]["pet"] == {"pet_active": True, "pet_revealed": True}  # ROAM-002, FR-037
     assert response.json()["user_id"] == str(doc["_id"])
 
 
