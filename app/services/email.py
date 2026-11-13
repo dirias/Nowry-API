@@ -43,6 +43,13 @@ NOT_ALLOWED = "not_allowed"
 OVER_BUDGET = "over_budget"
 SUPPRESSED = "suppressed"
 FAILED = "failed"
+#: Development only: the suite's own alias, kept in the dev outbox and never sent (ADR-090, E2E-005).
+OUTBOX = "outbox"
+
+
+def delivered(outcome: str) -> bool:
+    """Whether the email reached its reader: sent through Resend, or, for the dev suite, kept in the outbox."""
+    return outcome in (SENT, OUTBOX)
 
 
 def _env(name: str) -> str:
@@ -149,7 +156,9 @@ async def send_email(
     # "Questions:" names an address alone, never "Name <address>".
     filled = {"email": to, "support": config["reply_to"] or parseaddr(config["from"])[1], **values}
     rendered = render_email(kind, locale, filled, logo_url=mark_url(), postal=_env("EMAIL_POSTAL_ADDRESS"))
-    if not allowed_recipient(to, _env("EMAIL_ALLOWLIST")):
+    if dev_outbox.outbox_only(to):
+        outcome = OUTBOX  # never posted, never counted in the budget (`sent_today` counts "sent")
+    elif not allowed_recipient(to, _env("EMAIL_ALLOWLIST")):
         outcome = NOT_ALLOWED
     elif KINDS[kind]["sender"] == "personal" and await email_suppressions.is_suppressed(to):
         outcome = SUPPRESSED
@@ -157,7 +166,7 @@ async def send_email(
         outcome = OVER_BUDGET
     else:
         outcome = SENT if await _post(config, resend_payload(config, to, rendered, headers)) else FAILED
-    if outcome != SENT:
+    if not delivered(outcome):
         logger.warning("send_email: %s not sent (%s)", kind, outcome)
     await email_ledger.record(kind, email_class, outcome, rendered.locale, to)
     await dev_outbox.keep(kind, to, rendered, outcome)  # off production only (ADR-090)

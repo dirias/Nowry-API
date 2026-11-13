@@ -39,6 +39,8 @@ ACCOUNT_LETTER_WINDOW = 24 * 3600
 
 #: A claim older than this was left by a worker that died mid-send, and may be taken again.
 CLAIM_TTL = timedelta(minutes=10)
+#: A confirmation that never left is tried again at most once per address in this time (WAIT-017, FR-034).
+RETRY_AFTER = timedelta(hours=24)
 
 LEAVE_PAGE_PATH = "/waitlist/leave/"
 LEAVE_API_PATH = "/beta/waitlist/leave/"
@@ -138,14 +140,21 @@ async def _token_of(row: Dict[str, Any], collection) -> str:
 async def send_confirmation(address: str, collection, now: Optional[datetime] = None) -> str:
     """Send the one confirmation this address is owed. Returns the outcome; never raises.
 
-    `skipped` when none is owed. Anything but `sent` releases the claim, so a
-    later submission can try again (ADR-080 point 6).
+    `skipped` when none is owed. Anything but delivered releases the claim, so
+    a later submission can try again (ADR-080 point 6), but not within 24 hours
+    of the last try: `limited` (WAIT-017, FR-034). A delivered confirmation is
+    never sent again.
     """
     at = now or datetime.now(timezone.utc)
     try:
         row = await _claim_confirmation(address.lower(), collection, at)
         if row is None:
             return "skipped"
+        tried = row.get("confirmation_tried_at")
+        if tried is not None and (tried if tried.tzinfo else tried.replace(tzinfo=timezone.utc)) > at - RETRY_AFTER:
+            await collection.update_one({"_id": row["_id"]}, {"$unset": {"confirmation_claimed_at": ""}})
+            return "limited"
+        await collection.update_one({"_id": row["_id"]}, {"$set": {"confirmation_tried_at": at}})
         links = leave_links(await _token_of(row, collection))
         if links is None:
             logger.warning("waitlist: no public API address (API_PUBLIC_URL), so no confirmation can carry its one-click header")
@@ -155,7 +164,7 @@ async def send_confirmation(address: str, collection, now: Optional[datetime] = 
                 CONFIRMATION_KIND, row["email"], row.get("locale"),
                 {"leave_link": links["page"]}, headers=unsubscribe_headers(links["one_click"]),
             )
-        if outcome == email_service.SENT:
+        if email_service.delivered(outcome):
             await collection.update_one({"_id": row["_id"]}, {"$set": {"confirmation_sent_at": at}, "$unset": {"confirmation_claimed_at": ""}})
         else:
             await collection.update_one({"_id": row["_id"]}, {"$unset": {"confirmation_claimed_at": ""}})

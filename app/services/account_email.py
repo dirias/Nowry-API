@@ -81,7 +81,7 @@ async def send_verification(email: str, language: Optional[str]) -> str:
         await _note_fallback("account.verify", f"no link: {type(exc).__name__}")
         return FALLBACK
     outcome = await email_service.send_email("account.verify", email, language, {"link": link})
-    if outcome != email_service.SENT:
+    if not email_service.delivered(outcome):
         await _note_fallback("account.verify", outcome)
         return FALLBACK
     return SENT
@@ -107,7 +107,7 @@ async def send_google_notice(email: str, language: Optional[str]) -> None:
         outcome = await email_service.send_email("account.google", email, language, {"link": link})
     except Exception as exc:  # noqa: BLE001 - runs after the answer; nothing to raise to
         outcome = f"failed: {type(exc).__name__}"
-    if outcome != email_service.SENT:
+    if not email_service.delivered(outcome):
         logger.warning("account email: the Google sign-in notice was not sent (%s)", outcome)
 
 
@@ -148,6 +148,6 @@ async def send_reset(email: str, language: Optional[str]) -> None:
         outcome = await email_service.send_email("account.reset", email, language, {"link": link})
     except Exception as exc:  # noqa: BLE001
         outcome = f"no link: {type(exc).__name__}"
-    if outcome != email_service.SENT:
+    if not email_service.delivered(outcome):
         await _note_fallback("account.reset", outcome)
         await firebase_sends_reset(email, language)

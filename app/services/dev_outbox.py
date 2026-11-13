@@ -38,6 +38,15 @@ def enabled() -> bool:
     return _on("DEV_OUTBOX") and not is_production()
 
 
+#: The suite's aliases (E2E-005): `rikydier+e2e-<run>-<case>@…`. Manual `rikydier+…` tests are not covered.
+SUITE_PREFIX = "rikydier+e2e-"
+
+
+def outbox_only(address: str) -> bool:
+    """On development with the outbox on, a suite alias is kept here and never sent (ADR-090 amended)."""
+    return enabled() and (address or "").strip().lower().startswith(SUITE_PREFIX)
+
+
 def should_mount() -> bool:
     """Whether the app serves `GET /dev/outbox` at all."""
     return enabled()
