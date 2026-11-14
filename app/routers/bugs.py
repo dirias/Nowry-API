@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import status as http_status
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from bson import ObjectId
 
@@ -12,6 +13,8 @@ from app.models.Bug import (
 from app.models.common import BugStatsResponse, BugStatusUpdateResponse, MessageResponse
 from app.config.database import bugs_collection, users_collection
 from app.auth.firebase_auth import get_firebase_user
+from app.auth.dependencies import require_admin
+from app.services.admin_actions import record_admin_action
 
 router = APIRouter(prefix="/bugs", tags=["bugs"])
 
@@ -35,14 +38,14 @@ async def submit_bug_report(
     # Later, we can restrict to beta testers only
     # if not user.get("beta_features", {}).get("bug_reporting", False):
     #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         status_code=http_status.HTTP_403_FORBIDDEN,
     #         detail="Bug reporting is only available for beta testers"
     #     )
 
     # Validate screenshot count (max 3)
     if len(bug_data.screenshots) > 3:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="Maximum 3 screenshots allowed per bug report",
         )
 
@@ -98,96 +101,47 @@ async def get_my_bug_reports(current_user=Depends(get_firebase_user)):
     return bugs
 
 
-# ========== DEVELOPER-ONLY ENDPOINTS ==========
-# These must come BEFORE /{bug_id} routes to prevent "all" and "stats" being treated as bug IDs
+# ========== ADMIN-ONLY ENDPOINTS (ADMIN-001, ADR-086) ==========
+# These must come BEFORE /{bug_id} routes to prevent "all" and "stats" being treated as bug IDs.
+# `require_admin` reads `is_admin` from the account; `role` grants nothing.
+
+#: The most reports one triage listing returns.
+ALL_BUGS_LIMIT = 500
+STATUS_COUNTS = {"open": "open", "in_progress": "in-progress", "resolved": "resolved"}
+SEVERITIES = ("critical", "high", "medium", "low")
+
+
+def bug_filter(bug_status: Optional[str], severity: Optional[str], category: Optional[str]) -> Dict[str, str]:
+    """The listing's filter: only the fields the caller named."""
+    named = {"status": bug_status, "severity": severity, "category": category}
+    return {field: value for field, value in named.items() if value}
 
 
 @router.get("/all", response_model=List[BugReport])
 async def get_all_bugs(
-    status: str = None,
-    severity: str = None,
-    category: str = None,
-    current_user=Depends(get_firebase_user),
-):
-    """
-    Get all bug reports with optional filters (Dev only).
+    bug_status: Optional[str] = Query(default=None, alias="status", max_length=40),
+    severity: Optional[str] = Query(default=None, max_length=40),
+    category: Optional[str] = Query(default=None, max_length=40),
+    current_user: dict = Depends(require_admin),
+) -> List[dict]:
+    """Every bug report, newest first, optionally filtered (admin only).
 
-    Available filters:
     - status: open, in-progress, resolved, closed
     - severity: low, medium, high, critical
     - category: ui, functionality, performance, other
     """
-
-    # Check if user is dev or beta
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
-
-    if not user or user.get("role") not in ["dev", "beta"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Developer or beta access required",
-        )
-
-    # Build query with filters
-    query = {}
-    if status:
-        query["status"] = status
-    if severity:
-        query["severity"] = severity
-    if category:
-        query["category"] = category
-
-    # Get bugs
-    bugs = await bugs_collection.find(query).sort("created_at", -1).to_list(500)
-
-    # Convert ObjectIds to strings
+    bugs = await bugs_collection.find(bug_filter(bug_status, severity, category)).sort("created_at", -1).to_list(ALL_BUGS_LIMIT)
     for bug in bugs:
         bug["_id"] = str(bug["_id"])
-
     return bugs
 
 
 @router.get("/stats", response_model=BugStatsResponse)
-async def get_bug_stats(current_user=Depends(get_firebase_user)):
-    """
-    Get bug statistics (Dev only).
-
-    Returns counts by status and severity.
-    """
-
-    # Check if user is dev or beta
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
-
-    if not user or user.get("role") not in ["dev", "beta"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Developer access required"
-        )
-
-    # Get statistics
-    total = await bugs_collection.count_documents({})
-    open_bugs = await bugs_collection.count_documents({"status": "open"})
-    in_progress = await bugs_collection.count_documents({"status": "in-progress"})
-    resolved = await bugs_collection.count_documents({"status": "resolved"})
-    critical = await bugs_collection.count_documents({"severity": "critical"})
-    high = await bugs_collection.count_documents({"severity": "high"})
-    medium = await bugs_collection.count_documents({"severity": "medium"})
-    low = await bugs_collection.count_documents({"severity": "low"})
-
-    return {
-        "total": total,
-        "by_status": {
-            "open": open_bugs,
-            "in_progress": in_progress,
-            "resolved": resolved,
-        },
-        "by_severity": {
-            "critical": critical,
-            "high": high,
-            "medium": medium,
-            "low": low,
-        },
-    }
+async def get_bug_stats(current_user: dict = Depends(require_admin)) -> BugStatsResponse:
+    """Counts by status and severity (admin only)."""
+    by_status = {key: await bugs_collection.count_documents({"status": value}) for key, value in STATUS_COUNTS.items()}
+    by_severity = {name: await bugs_collection.count_documents({"severity": name}) for name in SEVERITIES}
+    return BugStatsResponse(total=await bugs_collection.count_documents({}), by_status=by_status, by_severity=by_severity)
 
 
 # ========== USER ENDPOINTS (with path parameters) ==========
@@ -207,19 +161,19 @@ async def get_bug_by_id(
         bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
     except Exception:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
+            status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
         )
 
     if not bug:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bug report not found"
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug report not found"
         )
 
     # Check if user owns this bug report
     user_id = current_user.get("user_id")
     if bug["user_id"] != user_id:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=http_status.HTTP_403_FORBIDDEN,
             detail="You can only view your own bug reports",
         )
 
@@ -242,19 +196,19 @@ async def delete_bug_report(
         bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
     except Exception:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
+            status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
         )
 
     if not bug:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bug report not found"
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug report not found"
         )
 
     # Check if user owns this bug report
     user_id = current_user.get("user_id")
     if bug["user_id"] != user_id:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=http_status.HTTP_403_FORBIDDEN,
             detail="You can only delete your own bug reports",
         )
 
@@ -268,53 +222,26 @@ async def delete_bug_report(
 async def update_bug_status(
     bug_id: str,
     status_update: BugStatusUpdate,
-    current_user=Depends(get_firebase_user),
-):
-    """
-    Update bug status, priority, and notes (Dev only).
-
-    Allows developers to manage bug lifecycle.
-    """
-
-    # Check if user is dev or beta
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
-
-    if not user or user.get("role") not in ["dev", "beta"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Developer access required"
-        )
-
-    # Find bug
-    try:
-        bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
-        )
-
+    current_user: dict = Depends(require_admin),
+) -> BugStatusUpdateResponse:
+    """Change a report's status, priority and notes (admin only). Logged as `bug.status`."""
+    if not ObjectId.is_valid(bug_id):
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format")
+    bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
     if not bug:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found"
-        )
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug not found")
 
-    # Prepare update data
-    update_data = {"status": status_update.status, "updated_at": datetime.now(timezone.utc)}
-
+    now = datetime.now(timezone.utc)
+    update_data: Dict[str, Any] = {"status": status_update.status, "updated_at": now}
     if status_update.priority:
         update_data["priority"] = status_update.priority
-
     if status_update.notes:
         update_data["dev_notes"] = status_update.notes
-
     if status_update.status == "resolved":
-        update_data["resolved_at"] = datetime.now(timezone.utc)
-
-    # Update bug
+        update_data["resolved_at"] = now
     await bugs_collection.update_one({"_id": ObjectId(bug_id)}, {"$set": update_data})
-
-    return {
-        "message": "Bug status updated successfully",
-        "bug_id": bug_id,
-        "status": status_update.status,
-    }
+    await record_admin_action(
+        current_user["user_id"], "bug.status", "bug", bug_id, bug.get("title"),
+        details={"from": bug.get("status"), "to": status_update.status, "priority": status_update.priority},
+    )
+    return BugStatusUpdateResponse(message="Bug status updated successfully", bug_id=bug_id, status=status_update.status)
