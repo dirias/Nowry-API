@@ -82,11 +82,12 @@ async def create_invite(payload: InviteCreate, admin: dict = Depends(require_rec
 
 @router.post("/invites/batch", response_model=InviteBatchResponse)
 async def batch_invites(payload: InviteBatchRequest, admin: dict = Depends(require_admin)) -> InviteBatchResponse:
-    """Check (dry run) or invite up to 50 addresses. A send needs the recent sign-in and today's budget."""
+    """Check (dry run) or invite up to 50 addresses and ticked waitlist rows. A send needs the recent sign-in and today's budget."""
     if not payload.dry_run:
         ensure_recent_admin_sign_in(admin)
     answer = await invite_batch.run_batch(
-        payload.addresses, payload.cohort, payload.expires_in_days, payload.locale, payload.dry_run, admin["user_id"]
+        payload.addresses, payload.cohort, payload.expires_in_days, payload.locale, payload.dry_run, admin["user_id"],
+        waitlist_ids=payload.waitlist_ids,
     )
     return InviteBatchResponse(**answer)
 

@@ -1,8 +1,9 @@
 """
 Invitations in batches (INVITE-008, ADR-077 amendment, docs/prd-admin.md FR-012).
 
-Up to 50 pasted entries are trimmed, lowercased and collapsed, then each
-address is sorted into one outcome:
+Up to 50 entries, pasted addresses and ticked waitlist rows (WAIT-006: an id
+stands for its row's address, and is `invalid` when no row has it), are
+trimmed, lowercased and collapsed, then each address is sorted into one outcome:
 
     invalid       not an email address
     left_list     its waitlist row has left, or it bounced or complained (ADR-080)
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from bson import ObjectId
 from fastapi import HTTPException
 from pydantic import validate_email
 from pydantic_core import PydanticCustomError
@@ -57,9 +59,9 @@ def is_address(text: str) -> bool:
     return address.lower() == text
 
 
-def entries(raw: Sequence[str]) -> List[Tuple[str, Optional[str]]]:
+def entries(raw: Sequence[str], seen: Optional[Set[str]] = None) -> List[Tuple[str, Optional[str]]]:
     """(input, address or None) per distinct entry, in the order given; duplicates collapse."""
-    seen: Set[str] = set()
+    seen = set() if seen is None else seen
     kept: List[Tuple[str, Optional[str]]] = []
     for value in raw:
         normal = rules.normalize_email(value)
@@ -67,6 +69,29 @@ def entries(raw: Sequence[str]) -> List[Tuple[str, Optional[str]]]:
             continue
         seen.add(normal)
         kept.append((value, normal if is_address(normal) else None))
+    return kept
+
+
+async def waitlist_entries(ids: Sequence[str], seen: Set[str], waitlist_rows: Any = None) -> List[Tuple[str, Optional[str]]]:
+    """(id, its row's address) per distinct ticked row (WAIT-006); (id, None) for an unknown or malformed id.
+
+    An address already among the pasted entries, or ticked twice, collapses like a pasted duplicate.
+    """
+    waitlist_rows = waitlist_collection if waitlist_rows is None else waitlist_rows
+    distinct = list(dict.fromkeys(ids))
+    wanted = [ObjectId(value) for value in distinct if ObjectId.is_valid(value)]
+    found: Dict[str, str] = {}
+    if wanted:
+        for row in await waitlist_rows.find({"_id": {"$in": wanted}}, {"email": 1}).to_list(length=len(wanted)):
+            found[str(row["_id"])] = rules.normalize_email(row["email"])
+    kept: List[Tuple[str, Optional[str]]] = []
+    for value in distinct:
+        address = found.get(value)
+        if address is not None and address in seen:
+            continue
+        if address is not None:
+            seen.add(address)
+        kept.append((value, address))
     return kept
 
 
@@ -150,11 +175,14 @@ async def invite_one(address: str, cohort: str, days: int, locale: str, admin_id
 
 
 async def run_batch(
-    raw: Sequence[str], cohort: str, days: int, locale: str, dry_run: bool, admin_id: str, now: Optional[datetime] = None
+    raw: Sequence[str], cohort: str, days: int, locale: str, dry_run: bool, admin_id: str, now: Optional[datetime] = None,
+    waitlist_ids: Sequence[str] = (),
 ) -> Dict[str, Any]:
-    """Sort every entry; unless a dry run, invite the ones to invite. The answer has no link."""
+    """Sort every entry, pasted then ticked; unless a dry run, invite the ones to invite. The answer has no link."""
     at = now or datetime.now(timezone.utc)
-    pairs = entries(raw)
+    seen: Set[str] = set()
+    pairs = entries(raw, seen)
+    pairs += await waitlist_entries(waitlist_ids, seen)
     facts = await gather_facts([address for _, address in pairs if address], at)
     results = [{"input": value, "email": address, "outcome": classify(address, facts), "invite_id": None} for value, address in pairs]
     for result in results:

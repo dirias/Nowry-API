@@ -8,7 +8,7 @@ not let in.
 from datetime import datetime
 from typing import Annotated, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class BetaConfigResponse(BaseModel):
@@ -118,13 +118,24 @@ class InviteListResponse(BaseModel):
 
 
 class InviteBatchRequest(BaseModel):
-    """Up to 50 pasted entries, already split by the client; checked first (`dry_run`), then sent."""
+    """Up to 50 entries, pasted addresses and ticked waitlist rows together; checked first (`dry_run`), then sent."""
 
-    addresses: List[Annotated[str, Field(max_length=320)]] = Field(min_length=1, max_length=50)
+    addresses: List[Annotated[str, Field(max_length=320)]] = Field(default_factory=list, max_length=50)
+    #: Ticked waitlist rows (WAIT-006): each is invited at its row's address, in its row's language.
+    waitlist_ids: List[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=50)
     cohort: str = Field(min_length=1, max_length=40, pattern=COHORT_PATTERN)
     expires_in_days: int = Field(default=14, ge=1, le=90)
     locale: InviteLocale = "en"
     dry_run: bool = True
+
+    @model_validator(mode="after")
+    def one_batch_of_at_most_fifty(self) -> "InviteBatchRequest":
+        total = len(self.addresses) + len(self.waitlist_ids)
+        if total == 0:
+            raise ValueError("a batch needs at least one address or waitlist row")
+        if total > 50:
+            raise ValueError("a batch takes at most 50 addresses and waitlist rows together")
+        return self
 
 
 InviteBatchOutcome = Literal["will_invite", "open_invite", "has_account", "invalid", "left_list", "sent", "send_failed"]
