@@ -49,9 +49,11 @@ def ledger(monkeypatch):
 # --- the words ---------------------------------------------------------------
 
 def test_every_locale_has_every_key_english_has():
-    english = _shape(json.loads((LOCALE_DIR / "en.json").read_text(encoding="utf-8")))
+    # `ops` is written to the operator only, in English (ADR-091): no other language carries it.
+    english = _shape({k: v for k, v in json.loads((LOCALE_DIR / "en.json").read_text(encoding="utf-8")).items() if k != "ops"})
     for locale in LOCALES:
-        assert _shape(json.loads((LOCALE_DIR / f"{locale}.json").read_text(encoding="utf-8"))) == english, locale
+        words = {k: v for k, v in json.loads((LOCALE_DIR / f"{locale}.json").read_text(encoding="utf-8")).items() if k != "ops"}
+        assert _shape(words) == english, locale
     assert sorted(path.stem for path in LOCALE_DIR.glob("*.json")) == sorted(LOCALES)
 
 
@@ -66,7 +68,7 @@ def test_every_kind_has_its_words():
 
 
 @pytest.mark.parametrize("locale", LOCALES)
-@pytest.mark.parametrize("kind", sorted(kind for kind, traits in KINDS.items() if traits["sender"] == "account"))
+@pytest.mark.parametrize("kind", sorted(kind for kind, traits in KINDS.items() if traits["sender"] == "account" and not traits.get("locale")))
 def test_both_parts_render_in_every_language_with_nothing_left_unfilled(kind, locale):
     rendered = render_email(kind, locale, VALUES, logo_url="https://nowry.app/logo192.png")
     assert rendered.locale == locale and rendered.subject

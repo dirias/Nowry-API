@@ -23,6 +23,7 @@ import logging
 from typing import Optional
 
 from app.core import llm_health
+from app.services import ai_alerts
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +113,12 @@ class FallbackClient:
                 return client.request(request_string)
             except Exception as exc:
                 if is_last or not llm_health.is_provider_failure(exc):
+                    if is_last:
+                        ai_alerts.report_soon(provider, exc, True, None)  # AI-007: nothing left behind it
                     raise
                 llm_health.mark_down(provider, exc)
                 logger.error("[llm] fallback: %s failed for generation (%s): %s", provider, type(exc).__name__, exc)
+                ai_alerts.report_soon(provider, exc, False, self._chain[index + 1][0])  # AI-007
 
 
 def _with_groq_behind(gemini_client):

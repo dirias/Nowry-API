@@ -26,6 +26,9 @@ KINDS: dict[str, dict[str, str]] = {
     "account.google": {"class": "account", "sender": "account"},
     # The notice right after a deletion (ADR-089, FR-039): no button; a reply reaches support.
     "account.deleted": {"class": "account", "sender": "account", "button": "none"},
+    # To the operator only, in English (ADR-091, AI-007): an AI provider stopped answering.
+    "ops.ai_provider": {"class": "notice", "sender": "account", "button": "none", "locale": "en"},
+    "ops.ai_urgent": {"class": "notice", "sender": "account", "button": "none", "locale": "en"},
     # A letter to a person who asked to wait (ADR-078 point 1b): no button, and a way to leave.
     "waitlist.confirm": {"class": "confirmation", "sender": "personal"},
     # The form met an address that already has an account (ADR-084): the waitlist's look and sender, but not a list email, so no leave link.
@@ -132,7 +135,7 @@ def render_email(kind: str, locale: Optional[str], values: Mapping[str, str], *,
     visitor = KINDS[kind]["sender"] == "personal" and KINDS[kind].get("leave") != "none"
     if visitor and not values.get("leave_link"):
         raise KeyError("leave_link")
-    code = resolve_locale(locale)
+    code = KINDS[kind].get("locale") or resolve_locale(locale)  # an operator email is English (ADR-091)
     words, common = _words(kind, code)
     return RenderedEmail(
         subject=_fill(words["subject"], values),

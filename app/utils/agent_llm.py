@@ -7,6 +7,7 @@ from datetime import datetime
 import google.generativeai as genai
 from app.utils.logger import get_logger
 from app.core import llm_health
+from app.services import ai_alerts
 from app.core.llm_timeouts import GEMINI_REQUEST_OPTIONS, bounded_groq
 from app.config.subscription_plans import AGENT_MODELS
 
@@ -178,6 +179,8 @@ class AgentLLM:
                     raise
                 llm_health.mark_down(provider, exc)
                 logger.error("[llm] fallback: %s failed for %s-tier chat (%s): %s", provider, tier, type(exc).__name__, exc)
+                last = index == len(chain) - 1
+                ai_alerts.report_soon(provider, exc, last, None if last else chain[index + 1])  # AI-007
                 last_failure = exc
                 continue
             if meta is not None:

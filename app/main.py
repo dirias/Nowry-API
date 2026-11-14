@@ -109,6 +109,10 @@ async def _flush_langfuse_queue() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # AI-007: an alert raised in a worker thread (card generation) runs on this loop.
+    from app.services import ai_alerts
+
+    ai_alerts.remember_loop(asyncio.get_running_loop())
     await create_indexes()
     # ADR-077: say what each cohort code is limited to, and shout about one whose limit cannot be read.
     for line in [*describe_code_rules(), describe_full_access()]:

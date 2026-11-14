@@ -82,5 +82,25 @@
       "signature": "Didier, Nowry",
       "footer": "Sent to $email because this address was entered on the Nowry waitlist."
     }
+  },
+  "ops": {
+    "ai_provider": {
+      "subject": "[Nowry] $provider is refusing requests; traffic went to $fallback",
+      "before": [
+        "$provider refused a request at $time UTC ($reason).",
+        "Requests now go to $fallback, so the companion and card generation keep working. Top up or check $provider when you want it back. This alert repeats at most every 6 hours while it lasts."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email, the operator address (NOTIFY_TO_EMAIL)."
+    },
+    "ai_urgent": {
+      "subject": "[Nowry] URGENT: $provider failed and no AI provider is left",
+      "before": [
+        "URGENT: $provider failed at $time UTC ($reason), and nothing is left behind it.",
+        "The companion and card generation fail for everyone until a provider answers again. Check the providers' status and credit."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email, the operator address (NOTIFY_TO_EMAIL)."
+    }
   }
 }
