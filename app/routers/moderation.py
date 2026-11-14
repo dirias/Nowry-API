@@ -3,13 +3,20 @@ Content Moderation API Router
 Handles reporting inappropriate/problematic public content
 """
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from typing import Optional, Literal
+from typing import Any, Dict, Literal, Optional
 from pydantic import BaseModel
 from bson import ObjectId
 from datetime import datetime, timezone
 
 from app.config.database import db
 from app.models.PublicContent import ContentReport
+from app.models.moderation import (
+    AdminReportPage,
+    AdminReportView,
+    ReportCreated,
+    ReportPage,
+    ReportView,
+)
 from app.auth.firebase_auth import get_current_user
 from app.auth.dependencies import require_admin, require_recent_admin
 from app.services.notifications import notify, report_notification
@@ -29,15 +36,57 @@ class ReviewReportRequest(BaseModel):
     resolution_notes: Optional[str] = None
 
 
+# ========== Ids (ADMIN-002) ==========
+
+#: What a malformed id answers on report, review and removal (FR-002).
+BAD_ID: Dict[str, str] = {"code": "bad_id"}
+
+
+def object_id_or_400(value: str) -> ObjectId:
+    """The id as an ObjectId, or `400 {"code": "bad_id"}` before anything is read."""
+    if not ObjectId.is_valid(value):
+        raise HTTPException(status_code=400, detail=BAD_ID)
+    return ObjectId(value)
+
+
+def content_oid(content_id: str) -> ObjectId:
+    """The path's content id, checked."""
+    return object_id_or_400(content_id)
+
+
+def report_oid(report_id: str) -> ObjectId:
+    """The path's report id, checked."""
+    return object_id_or_400(report_id)
+
+
+def _page(page: int, page_size: int, total: int, rows: list) -> Dict[str, Any]:
+    return {
+        "items": [{**row, "id": str(row["_id"])} for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
+    }
+
+
+async def _report_page(query: Dict[str, Any], page: int, page_size: int) -> Dict[str, Any]:
+    """One page of reports, newest first, bounded by `page_size`."""
+    total = await db["content_reports"].count_documents(query)
+    skip = (page - 1) * page_size
+    rows = await db["content_reports"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(page_size)
+    return _page(page, page_size, total, rows)
+
+
 # ========== Reporting Endpoints (Auth Required) ==========
 
-@router.post("/report/{content_type}/{content_id}")
+@router.post("/report/{content_type}/{content_id}", response_model=ReportCreated)
 async def report_content(
     content_type: Literal["book", "deck", "card"],
     content_id: str,
     report_data: ReportContentRequest,
     background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    content_object_id: ObjectId = Depends(content_oid),
 ):
     """
     Report inappropriate or problematic public content.
@@ -57,7 +106,7 @@ async def report_content(
     # Verify content exists and is public
     collection = db[f"{content_type}s"]
     content = await collection.find_one({
-        "_id": ObjectId(content_id),
+        "_id": content_object_id,
         "is_public": True
     })
     
@@ -101,7 +150,7 @@ async def report_content(
     }
 
 
-@router.get("/reports")
+@router.get("/reports", response_model=ReportPage)
 async def get_my_reports(
     status: Optional[Literal["pending", "under_review", "resolved", "dismissed"]] = None,
     page: int = Query(1, ge=1),
@@ -117,28 +166,14 @@ async def get_my_reports(
         - page_size: Items per page
     """
     query = {"reporter_user_id": current_user.get("user_id")}
-    
     if status:
         query["status"] = status
-    
-    total = await db["content_reports"].count_documents(query)
-    skip = (page - 1) * page_size
-    
-    reports = await db["content_reports"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(page_size)
-    
-    return {
-        "items": reports,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": (total + page_size - 1) // page_size
-    }
+    return await _report_page(query, page, page_size)
 
 
 # ========== Admin/Moderator Endpoints (Admin Auth Required) ==========
-# TODO: Add admin authorization middleware
 
-@router.get("/admin/reports")
+@router.get("/admin/reports", response_model=AdminReportPage)
 async def get_all_reports(
     status: Optional[Literal["pending", "under_review", "resolved", "dismissed"]] = None,
     reason: Optional[Literal["copyright", "inappropriate", "spam", "misinformation", "other"]] = None,
@@ -151,43 +186,29 @@ async def get_all_reports(
     Get all content reports (Admin only).
     """
     
-    query = {}
-    
+    query: Dict[str, Any] = {}
     if status:
         query["status"] = status
-    
     if reason:
         query["reason"] = reason
-    
     if content_type:
         query["content_type"] = content_type
-    
-    total = await db["content_reports"].count_documents(query)
-    skip = (page - 1) * page_size
-    
-    reports = await db["content_reports"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(page_size)
-    
-    return {
-        "items": reports,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": (total + page_size - 1) // page_size
-    }
+    return await _report_page(query, page, page_size)
 
 
 @router.put("/admin/reports/{report_id}/review")
 async def review_report(
     report_id: str,
     review_data: ReviewReportRequest,
-    current_user: dict = Depends(require_recent_admin)
+    current_user: dict = Depends(require_recent_admin),
+    report_object_id: ObjectId = Depends(report_oid),
 ):
     """
     Review and resolve a content report (Admin only).
     """
     
     # Get report
-    report = await db["content_reports"].find_one({"_id": ObjectId(report_id)})
+    report = await db["content_reports"].find_one({"_id": report_object_id})
     
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -203,7 +224,7 @@ async def review_report(
     }
     
     await db["content_reports"].update_one(
-        {"_id": ObjectId(report_id)},
+        {"_id": report_object_id},
         {"$set": update_data}
     )
     
@@ -234,7 +255,8 @@ async def remove_public_content(
     content_type: Literal["book", "deck"],
     content_id: str,
     reason: str,
-    current_user: dict = Depends(require_recent_admin)
+    current_user: dict = Depends(require_recent_admin),
+    content_object_id: ObjectId = Depends(content_oid),
 ):
     """
     Remove content from public access (Admin only).
@@ -244,7 +266,7 @@ async def remove_public_content(
     collection = db[f"{content_type}s"]
     
     content = await collection.find_one({
-        "_id": ObjectId(content_id),
+        "_id": content_object_id,
         "is_public": True
     })
     
@@ -253,7 +275,7 @@ async def remove_public_content(
     
     # Unpublish content
     await collection.update_one(
-        {"_id": ObjectId(content_id)},
+        {"_id": content_object_id},
         {
             "$set": {
                 "is_public": False,
