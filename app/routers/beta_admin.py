@@ -7,6 +7,7 @@ The operator's calls for personal invitations (ADR-077 and its amendment, FR-012
     GET  /beta/admin/cohorts               what the paste form offers, and today's invitations left
     POST /beta/admin/invites/{id}/revoke   close an open invitation
     POST /beta/admin/invites/{id}/resend   Resend (open, expired) or Invite again (revoked): a new link, emailed
+    GET  /beta/admin/waitlist              the waitlist, oldest first, by state, language and source (WAIT-002)
 
 All are admin-only; every write also needs a sign-in less than 12 hours old
 (ADR-086 point 5) and leaves a row in the admin log. A batch dry run is a read.
@@ -26,11 +27,14 @@ from app.models.Beta import (
     InviteCohortsResponse,
     InviteCreate,
     InviteCreated,
+    InviteLocale,
     InviteListResponse,
     InviteState,
     InviteSummary,
+    WaitlistAdminResponse,
+    WaitlistState,
 )
-from app.services import beta_invites, invite_batch, invite_resend
+from app.services import beta_invites, invite_batch, invite_resend, waitlist_admin
 from app.services.admin_actions import record_admin_action
 
 router = APIRouter(prefix="/beta/admin", tags=["beta-admin"])
@@ -137,3 +141,16 @@ async def resend_invite(invite_id: str, admin: dict = Depends(require_recent_adm
     if row is None:
         raise HTTPException(status_code=404, detail="No such invitation.")
     return InviteSummary(**summary_fields(row))
+
+
+@router.get("/waitlist", response_model=WaitlistAdminResponse)
+async def list_waitlist(
+    state: Optional[WaitlistState] = None,
+    locale: Optional[InviteLocale] = None,
+    source: Optional[str] = Query(default=None, max_length=200),
+    limit: int = Query(default=100, ge=1, le=waitlist_admin.LIST_MAX),
+    admin: dict = Depends(require_admin),
+) -> WaitlistAdminResponse:
+    """The waitlist, oldest first, with counts per state, language and source over every row. A read: not logged."""
+    answer = await waitlist_admin.list_waitlist(state, locale, source, limit)
+    return WaitlistAdminResponse(**answer)

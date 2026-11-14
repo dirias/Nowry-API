@@ -154,3 +154,32 @@ class InviteCohortsResponse(BaseModel):
     lifetimes: List[int]
     default_lifetime: int
     invitations_left_today: int
+
+
+# ── The waitlist in the admin area (WAIT-002, FR-012) ────────────────────────
+
+WaitlistState = Literal["waiting", "invited", "joined", "left"]
+
+
+class WaitlistAdminRow(BaseModel):
+    """A waitlist row as the operator reads it. Never its leave token."""
+
+    id: str
+    email: str
+    #: The two-letter code the row's letters go in (`es-MX` reads `es`); null when the row has none.
+    locale: Optional[InviteLocale] = None
+    source: Optional[str] = None
+    status: WaitlistState
+    created_at: datetime
+    invited_at: Optional[datetime] = None
+    joined_at: Optional[datetime] = None
+
+
+class WaitlistAdminResponse(BaseModel):
+    """The rows asked for, oldest first; the counts are over every row."""
+
+    rows: List[WaitlistAdminRow]
+    totals: Dict[WaitlistState, int]
+    locales: Dict[str, int]
+    #: The most common sources, most common first, for the source filter.
+    sources: List[str]
