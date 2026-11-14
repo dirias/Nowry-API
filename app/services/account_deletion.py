@@ -80,6 +80,7 @@ HANDLED_OTHERWISE: Dict[str, str] = {
     "content_forks": "legacy, read by one migration only",
     "ai_traces": "two ids per Langfuse trace; the account's rows go when its traces are deleted at Langfuse, at once (ai_traces.py)",
     "ai_trace_deletions": "a deletion Langfuse refused, retried until it succeeds; holds only the account id",
+    "admin_actions": "the operator's record of admin writes (ADR-086), kept 24 months by its own expiry",
 }
 
 #: Collections that may hold `is_public`; deletion unpublishes as it marks.
