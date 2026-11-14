@@ -11,6 +11,7 @@ ever sent, and records when its one confirmation left.
     leave              the page's key and a mail provider's one-click request
     mark_suppressed    Resend said this address bounced or complained
     send_account_letter  the form met an address that has an account (ADR-084)
+    mark_joined        an invited address made its account (WAIT-007)
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from pymongo import ReturnDocument
 
+from app.config.database import waitlist_collection
 from app.models.Beta import WaitlistCreate
 from app.services import email as email_service
 from app.services import email_suppressions
@@ -31,6 +33,8 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 WAITING = "waiting"
+INVITED = "invited"
+JOINED = "joined"
 LEFT = "left"
 CONFIRMATION_KIND = "waitlist.confirm"
 ACCOUNT_KIND = "waitlist.account"
@@ -222,3 +226,20 @@ async def send_account_letter(address: str, locale: Optional[str]) -> str:
     except Exception as exc:  # noqa: BLE001 - runs after the answer; nothing is waiting for it
         logger.warning("waitlist: the account letter could not be sent: %s", type(exc).__name__)
         return email_service.FAILED
+
+
+async def mark_joined(address: str, collection: Any = None, now: Optional[datetime] = None) -> None:
+    """An invited address made its account: its row, waiting or invited, becomes `joined` (WAIT-007).
+
+    A row that left stays left, a joined row keeps its first date, and no row is
+    made. Runs inside sign-up, so it never raises: a failure is a warning.
+    """
+    rows = waitlist_collection if collection is None else collection
+    at = now or datetime.now(timezone.utc)
+    try:
+        await rows.update_one(
+            {"email": address.strip().lower(), "status": {"$in": [WAITING, INVITED]}},
+            {"$set": {"status": JOINED, "joined_at": at, "updated_at": at}},
+        )
+    except Exception as exc:  # noqa: BLE001 - the account is made; the list can be wrong, sign-up cannot fail
+        logger.warning("waitlist: a row could not be marked joined: %s", type(exc).__name__)

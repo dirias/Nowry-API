@@ -17,6 +17,7 @@ from pymongo import ReturnDocument
 from app.config import invites as rules
 from app.config.beta import BETA_INVITE_REQUIRED_CODE, beta_config, gate_new_account
 from app.config.database import invites_collection, users_collection
+from app.services import waitlist
 
 logger = logging.getLogger(__name__)
 
@@ -149,15 +150,23 @@ async def gate_account_creation(invite_header: Optional[str], token_data: Dict[s
     return await gate_new_account(invite_header, count_code_uses, now)
 
 
-async def settle_personal_invite(stamp: Optional[Dict[str, Any]], user_id: str, firebase_uid: str, collection=None) -> None:
-    """Tie a spent invitation to the account it made. A cohort stamp has nothing to tie."""
+async def settle_personal_invite(
+    stamp: Optional[Dict[str, Any]], user_id: str, firebase_uid: str, collection=None, now: Optional[datetime] = None
+) -> None:
+    """Tie a spent invitation to the account it made, and make its address's waitlist row `joined` (WAIT-007).
+
+    A cohort stamp has nothing to tie. The waitlist step never raises.
+    """
     if not stamp or not stamp.get("invite_id"):
         return
     collection = invites_collection if collection is None else collection
-    await collection.update_one(
+    row = await collection.find_one_and_update(
         {"_id": ObjectId(stamp["invite_id"])},
         {"$set": {"status": rules.STATUS_USED, "used_by": user_id, "used_by_uid": firebase_uid}},
+        return_document=ReturnDocument.AFTER,
     )
+    if row and row.get("email"):
+        await waitlist.mark_joined(row["email"], now=now)
 
 
 async def release_personal_invite(stamp: Optional[Dict[str, Any]], firebase_uid: str, collection=None) -> None:
