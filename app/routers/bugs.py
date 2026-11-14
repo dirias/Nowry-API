@@ -17,8 +17,18 @@ from app.auth.dependencies import require_admin, require_recent_admin
 from app.services.admin_actions import record_admin_action
 from app.services.notifications import notify
 from app.config.beta import beta_config
+from app.core.body_limit import body_capped_route
+from app.services.bug_limits import (
+    DAILY_REPORTS,
+    MAX_BODY_BYTES,
+    daily_limit,
+    oversized_text,
+    screenshots_ok,
+    too_large,
+    utc_day_bounds,
+)
 
-router = APIRouter(prefix="/bugs", tags=["bugs"])
+router = APIRouter(prefix="/bugs", tags=["bugs"], route_class=body_capped_route(MAX_BODY_BYTES))
 
 
 #: What `POST /bugs` answers when the beta is off (FR-007).
@@ -88,6 +98,27 @@ async def notify_operator(bug: Dict[str, Any]) -> None:
     await notify(subject, text)
 
 
+def ensure_within_limits(bug_data: BugReportCreate) -> None:
+    """413 `too_large` naming the first text or the screenshots that break a limit (ADMIN-008a)."""
+    field = oversized_text(bug_data.model_dump(include={
+        "title", "description", "steps_to_reproduce", "expected_behavior", "actual_behavior",
+    }))
+    if field is None and not screenshots_ok(shot.data for shot in bug_data.screenshots):
+        field = "screenshots"
+    if field is not None:
+        raise HTTPException(status_code=http_status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=too_large(field))
+
+
+async def ensure_under_daily_limit(user_id: str, now: datetime) -> None:
+    """429 `daily_limit` once the account has sent its reports for this UTC day."""
+    start, end = utc_day_bounds(now)
+    sent = await bugs_collection.count_documents(
+        {"user_id": user_id, "created_at": {"$gte": start}}, limit=DAILY_REPORTS,
+    )
+    if sent >= DAILY_REPORTS:
+        raise HTTPException(status_code=http_status.HTTP_429_TOO_MANY_REQUESTS, detail=daily_limit(end))
+
+
 @router.post("", response_model=BugReportResponse)
 async def submit_bug_report(
     bug_data: BugReportCreate,
@@ -96,12 +127,10 @@ async def submit_bug_report(
 ) -> BugReportResponse:
     """Store a tester's report while the beta is on, then tell the operator (BUG-001, FR-007)."""
     ensure_reports_open()
-    if len(bug_data.screenshots) > 3:
-        raise HTTPException(
-            status_code=http_status.HTTP_400_BAD_REQUEST,
-            detail="Maximum 3 screenshots allowed per bug report",
-        )
-    bug_dict = new_bug_document(bug_data, current_user.get("user_id"), datetime.now(timezone.utc))
+    ensure_within_limits(bug_data)
+    now = datetime.now(timezone.utc)
+    await ensure_under_daily_limit(current_user.get("user_id"), now)
+    bug_dict = new_bug_document(bug_data, current_user.get("user_id"), now)
     result = await bugs_collection.insert_one(bug_dict)
     background_tasks.add_task(notify_operator, bug_dict)
     return BugReportResponse(
