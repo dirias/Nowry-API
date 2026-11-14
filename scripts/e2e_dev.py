@@ -8,6 +8,7 @@ every address must be one of the run's aliases, ``rikydier+e2e-<run>-<case>@gmai
     python -I -m scripts.e2e_dev account <email>            the account, live and deleted
     python -I -m scripts.e2e_dev waitlist <email>           the waitlist row
     python -I -m scripts.e2e_dev make-admin <email>         is_admin on a suite account
+    python -I -m scripts.e2e_dev admin-log <email>          the admin log rows about a suite address
     python -I -m scripts.e2e_dev expire-invites <email>     open invitations to that alias end now
     python -I -m scripts.e2e_dev backdate-deletion <email> <days>   the deleted record and its rows, moved back
     python -I -m scripts.e2e_dev set-xp <email> <xp>         the account's XP total, e.g. one review short of a stage
@@ -110,6 +111,12 @@ async def expire_invites(db, email: str) -> Dict[str, Any]:
     return {"changed": result.modified_count}
 
 
+async def admin_log(db, email: str) -> Dict[str, Any]:
+    """The admin log rows about a suite address, oldest first: action and outcome only (E2E-ADMIN-1)."""
+    rows = await db.admin_actions.find(alias_query("target_title", email)).sort("created_at", 1).to_list(length=50)
+    return {"actions": [row.get("action") for row in rows]}
+
+
 async def set_xp(db, email: str, xp: int) -> Dict[str, Any]:
     """Put a suite account at `xp` total, e.g. one review short of a stage (EVO-020)."""
     if xp < 0:
@@ -151,7 +158,7 @@ async def cleanup(db, run: str) -> Dict[str, Any]:
             removed[name] = removed.get(name, 0) + result.deleted_count
         await db.users.delete_one({"_id": user["_id"]})
         removed["users"] = removed.get("users", 0) + 1
-    for name, field in (("waitlist", "email"), ("invites", "email"), ("dev_outbox", "to")):
+    for name, field in (("waitlist", "email"), ("invites", "email"), ("dev_outbox", "to"), ("admin_actions", "target_title")):
         result = await db[name].delete_many({field: pattern})
         removed[name] = result.deleted_count
     firebase = 0
@@ -193,6 +200,8 @@ async def main(argv: List[str]) -> None:
             result = await make_admin(db, email)
         elif command == "expire-invites":
             result = await expire_invites(db, email)
+        elif command == "admin-log":
+            result = await admin_log(db, email)
         elif command == "set-xp":
             result = await set_xp(db, email, int(args[1]))
         elif command == "backdate-deletion":
