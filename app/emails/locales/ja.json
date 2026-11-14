@@ -109,7 +109,7 @@
   },
   "beta": {
     "invitation": {
-      "subject": "Nowry へのご招待",
+      "subject": "Nowry ベータへの参加のご案内",
       "before": [
         "こんにちは。",
         "Nowry ベータへの順番が来ました。この招待は $email 専用で、$expires まで一度だけ使えます。"

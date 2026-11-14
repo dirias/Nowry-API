@@ -109,7 +109,7 @@
   },
   "beta": {
     "invitation": {
-      "subject": "Tu invitación a Nowry",
+      "subject": "Tu plaza en la beta de Nowry",
       "before": [
         "Hola:",
         "Tu lugar en la beta de Nowry ya está abierto. Esta invitación es solo para $email. Funciona una vez, hasta el $expires."
