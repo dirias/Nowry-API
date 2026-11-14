@@ -78,3 +78,12 @@ def test_the_media_ledger_is_read_by_owner_and_date_and_by_book(indexes):
     media = _keys(indexes["by"]["media"])
     assert media["media_owner_date"] == [("user_id", 1), ("created_at", -1)]
     assert media["media_book"] == [("book_id", 1)]
+
+
+def test_the_admin_log_is_read_by_time_actor_and_target_and_kept_24_months(indexes):
+    """ADMIN-005, FR-003: the admin log's indexes and its 730-day expiry."""
+    actions = indexes["by"]["admin_actions"]
+    assert _keys(actions)["admin_actions_ttl"] == [("created_at", 1)]
+    assert actions["admin_actions_ttl"].get("expireAfterSeconds") == 730 * 24 * 3600
+    assert _keys(actions)["admin_actions_actor"] == [("actor_id", 1), ("created_at", -1)]
+    assert _keys(actions)["admin_actions_target"] == [("target_type", 1), ("target_id", 1)]

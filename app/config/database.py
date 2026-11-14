@@ -82,6 +82,11 @@ device_tokens_collection = db["device_tokens"]
 # it; the app never lists the bucket to learn what it owns.
 media_collection = db["media"]
 
+# The admin log (ADR-086 point 4, FR-003): one row per admin write, kept 24 months.
+admin_actions_collection = db["admin_actions"]
+#: How long an admin log row is kept: 24 months.
+ADMIN_ACTIONS_KEEP_SECONDS = 730 * 24 * 3600
+
 #: Index names for curated official browse (ADR-004). Named so deployment can
 #: verify them, and so the verification step below can report a missing one.
 CURATED_BROWSE_INDEX = "decks_curated_browse"
@@ -234,6 +239,10 @@ async def create_indexes():
     # The email ledger (ADR-078): counted by day, kept 90 days. The quota row has no created_at and stays.
     await email_sends_collection.create_index("day")
     await email_sends_collection.create_index("created_at", expireAfterSeconds=90 * 24 * 3600)
+    # The admin log (ADR-086, FR-003): read by time, by who acted and by what it touched; kept 24 months.
+    await admin_actions_collection.create_index("created_at", expireAfterSeconds=ADMIN_ACTIONS_KEEP_SECONDS, name="admin_actions_ttl")
+    await admin_actions_collection.create_index([("actor_id", 1), ("created_at", -1)], name="admin_actions_actor")
+    await admin_actions_collection.create_index([("target_type", 1), ("target_id", 1)], name="admin_actions_target")
     # ADR-081 amendment: a trace is remembered once; an account's traces are found by its id.
     await ai_traces_collection.create_index("trace_id", unique=True)
     await ai_traces_collection.create_index("user_id")

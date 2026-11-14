@@ -17,6 +17,7 @@ from app.auth.dependencies import require_admin
 from app.config.invites import invite_link, invite_state
 from app.models.Beta import InviteCreate, InviteCreated, InviteListResponse, InviteState, InviteSummary
 from app.services import beta_invites
+from app.services.admin_actions import record_admin_action
 
 router = APIRouter(prefix="/beta/admin", tags=["beta-admin"])
 
@@ -42,6 +43,7 @@ async def create_invite(payload: InviteCreate, admin: dict = Depends(require_adm
     row, token = await beta_invites.create_invite(
         payload.email, payload.cohort, admin["user_id"], payload.expires_in_days, payload.note
     )
+    await record_admin_action(admin["user_id"], "invite.create", "invite", str(row["_id"]), row["email"], details={"cohort": row["cohort"]})
     return InviteCreated(**summary_fields(row), link=invite_link(token))
 
 
@@ -64,4 +66,5 @@ async def revoke_invite(invite_id: str, admin: dict = Depends(require_admin)) ->
     row = await beta_invites.revoke_invite(invite_id, admin["user_id"])
     if row is None:
         raise HTTPException(status_code=404, detail="No such invitation.")
+    await record_admin_action(admin["user_id"], "invite.revoke", "invite", invite_id, row["email"])
     return InviteSummary(**summary_fields(row))

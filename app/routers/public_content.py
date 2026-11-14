@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from bson import ObjectId
 
 from app.auth.dependencies import require_admin
+from app.services.admin_actions import record_admin_action
 from app.config.database import db
 from app.models.PublicContent import (
     MAX_LEARNING_OUTCOME_LENGTH,
@@ -583,7 +584,10 @@ async def set_deck_curation(
         curation=data.model_dump(),
         reviewer_id=current_user["user_id"],
     )
-
+    await record_admin_action(
+        current_user["user_id"], "curation.review", "deck", deck_id,
+        details={"status": data.status, "topic": data.topic, "rank": data.rank},
+    )
     return DeckCurationResponse(**result)
 
 
