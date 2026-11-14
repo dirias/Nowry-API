@@ -243,6 +243,12 @@ async def create_indexes():
     await admin_actions_collection.create_index("created_at", expireAfterSeconds=ADMIN_ACTIONS_KEEP_SECONDS, name="admin_actions_ttl")
     await admin_actions_collection.create_index([("actor_id", 1), ("created_at", -1)], name="admin_actions_actor")
     await admin_actions_collection.create_index([("target_type", 1), ("target_id", 1)], name="admin_actions_target")
+    # The Overview and /admin/log (ADMIN-007c): the log by kind, newest first; what needs the admin, counted.
+    await admin_actions_collection.create_index([("action", 1), ("created_at", -1)], name="admin_actions_action")
+    await invites_collection.create_index([("status", 1), ("expires_at", 1)], name="invites_ending")
+    await waitlist_collection.create_index([("status", 1), ("created_at", 1)], name="waitlist_status_created")
+    await bugs_collection.create_index([("status", 1), ("severity", 1)], name="bugs_status_severity")
+    await email_sends_collection.create_index([("day", 1), ("class", 1), ("outcome", 1)], name="email_sends_day_class")
     # ADR-081 amendment: a trace is remembered once; an account's traces are found by its id.
     await ai_traces_collection.create_index("trace_id", unique=True)
     await ai_traces_collection.create_index("user_id")
