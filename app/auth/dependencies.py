@@ -1,6 +1,7 @@
 from fastapi import Request, HTTPException, Depends
 from bson import ObjectId
-from typing import Callable
+import time
+from typing import Any, Callable, Optional
 from pymongo.collection import Collection
 from datetime import datetime, timezone
 
@@ -77,6 +78,38 @@ async def require_admin(
         raise refusal
     return current_user
 
+
+#: An admin write needs a sign-in younger than this (ADR-086 point 5, FR-010).
+ADMIN_SIGN_IN_MAX_AGE_SECONDS: int = 12 * 3600
+#: The 401 the web answers by asking the admin to sign in again (shared with ADR-089).
+REAUTH_REQUIRED_CODE: str = "reauth_required"
+
+
+def signed_in_within(auth_time: Any, max_age_seconds: int, now_epoch: Optional[float] = None) -> bool:
+    """Whether the token's `auth_time` (seconds since the epoch) is at most `max_age_seconds` old.
+
+    A token without a readable one is refused: every Firebase ID token carries it.
+    """
+    if not isinstance(auth_time, (int, float)) or isinstance(auth_time, bool):
+        return False
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    return now_epoch - auth_time <= max_age_seconds
+
+
+def ensure_recent_admin_sign_in(current_user: dict) -> None:
+    """Raise `401 reauth_required` when the admin's sign-in is older than 12 hours."""
+    if not signed_in_within(current_user.get("auth_time"), ADMIN_SIGN_IN_MAX_AGE_SECONDS):
+        raise HTTPException(status_code=401, detail={"code": REAUTH_REQUIRED_CODE})
+
+
+async def require_recent_admin(current_user: dict = Depends(require_admin)) -> dict:
+    """`require_admin`, then a sign-in less than 12 hours old: what every admin write takes.
+
+    The admin check runs first, so an account without the flag is 403 and never
+    learns anything about sign-in age.
+    """
+    ensure_recent_admin_sign_in(current_user)
+    return current_user
 
 AI_LIMIT_REACHED_CODE = "ai_limit_reached"
 

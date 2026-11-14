@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.auth.dependencies import require_admin
+from app.auth.dependencies import require_admin, require_recent_admin
 from app.config.invites import invite_link, invite_state
 from app.models.Beta import InviteCreate, InviteCreated, InviteListResponse, InviteState, InviteSummary
 from app.services import beta_invites
@@ -38,7 +38,7 @@ def summary_fields(row: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
 
 
 @router.post("/invites", response_model=InviteCreated, status_code=status.HTTP_201_CREATED)
-async def create_invite(payload: InviteCreate, admin: dict = Depends(require_admin)) -> InviteCreated:
+async def create_invite(payload: InviteCreate, admin: dict = Depends(require_recent_admin)) -> InviteCreated:
     """Invite one address. An open invitation it already had is revoked."""
     row, token = await beta_invites.create_invite(
         payload.email, payload.cohort, admin["user_id"], payload.expires_in_days, payload.note
@@ -61,7 +61,7 @@ async def list_invites(
 
 
 @router.post("/invites/{invite_id}/revoke", response_model=InviteSummary)
-async def revoke_invite(invite_id: str, admin: dict = Depends(require_admin)) -> InviteSummary:
+async def revoke_invite(invite_id: str, admin: dict = Depends(require_recent_admin)) -> InviteSummary:
     """Close an open invitation. A used one is answered as it is, unchanged."""
     row = await beta_invites.revoke_invite(invite_id, admin["user_id"])
     if row is None:

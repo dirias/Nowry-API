@@ -8,7 +8,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 from bson import ObjectId
 
-from app.auth.dependencies import require_admin
+from app.auth.dependencies import require_admin, require_recent_admin
 from app.services.admin_actions import record_admin_action
 from app.config.database import db
 from app.models.PublicContent import (
@@ -551,7 +551,7 @@ async def unpublish_deck(
 async def set_deck_curation(
     deck_id: str,
     data: DeckCurationRequest,
-    current_user: dict = Depends(require_admin),
+    current_user: dict = Depends(require_recent_admin),
     service: PublicContentService = Depends(get_public_service),
 ) -> DeckCurationResponse:
     """

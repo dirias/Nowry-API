@@ -49,7 +49,7 @@ def world(monkeypatch):
     api = FastAPI()
     api.include_router(bugs_router.router)
     caller = {"user_id": str(TESTER)}
-    api.dependency_overrides[get_firebase_user] = lambda: {**caller, "auth_time": int(datetime.now(timezone.utc).timestamp())}
+    api.dependency_overrides[get_firebase_user] = lambda: {"auth_time": int(datetime.now(timezone.utc).timestamp()), **caller}
     client = TestClient(api)
 
     async def seed():
@@ -140,3 +140,13 @@ def test_the_news_cache_route_is_gone():
     from app.routers import news
 
     assert not any("cache/clear" in getattr(route, "path", "") for route in news.router.routes)
+
+
+def test_a_stale_admin_sign_in_is_asked_again_before_a_status_change(world):
+    """ADMIN-008b: an admin write needs a sign-in less than 12 hours old; reads do not."""
+    client, caller, _ = world
+    act_as(caller, ADMIN)
+    caller["auth_time"] = int(datetime.now(timezone.utc).timestamp()) - 13 * 3600
+    target = client.get("/bugs/all").json()[0]["_id"]
+    response = client.patch(f"/bugs/{target}/status", json={"status": "resolved"})
+    assert response.status_code == 401 and response.json()["detail"] == {"code": "reauth_required"}

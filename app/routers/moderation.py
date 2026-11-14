@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from app.config.database import db
 from app.models.PublicContent import ContentReport
 from app.auth.firebase_auth import get_current_user
-from app.auth.dependencies import require_admin
+from app.auth.dependencies import require_admin, require_recent_admin
 from app.services.notifications import notify, report_notification
 
 router = APIRouter(prefix="/moderation", tags=["Content Moderation"])
@@ -180,7 +180,7 @@ async def get_all_reports(
 async def review_report(
     report_id: str,
     review_data: ReviewReportRequest,
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(require_recent_admin)
 ):
     """
     Review and resolve a content report (Admin only).
@@ -234,7 +234,7 @@ async def remove_public_content(
     content_type: Literal["book", "deck"],
     content_id: str,
     reason: str,
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(require_recent_admin)
 ):
     """
     Remove content from public access (Admin only).

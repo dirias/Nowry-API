@@ -593,7 +593,11 @@ def test_curation_route_is_admin_gated():
     route = next(
         r for r in router.routes if r.path.endswith("/curation") and "PUT" in r.methods
     )
-    assert require_admin in [d.call for d in route.dependant.dependencies]
+    from app.auth.dependencies import require_recent_admin
+
+    direct = [d.call for d in route.dependant.dependencies]
+    assert require_recent_admin in direct  # ADMIN-008b: require_admin, then a recent sign-in
+    assert require_admin in [d.call for d in route.dependant.dependencies[direct.index(require_recent_admin)].dependencies]
 
 
 # ---------------------------------------------------------------------------

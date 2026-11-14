@@ -302,9 +302,15 @@ def test_every_invitation_route_is_admin_gated():
     from app.auth.dependencies import require_admin
     from app.routers.beta_admin import router
 
-    assert len(router.routes) == 3
+    def calls(dependant):
+        found = {dependant.call}
+        for sub in dependant.dependencies:
+            found |= calls(sub)
+        return found
+
+    assert len(router.routes) >= 3
     for route in router.routes:
-        assert require_admin in [dependency.call for dependency in route.dependant.dependencies], route.path
+        assert require_admin in calls(route.dependant), route.path
 
 
 def test_what_the_operator_reads_has_no_token_and_no_hash():

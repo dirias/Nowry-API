@@ -13,7 +13,7 @@ from app.models.Bug import (
 from app.models.common import BugStatsResponse, BugStatusUpdateResponse, MessageResponse
 from app.config.database import bugs_collection, users_collection
 from app.auth.firebase_auth import get_firebase_user
-from app.auth.dependencies import require_admin
+from app.auth.dependencies import require_admin, require_recent_admin
 from app.services.admin_actions import record_admin_action
 
 router = APIRouter(prefix="/bugs", tags=["bugs"])
@@ -222,7 +222,7 @@ async def delete_bug_report(
 async def update_bug_status(
     bug_id: str,
     status_update: BugStatusUpdate,
-    current_user: dict = Depends(require_admin),
+    current_user: dict = Depends(require_recent_admin),
 ) -> BugStatusUpdateResponse:
     """Change a report's status, priority and notes (admin only). Logged as `bug.status`."""
     if not ObjectId.is_valid(bug_id):
