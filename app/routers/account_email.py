@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.config.firebase_config import verify_firebase_token
 from app.core.limiter import client_address
-from app.services import account_email
+from app.services import account_email, dev_outbox
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -68,7 +68,9 @@ async def send_verification_email(
         raise HTTPException(status_code=400, detail="This sign-in has no email address.")
     if identity.get("email_verified"):
         return VerificationEmailResponse(status="verified")
-    wait = await account_email.verification_wait(identity.get("uid") or email, client_address(request))
+    # E2E-007: on development, the suite's own requests skip the per-network check only.
+    exempt = dev_outbox.suite_request(request.headers.get("X-Dev-Outbox-Key"), email)
+    wait = await account_email.verification_wait(identity.get("uid") or email, client_address(request), exempt_network=exempt)
     if wait:
         return VerificationEmailResponse(status="wait", retry_after=wait)
     status = await account_email.send_verification(email, payload.language)

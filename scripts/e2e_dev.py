@@ -153,7 +153,8 @@ async def cleanup(db, run: str) -> Dict[str, Any]:
         page = firebase_auth.list_users()
         while page:
             for record in page.users:
-                if record.email and re.match(pattern["$regex"], record.email, re.I):
+                # The run's aliases, and its one non-suite identity (E2E-007's outsider).
+                if record.email and (re.match(pattern["$regex"], record.email, re.I) or record.email.lower() == f"rikydier+nosuite-{run}@gmail.com"):
                     firebase_auth.delete_user(record.uid)
                     firebase += 1
             page = page.get_next_page()

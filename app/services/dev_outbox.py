@@ -47,6 +47,19 @@ def outbox_only(address: str) -> bool:
     return enabled() and (address or "").strip().lower().startswith(SUITE_PREFIX)
 
 
+def valid_key(key: Optional[str]) -> bool:
+    """The request carries this environment's outbox key. Off production, and only with a key of real length."""
+    import secrets as _secrets
+
+    expected = (os.getenv("DEV_OUTBOX_KEY") or "").strip()
+    return enabled() and len(expected) >= 24 and bool(key) and _secrets.compare_digest(key.strip(), expected)
+
+
+def suite_request(key: Optional[str], address: str) -> bool:
+    """A suite request on development: the valid key and a suite alias (E2E-007). Exempt from the network limit only."""
+    return valid_key(key) and outbox_only(address)
+
+
 def should_mount() -> bool:
     """Whether the app serves `GET /dev/outbox` at all."""
     return enabled()

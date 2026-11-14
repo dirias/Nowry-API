@@ -45,13 +45,19 @@ def action_link(firebase_link: str, mode: str, frontend_url: str) -> str:
     return f"{frontend_url}/auth/action?{urlencode({'mode': mode, 'oobCode': codes[0]})}"
 
 
-async def verification_wait(firebase_uid: str, caller: str) -> int:
-    """Seconds before this account may be sent another verification email; 0 when it may now."""
-    return await longest_wait([
+async def verification_wait(firebase_uid: str, caller: str, exempt_network: bool = False) -> int:
+    """Seconds before this account may be sent another verification email; 0 when it may now.
+
+    `exempt_network` drops only the per-network check, for the dev suite's own
+    requests (E2E-007); the account's own limits always apply.
+    """
+    checks = [
         ("email_verify_minute", firebase_uid, 1, MINUTE),
         ("email_verify_day", firebase_uid, 5, DAY),
-        ("email_verify_ip", caller, 10, HOUR),
-    ])
+    ]
+    if not exempt_network:
+        checks.append(("email_verify_ip", caller, 10, HOUR))
+    return await longest_wait(checks)
 
 
 async def reset_wait(address: str, caller: str) -> int:

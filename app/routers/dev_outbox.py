@@ -8,8 +8,6 @@ plain 404, as if the route did not exist.
 """
 from __future__ import annotations
 
-import os
-import secrets
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -25,8 +23,7 @@ class OutboxResponse(BaseModel):
 
 
 def _allowed(key: Optional[str]) -> bool:
-    expected = (os.getenv("DEV_OUTBOX_KEY") or "").strip()
-    return dev_outbox.enabled() and len(expected) >= 24 and bool(key) and secrets.compare_digest(key.strip(), expected)
+    return dev_outbox.valid_key(key)
 
 
 @router.get("/outbox", response_model=OutboxResponse)
