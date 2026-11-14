@@ -102,7 +102,7 @@ def public_only(copies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ── The queue ───────────────────────────────────────────────────────────────
 
 
-def _open_items_pipeline() -> List[Dict[str, Any]]:
+def open_items_pipeline() -> List[Dict[str, Any]]:
     return [
         {"$match": {"content_type": {"$in": REMOVABLE_TYPES}, "status": {"$in": OPEN_STATUSES}}},
         {"$group": {"_id": {"t": "$content_type", "i": "$content_id"}, "order": {"$min": "$created_at"}}},
@@ -129,11 +129,16 @@ async def _count(pipeline: List[Dict[str, Any]]) -> int:
     return int(rows[0]["n"]) if rows else 0
 
 
+async def items_to_review() -> int:
+    """How many items wait for a decision: the queue's "To review" total, also read by the Overview."""
+    return await _count(open_items_pipeline())
+
+
 async def queue_totals() -> Dict[str, int]:
     removed = 0
     for content_type in REMOVABLE_TYPES:
         removed += await _collection(content_type).count_documents(REMOVED_QUERY)
-    return {"to_review": await _count(_open_items_pipeline()), "kept": await _count(_kept_items_pipeline()), "removed": removed}
+    return {"to_review": await items_to_review(), "kept": await _count(_kept_items_pipeline()), "removed": removed}
 
 
 async def _report_keys(pipeline: List[Dict[str, Any]], direction: int, limit: int) -> List[Tuple[str, str]]:
@@ -159,7 +164,7 @@ async def queue_keys(state: str, limit: int) -> List[Tuple[str, str]]:
         return await _report_keys(_kept_items_pipeline(), -1, limit)
     if state == "removed":
         return await _removed_keys(limit)
-    return await _report_keys(_open_items_pipeline(), 1, limit)
+    return await _report_keys(open_items_pipeline(), 1, limit)
 
 
 #: Which reports each state shows on its items.

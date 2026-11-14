@@ -33,8 +33,8 @@ class ActionRow(BaseModel):
 
 class ActionsPage(BaseModel):
     actions: List[ActionRow]
-    #: Pass as `before` for the next page; null when this page is the last.
-    next_before: Optional[datetime] = None
+    #: Opaque "<ISO instant with Z>~<id>"; pass as `before` for the next page; null when this page is the last.
+    next_before: Optional[str] = None
 
 
 class ReportsToReview(BaseModel):

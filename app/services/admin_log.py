@@ -1,15 +1,16 @@
 """
 Reading the admin log (ADMIN-007c, docs/prd-admin.md FR-011 "Overview" and `/admin/log`).
 
-Rows come newest first, by kind, a page at a time: `before` is an exclusive
-cursor on `created_at`. Actors are named by username in one bounded query, the
+Rows come newest first (time, then id), by kind, a page at a time: `before`
+is the exclusive cursor "<instant>~<id>" a page answered, or a plain instant
+(everything before it), so rows written in one instant are never skipped. Actors are named by username in one bounded query, the
 grant script as "script". Details are cut to a safe subset: never an address
 (the title is the only place one appears), a token, an owner id or a copy's list.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from bson import ObjectId
 
@@ -88,16 +89,65 @@ def action_view(row: Dict[str, Any], names: Dict[str, Optional[str]], caller_id:
     }
 
 
-def actions_query(kind: Optional[str], before: Optional[datetime] = None, since: Optional[datetime] = None) -> Dict[str, Any]:
-    query: Dict[str, Any] = {"action": {"$in": KINDS[kind]}} if kind else {}
-    window: Dict[str, Any] = {}
-    if before is not None:
-        window["$lt"] = before
+#: Newest first; rows of one instant by id, so the order is total and a cursor can resume it.
+NEWEST_FIRST = [("created_at", -1), ("_id", -1)]
+#: Between the instant and the id in a `next_before` cursor.
+CURSOR_SEPARATOR = "~"
+
+
+class BadCursor(ValueError):
+    """A `before` that is neither a cursor this API wrote nor an ISO instant."""
+
+
+def _naive_utc(moment: datetime) -> datetime:
+    """Mongo stores naive UTC; compare in the same form (equality between naive and aware never matches)."""
+    return moment if moment.tzinfo is None else moment.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _iso_z(moment: datetime) -> str:
+    return as_utc(moment).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def encode_cursor(row: Dict[str, Any]) -> str:
+    """The opaque `next_before`: "<ISO instant with Z>~<id>" of the last row answered."""
+    return f"{_iso_z(row['created_at'])}{CURSOR_SEPARATOR}{row['_id']}"
+
+
+def _parse_instant(text: str) -> datetime:
+    try:
+        return datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BadCursor(text) from exc
+
+
+def decode_cursor(before: Optional[str]) -> Optional[Tuple[datetime, Optional[ObjectId]]]:
+    """(instant, id) from a cursor, or (instant, None) from a plain ISO datetime; None when absent."""
+    if before is None or not before.strip():
+        return None
+    parts = before.split(CURSOR_SEPARATOR)
+    if len(parts) > 2 or (len(parts) == 2 and not ObjectId.is_valid(parts[1])):
+        raise BadCursor(before)
+    return _naive_utc(_parse_instant(parts[0])), ObjectId(parts[1]) if len(parts) == 2 else None
+
+
+def _before(cursor: Tuple[datetime, Optional[ObjectId]]) -> Dict[str, Any]:
+    instant, row_id = cursor
+    if row_id is None:
+        return {"created_at": {"$lt": instant}}
+    return {"$or": [{"created_at": {"$lt": instant}}, {"created_at": instant, "_id": {"$lt": row_id}}]}
+
+
+def actions_query(
+    kind: Optional[str], cursor: Optional[Tuple[datetime, Optional[ObjectId]]] = None, since: Optional[datetime] = None
+) -> Dict[str, Any]:
+    clauses: List[Dict[str, Any]] = []
+    if kind:
+        clauses.append({"action": {"$in": KINDS[kind]}})
+    if cursor is not None:
+        clauses.append(_before(cursor))
     if since is not None:
-        window["$gt"] = since
-    if window:
-        query["created_at"] = window
-    return query
+        clauses.append({"created_at": {"$gt": _naive_utc(since)}})
+    return clauses[0] if len(clauses) == 1 else ({"$and": clauses} if clauses else {})
 
 
 async def _views(rows: List[Dict[str, Any]], caller_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -105,34 +155,16 @@ async def _views(rows: List[Dict[str, Any]], caller_id: Optional[str]) -> List[D
     return [action_view(row, names, caller_id) for row in rows]
 
 
-async def read_actions(
-    kind: Optional[str], before: Optional[datetime], limit: int, caller_id: Optional[str]
-) -> Dict[str, Any]:
-    """One page of the log, newest first; `next_before` only while older rows exist."""
-    rows = await admin_actions_collection.find(actions_query(kind, before)).sort("created_at", -1).limit(
-        limit + 1).to_list(length=limit + 1)
-    page = page_before_cursor(rows, limit)
-    views = await _views(page, caller_id)
-    return {"actions": views, "next_before": views[-1]["at"] if len(rows) > limit else None}
-
-
-def page_before_cursor(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    """The first `limit` rows, less any that share a time with the first row left out.
-
-    The cursor is exclusive on time, so rows written in the same millisecond
-    (a removal and its copies) must start the next page together rather than
-    straddle it. A page made only of one instant is answered whole.
-    """
+async def read_actions(kind: Optional[str], before: Optional[str], limit: int, caller_id: Optional[str]) -> Dict[str, Any]:
+    """One page of the log, newest first; `next_before` only while older rows exist. Raises BadCursor."""
+    query = actions_query(kind, decode_cursor(before))
+    rows = await admin_actions_collection.find(query).sort(NEWEST_FIRST).limit(limit + 1).to_list(length=limit + 1)
     page = rows[:limit]
-    if len(rows) <= limit:
-        return page
-    boundary = rows[limit]["created_at"]
-    trimmed = [row for row in page if row["created_at"] != boundary]
-    return trimmed or page
+    return {"actions": await _views(page, caller_id), "next_before": encode_cursor(page[-1]) if len(rows) > limit else None}
 
 
 async def recent_actions(since: datetime, limit: int, caller_id: Optional[str]) -> List[Dict[str, Any]]:
     """The newest rows after `since`, at most `limit`."""
-    rows = await admin_actions_collection.find(actions_query(None, since=since)).sort("created_at", -1).limit(
+    rows = await admin_actions_collection.find(actions_query(None, since=since)).sort(NEWEST_FIRST).limit(
         limit).to_list(length=limit)
     return await _views(rows, caller_id)

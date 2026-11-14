@@ -30,7 +30,7 @@ from mongomock_motor import AsyncMongoMockClient
 from app.auth import dependencies
 from app.auth.firebase_auth import get_firebase_user
 from app.routers import admin as admin_router
-from app.services import admin_log, admin_overview
+from app.services import admin_log, admin_overview, moderation
 
 ADMIN = ObjectId()
 OTHER_ADMIN = ObjectId()
@@ -46,6 +46,7 @@ class World:
         monkeypatch.setattr(dependencies, "users_collection", self.database["users"])
         monkeypatch.setattr(admin_log, "admin_actions_collection", self.database["admin_actions"])
         monkeypatch.setattr(admin_log, "users_collection", self.database["users"])
+        monkeypatch.setattr(moderation, "db", self.database)
         for name in ("admin_actions", "bugs", "invites", "waitlist", "email_sends", "content_reports"):
             monkeypatch.setattr(admin_overview, f"{name}_collection", self.database[name])
         api = FastAPI()
@@ -88,8 +89,8 @@ def test_both_reads_are_refused_to_an_account_without_the_flag(world, path):
 # ── 2. What needs the admin ─────────────────────────────────────────────────
 
 
-def _report(status: str, reason: str, age_hours: int, content_type: str = "deck") -> Dict[str, Any]:
-    return {"content_type": content_type, "content_id": str(ObjectId()), "status": status, "reason": reason,
+def _report(status: str, reason: str, age_hours: int, content_type: str = "deck", item: str = "") -> Dict[str, Any]:
+    return {"content_type": content_type, "content_id": item or str(ObjectId()), "status": status, "reason": reason,
             "created_at": NOW - timedelta(hours=age_hours)}
 
 
@@ -104,16 +105,19 @@ def test_an_empty_world_answers_zeros_and_nulls(world):
     assert body["recent_actions"] == []
 
 
-def test_reports_to_review_counts_open_reports_with_the_oldest_and_the_common_reasons(world):
+def test_reports_to_review_counts_items_as_the_moderation_tab_does_with_the_oldest_and_common_reasons(world):
+    deck_a, deck_b, book_c, deck_d = (str(ObjectId()) for _ in range(4))
     world.seed(
         "content_reports",
-        _report("pending", "spam", 30), _report("under_review", "spam", 5), _report("pending", "copyright", 2),
-        _report("pending", "copyright", 1), _report("pending", "spam", 1), _report("pending", "other", 3, "book"),
-        _report("resolved", "inappropriate", 90), _report("dismissed", "inappropriate", 80),
+        _report("pending", "spam", 30, item=deck_a), _report("under_review", "spam", 5, item=deck_a),
+        _report("pending", "copyright", 2, item=deck_a), _report("pending", "copyright", 1, item=deck_b),
+        _report("pending", "spam", 1, item=deck_b), _report("pending", "other", 3, "book", item=book_c),
+        _report("resolved", "inappropriate", 90, item=deck_d), _report("dismissed", "inappropriate", 80, item=deck_d),
         _report("pending", "inappropriate", 99, "comment"),
     )
     reports = world.client.get("/admin/overview").json()["needs"]["reports_to_review"]
-    assert reports["count"] == 6
+    assert reports["count"] == 3
+    assert reports["count"] == world.run(moderation.queue_totals())["to_review"]
     assert reports["reasons"] == ["spam", "copyright"]
     oldest = datetime.fromisoformat(reports["oldest_at"].replace("Z", "+00:00"))
     assert oldest == NOW - timedelta(hours=30)
@@ -238,43 +242,75 @@ def test_no_kind_reads_every_action(world):
     assert body["actions"][0]["action"] == "invite.create"
 
 
-def test_an_unknown_kind_and_a_limit_out_of_range_are_422(world):
+def test_an_unknown_kind_a_limit_out_of_range_and_a_bad_cursor_are_422(world):
     assert world.client.get("/admin/actions", params={"kind": "everything"}).status_code == 422
     assert world.client.get("/admin/actions", params={"limit": 0}).status_code == 422
     assert world.client.get("/admin/actions", params={"limit": 101}).status_code == 422
-    assert world.client.get("/admin/actions", params={"before": "yesterday"}).status_code == 422
+    for bad in ("yesterday", "2026-11-14T12:00:00Z~not-an-id", "~" + str(ObjectId()), "a~b~c"):
+        assert world.client.get("/admin/actions", params={"before": bad}).status_code == 422, bad
+
+
+def _all_pages(world, limit: int, **params: Any) -> list:
+    seen, query = [], {"limit": limit, **params}
+    while True:
+        body = world.client.get("/admin/actions", params=query).json()
+        seen += body["actions"]
+        if body["next_before"] is None:
+            return seen
+        query = {"limit": limit, **params, "before": body["next_before"]}
 
 
 def test_pages_follow_the_cursor_without_repeating_or_skipping(world):
     for minutes in range(1, 8):
         world.log("bug.status", NOW - timedelta(minutes=minutes), target_id=f"r{minutes}")
-    seen = []
-    params: Dict[str, Any] = {"limit": 3}
-    while True:
-        body = world.client.get("/admin/actions", params=params).json()
-        seen += [row["target_id"] for row in body["actions"]]
-        if body["next_before"] is None:
-            break
-        params = {"limit": 3, "before": body["next_before"]}
-    assert seen == [f"r{minutes}" for minutes in range(1, 8)]
+    assert [row["target_id"] for row in _all_pages(world, 3)] == [f"r{minutes}" for minutes in range(1, 8)]
 
 
-def test_rows_of_one_instant_are_never_split_across_pages(world):
-    world.log("bug.status", NOW - timedelta(minutes=1), target_id="first")
-    for copy in range(3):  # a removal and its copies, written in the same millisecond
-        world.log("content.remove", NOW - timedelta(minutes=2), target_id=f"same{copy}")
-    world.log("bug.status", NOW - timedelta(minutes=3), target_id="last")
-    first = world.client.get("/admin/actions", params={"limit": 2}).json()
-    assert [row["target_id"] for row in first["actions"]] == ["first"]
-    rest = world.client.get("/admin/actions", params={"limit": 5, "before": first["next_before"]}).json()["actions"]
-    seen = [row["target_id"] for row in rest]
-    assert sorted(seen[:3]) == ["same0", "same1", "same2"] and seen[3:] == ["last"]
+def test_a_removal_of_120_rows_at_one_instant_pages_whole_at_fifty(world):
+    world.log("bug.status", NOW - timedelta(minutes=1), target_id="newer")
+    world.seed("admin_actions", *[
+        {"actor_id": str(ADMIN), "action": "content.remove", "target_type": "deck", "target_id": f"c{n}",
+         "target_title": None, "reason": "copyright", "details": None, "created_at": NOW - timedelta(minutes=2)}
+        for n in range(120)
+    ])
+    world.log("bug.status", NOW - timedelta(minutes=3), target_id="older")
+    rows = _all_pages(world, 50)
+    ids = [row["id"] for row in rows]
+    assert len(rows) == 122 and len(set(ids)) == 122
+    assert rows[0]["target_id"] == "newer" and rows[-1]["target_id"] == "older"
+    same = [row["id"] for row in rows[1:121]]
+    assert same == sorted(same, reverse=True)  # one instant: by id, newest first
+    assert sorted(row["target_id"] for row in rows[1:121]) == sorted(f"c{n}" for n in range(120))
 
 
-def test_a_page_made_of_one_instant_is_answered_whole():
-    at = NOW
-    rows = [{"created_at": at} for _ in range(4)]
-    assert admin_log.page_before_cursor(rows, 3) == rows[:3]
+def test_a_kind_pages_through_one_instant_too(world):
+    world.seed("admin_actions", *[
+        {"actor_id": str(ADMIN), "action": "content.remove" if n % 2 else "bug.status", "target_type": "deck",
+         "target_id": f"c{n}", "created_at": NOW - timedelta(minutes=2)}
+        for n in range(30)
+    ])
+    rows = _all_pages(world, 4, kind="moderation")
+    assert sorted(row["target_id"] for row in rows) == sorted(f"c{n}" for n in range(1, 30, 2))
+
+
+def test_next_before_is_the_instant_and_the_id(world):
+    for minutes in range(1, 4):
+        world.log("bug.status", NOW - timedelta(minutes=minutes))
+    body = world.client.get("/admin/actions", params={"limit": 2}).json()
+    instant, row_id = body["next_before"].split("~")
+    assert instant.endswith("Z") and row_id == body["actions"][-1]["id"]
+    assert datetime.fromisoformat(instant.replace("Z", "+00:00")) == NOW - timedelta(minutes=2)
+
+
+def test_a_plain_instant_reads_everything_before_it(world):
+    world.log("bug.status", NOW - timedelta(minutes=1), target_id="after")
+    world.log("bug.status", NOW - timedelta(minutes=2), target_id="at")
+    world.log("bug.status", NOW - timedelta(minutes=3), target_id="before")
+    instant = (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = world.client.get("/admin/actions", params={"before": instant}).json()["actions"]
+    assert [row["target_id"] for row in rows] == ["before"]
+    naive = (NOW - timedelta(minutes=2)).replace(tzinfo=None).isoformat()
+    assert [row["target_id"] for row in world.client.get("/admin/actions", params={"before": naive}).json()["actions"]] == ["before"]
 
 
 def test_a_full_last_page_says_there_is_no_next(world):
@@ -379,7 +415,8 @@ def test_the_reads_have_their_indexes():
             info = world.run(world.raw[name].index_information())
             return {index: [tuple(k) for k in spec["key"]] for index, spec in info.items()}
 
-        assert keys("admin_actions")["admin_actions_action"] == [("action", 1), ("created_at", -1)]
+        assert keys("admin_actions")["admin_actions_action"] == [("action", 1), ("created_at", -1), ("_id", -1)]
+        assert keys("admin_actions")["admin_actions_newest"] == [("created_at", -1), ("_id", -1)]
         assert keys("invites")["invites_ending"] == [("status", 1), ("expires_at", 1)]
         assert keys("waitlist")["waitlist_status_created"] == [("status", 1), ("created_at", 1)]
         assert keys("bugs")["bugs_status_severity"] == [("status", 1), ("severity", 1)]

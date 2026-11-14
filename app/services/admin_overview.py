@@ -1,7 +1,7 @@
 """
 The Overview (ADMIN-007c, docs/prd-admin.md FR-011 "Overview", board A).
 
-What needs the admin (open reports, new bugs, invitations ending within three
+What needs the admin (items with open reports, new bugs, invitations ending within three
 days, people waiting), today's email meters for invitations and waitlist
 confirmations against their share of the day's budget (ADR-078 point 9), and
 the last seven days of the admin log. Every count stops at `COUNT_CAP`; every
@@ -24,7 +24,7 @@ from app.config.database import (
 from app.config.invites import STATUS_OPEN
 from app.emails.budget import ceiling, parse_budget
 from app.models.Bug import stored_statuses
-from app.services import admin_log
+from app.services import admin_log, moderation
 from app.services.email_ledger import utc_day
 from app.services.moderation import OPEN_STATUSES, REMOVABLE_TYPES
 from app.services.waitlist import WAITING
@@ -65,10 +65,11 @@ async def _most_common(collection: Any, query: Dict[str, Any], field: str) -> Li
 
 
 async def reports_to_review() -> Dict[str, Any]:
+    """Items waiting (the Moderation tab's number); the oldest open report and the commonest reasons."""
     query = {"content_type": {"$in": REMOVABLE_TYPES}, "status": {"$in": OPEN_STATUSES}}
     oldest = await content_reports_collection.find(query, {"created_at": 1}).sort("created_at", 1).limit(1).to_list(length=1)
     return {
-        "count": await _count(content_reports_collection, query),
+        "count": await moderation.items_to_review(),
         "oldest_at": admin_log.as_utc(oldest[0]["created_at"]) if oldest and oldest[0].get("created_at") else None,
         "reasons": await _most_common(content_reports_collection, query, "reason"),
     }

@@ -244,7 +244,8 @@ async def create_indexes():
     await admin_actions_collection.create_index([("actor_id", 1), ("created_at", -1)], name="admin_actions_actor")
     await admin_actions_collection.create_index([("target_type", 1), ("target_id", 1)], name="admin_actions_target")
     # The Overview and /admin/log (ADMIN-007c): the log by kind, newest first; what needs the admin, counted.
-    await admin_actions_collection.create_index([("action", 1), ("created_at", -1)], name="admin_actions_action")
+    await admin_actions_collection.create_index([("action", 1), ("created_at", -1), ("_id", -1)], name="admin_actions_action")
+    await admin_actions_collection.create_index([("created_at", -1), ("_id", -1)], name="admin_actions_newest")
     await invites_collection.create_index([("status", 1), ("expires_at", 1)], name="invites_ending")
     await waitlist_collection.create_index([("status", 1), ("created_at", 1)], name="waitlist_status_created")
     await bugs_collection.create_index([("status", 1), ("severity", 1)], name="bugs_status_severity")

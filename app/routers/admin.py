@@ -7,10 +7,9 @@ The admin area's own reads (ADMIN-007c, docs/prd-admin.md FR-011, boards A, K).
 Both are admin-only reads (`require_admin`); neither writes, so neither needs
 the recent sign-in.
 """
-from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.dependencies import require_admin
 from app.models.admin import ActionKind, ActionsPage, OverviewResponse
@@ -28,10 +27,16 @@ async def get_overview(admin: dict = Depends(require_admin)) -> OverviewResponse
 @router.get("/actions", response_model=ActionsPage)
 async def list_actions(
     kind: Optional[ActionKind] = Query(default=None),
-    before: Optional[datetime] = Query(default=None, description="Exclusive: rows written before this instant"),
+    before: Optional[str] = Query(
+        default=None, max_length=80,
+        description='A page\'s `next_before` ("<ISO instant>~<id>"), or a plain ISO instant: everything before it',
+    ),
     limit: int = Query(default=admin_log.DEFAULT_LIMIT, ge=1, le=admin_log.MAX_LIMIT),
     admin: dict = Depends(require_admin),
 ) -> ActionsPage:
     """One page of the admin log; pass `next_before` back as `before` for the next."""
-    cursor = None if before is None else (before.replace(tzinfo=timezone.utc) if before.tzinfo is None else before)
-    return ActionsPage(**await admin_log.read_actions(kind, cursor, limit, admin.get("user_id")))
+    try:
+        page = await admin_log.read_actions(kind, before, limit, admin.get("user_id"))
+    except admin_log.BadCursor:
+        raise HTTPException(status_code=422, detail={"code": "bad_cursor"})
+    return ActionsPage(**page)
