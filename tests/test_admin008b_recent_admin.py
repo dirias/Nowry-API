@@ -68,6 +68,7 @@ def _route(router, method: str, suffix: str):
 WRITES = [
     ("app.routers.beta_admin", "POST", "/beta/admin/invites"),
     ("app.routers.beta_admin", "POST", "/invites/{invite_id}/revoke"),
+    ("app.routers.beta_admin", "POST", "/invites/{invite_id}/resend"),
     ("app.routers.public_content", "PUT", "/decks/{deck_id}/curation"),
     ("app.routers.bugs", "PATCH", "/{bug_id}/status"),
     ("app.routers.moderation", "PUT", "/admin/reports/{report_id}/review"),
@@ -76,6 +77,8 @@ WRITES = [
 
 READS = [
     ("app.routers.beta_admin", "GET", "/beta/admin/invites"),
+    ("app.routers.beta_admin", "GET", "/beta/admin/cohorts"),
+    ("app.routers.beta_admin", "POST", "/invites/batch"),
     ("app.routers.bugs", "GET", "/bugs/all"),
     ("app.routers.bugs", "GET", "/bugs/stats"),
     ("app.routers.moderation", "GET", "/admin/reports"),

@@ -6,6 +6,7 @@ The operator's calls for personal invitations (ADR-077 and its amendment, FR-012
     GET  /beta/admin/invites               the invitations, newest first, with counts per cohort and in all
     GET  /beta/admin/cohorts               what the paste form offers, and today's invitations left
     POST /beta/admin/invites/{id}/revoke   close an open invitation
+    POST /beta/admin/invites/{id}/resend   Resend (open, expired) or Invite again (revoked): a new link, emailed
 
 All are admin-only; every write also needs a sign-in less than 12 hours old
 (ADR-086 point 5) and leaves a row in the admin log. A batch dry run is a read.
@@ -29,7 +30,7 @@ from app.models.Beta import (
     InviteState,
     InviteSummary,
 )
-from app.services import beta_invites, invite_batch
+from app.services import beta_invites, invite_batch, invite_resend
 from app.services.admin_actions import record_admin_action
 
 router = APIRouter(prefix="/beta/admin", tags=["beta-admin"])
@@ -119,5 +120,19 @@ async def revoke_invite(invite_id: str, admin: dict = Depends(require_recent_adm
     row = await beta_invites.revoke_invite(invite_id, admin["user_id"])
     if row is None:
         raise HTTPException(status_code=404, detail="No such invitation.")
-    await record_admin_action(admin["user_id"], "invite.revoke", "invite", invite_id, row["email"])
+    if row["status"] == "revoked":
+        await record_admin_action(admin["user_id"], "invite.revoke", "invite", invite_id, row["email"])
+    return InviteSummary(**summary_fields(row))
+
+
+@router.post("/invites/{invite_id}/resend", response_model=InviteSummary)
+async def resend_invite(invite_id: str, admin: dict = Depends(require_recent_admin)) -> InviteSummary:
+    """A new link for the same address, cohort, language and lifetime, emailed; the old link stops working.
+
+    409 `invite_used` for a used row, 429 `resend_too_soon` (with `retry_at`) within an
+    hour of the last letter to that address, 409 `over_budget` when none is left today.
+    """
+    row = await invite_resend.resend_invite(invite_id, admin["user_id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such invitation.")
     return InviteSummary(**summary_fields(row))
