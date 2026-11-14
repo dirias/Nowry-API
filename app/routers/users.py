@@ -16,7 +16,7 @@ import bcrypt
 import os
 import secrets
 import asyncio
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SerializerFunctionWrapHandler, field_validator, model_serializer, validator
 from app.utils import media_ledger
 from app.utils.logger import get_logger
 from app.utils.storage import get_storage_backend, media_root
@@ -84,13 +84,22 @@ class UserMeResponse(BaseModel):
     email: str
     avatar_url: Optional[str] = None
     photo_url: Optional[str] = None
-    role: str
     subscription: dict
     preferences: dict
     created_at: Optional[datetime] = None
     wizard_completed: bool
     # ADR-089, FR-041: an account with this address deleted less than 30 days ago.
     previous_account: Optional[Dict[str, str]] = None
+    # ADR-086 point 2: `true` for an admin; absent for everyone else. `role` is retired.
+    is_admin: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_is_admin_unless_true(self, handler: SerializerFunctionWrapHandler) -> Dict[str, Any]:
+        """Only `is_admin` is dropped when not true; every other null field stays on the wire."""
+        data = handler(self)
+        if data.get("is_admin") is not True:
+            data.pop("is_admin", None)
+        return data
 
 
 @router.get("/me", response_model=UserMeResponse)
@@ -120,13 +129,13 @@ async def get_current_user_profile(
         email=user.get("email"),
         avatar_url=user.get("avatar_url"),
         photo_url=user.get("photo_url"),
-        role=user.get("role", "user"),
         # ADR-079: `tier` is the plan in effect; `access` says why, `paid_tier` what is paid for.
         subscription={**(user.get("subscription") or {}), **access_fields(resolve_access(user))},
         preferences=user.get("preferences", {}),
         created_at=user.get("created_at"),
         wizard_completed=user.get("wizard_completed", False),
         previous_account=await account_deletion.previous_account(user),
+        is_admin=True if user.get("is_admin") is True else None,
     )
 
 

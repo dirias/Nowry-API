@@ -158,7 +158,7 @@ class PublicMetadata(BaseModel):
     description: Optional[str] = Field(default=None, max_length=280)
 
     # Access Control
-    restricted_to: Optional[Literal["dev", "beta", "premium"]] = None  # Restrict visibility to specific user groups
+    restricted_to: Optional[Literal["beta", "premium"]] = None  # Restrict visibility to specific user groups ("dev" retired with role, ADR-086)
 
     # Editorial Curation (trusted — see ADR-004)
     # Written ONLY by PublicContentService.set_deck_curation. The publish path

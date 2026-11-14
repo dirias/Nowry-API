@@ -454,7 +454,7 @@ async def test_ordinary_browse_keeps_its_access_restriction_filter():
     service = make_service(collection)
 
     await service.browse_public_content(
-        content_type="deck", viewer_role="user", viewer_is_beta=False
+        content_type="deck", viewer_is_beta=False
     )
 
     restrictions = applied_query(collection)["$or"]

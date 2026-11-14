@@ -299,7 +299,6 @@ async def get_firebase_user(request: Request) -> dict:
                 "username": username,
                 "username_source": "derived",  # ADR-085: /auth/register may replace it once with the chosen name
                 "photo_url": token_data.get("picture"),
-                "role": "user",
                 "stripe_customer_id": stripe_customer_id,  # None if Stripe call failed
                 "subscription": {
                     "tier": SubscriptionTier.FREE.value,

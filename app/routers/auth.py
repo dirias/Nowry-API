@@ -140,7 +140,6 @@ async def register_user(
         "username": request.username,
         "username_source": USERNAME_CHOSEN,  # ADR-085
         "photo_url": request.photo_url,
-        "role": "user",
         "subscription": {
             "tier": SubscriptionTier.FREE,
             "status": "active"
@@ -213,7 +212,6 @@ async def login_user(
         "firebase_uid": user.get("firebase_uid"),
         "email": user.get("email"),
         "username": user.get("username"),
-        "role": user.get("role", "user"),
         "wizard_completed": user.get("wizard_completed", False),
         "subscription": {
             **(user.get("subscription") or {"status": "active"}),

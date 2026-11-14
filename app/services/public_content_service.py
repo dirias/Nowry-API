@@ -418,21 +418,18 @@ class PublicContentService:
         language: Optional[str],
         difficulty: Optional[str],
         search_query: Optional[str],
-        viewer_role: Optional[str],
         viewer_is_beta: bool,
     ) -> Dict[str, Any]:
         """Build the ordinary (non-official) browse filter. Behavior unchanged."""
         query: Dict[str, Any] = {"is_public": True, "deleted_at": None}
 
-        # Access control: content can be restricted to "dev", "beta" or "premium".
-        # Unrestricted content is always visible; restricted content only to a
-        # viewer holding the matching role.
+        # Access control: content can be restricted to "beta" or "premium".
+        # Unrestricted content is always visible; beta content only to a beta
+        # tester. "dev" was retired with `role` (ADR-086): no viewer sees it.
         restriction_filter: List[dict] = [
             {"public_metadata.restricted_to": None},
             {"public_metadata.restricted_to": {"$exists": False}},
         ]
-        if viewer_role == "dev":
-            restriction_filter.append({"public_metadata.restricted_to": "dev"})
         if viewer_is_beta:
             restriction_filter.append({"public_metadata.restricted_to": "beta"})
         query["$or"] = restriction_filter
@@ -507,7 +504,6 @@ class PublicContentService:
         sort_by: str = "recent",  # "recent", "popular", "top_rated", "curated"
         page: int = 1,
         page_size: int = 20,
-        viewer_role: Optional[str] = None,  # User's role for access control
         viewer_is_beta: bool = False,  # User's beta status
         official: bool = False,  # Restrict to approved official curated content
     ) -> Dict[str, Any]:
@@ -532,7 +528,7 @@ class PublicContentService:
 
         query = self._build_browse_query(
             content_type, category, tags, language, difficulty,
-            search_query, viewer_role, viewer_is_beta,
+            search_query, viewer_is_beta,
         )
 
         if official:
@@ -699,7 +695,6 @@ class PublicContentService:
         content_type: str,
         content_id: str,
         viewer_user_id: Optional[str] = None,
-        viewer_role: Optional[str] = None,
         viewer_is_beta: bool = False,
         track_view: bool = True
     ) -> dict:
@@ -726,9 +721,7 @@ class PublicContentService:
             # Content is restricted - check if viewer has access
             has_access = False
             
-            if restricted_to == "dev" and viewer_role == "dev":
-                has_access = True
-            elif restricted_to == "beta" and viewer_is_beta:
+            if restricted_to == "beta" and viewer_is_beta:
                 has_access = True
             elif restricted_to == "premium":
                 # TODO: Check premium subscription status

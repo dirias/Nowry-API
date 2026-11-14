@@ -167,7 +167,6 @@ async def test_search_does_not_leak_restricted_content_to_unentitled_viewer():
     result = await browse(
         collection,
         search_query=SEARCH_TERM,
-        viewer_role="user",
         viewer_is_beta=False,
     )
 
@@ -178,15 +177,13 @@ async def test_search_does_not_leak_restricted_content_to_unentitled_viewer():
 
 
 @pytest.mark.asyncio
-async def test_search_still_admits_content_the_viewer_is_entitled_to():
-    """The fix must restrict, not over-restrict: a dev keeps seeing dev decks."""
+async def test_dev_restricted_content_is_shown_to_no_one():
+    """ADR-086: `role` is retired, so the "dev" restriction admits nobody, beta testers included."""
     collection = FakeDecksCollection(ALL_DECKS)
 
-    result = await browse(
-        collection, search_query=SEARCH_TERM, viewer_role="dev", viewer_is_beta=False,
-    )
-
-    assert returned_ids(result) == {str(PUBLIC_DECK_OID), str(DEV_DECK_OID)}
+    for viewer_is_beta in (False, True):
+        result = await browse(collection, search_query=SEARCH_TERM, viewer_is_beta=viewer_is_beta)
+        assert str(DEV_DECK_OID) not in returned_ids(result)
 
 
 @pytest.mark.asyncio
@@ -194,7 +191,7 @@ async def test_search_admits_beta_content_for_a_beta_viewer():
     collection = FakeDecksCollection(ALL_DECKS)
 
     result = await browse(
-        collection, search_query=SEARCH_TERM, viewer_role="user", viewer_is_beta=True,
+        collection, search_query=SEARCH_TERM, viewer_is_beta=True,
     )
 
     assert returned_ids(result) == {str(PUBLIC_DECK_OID), str(BETA_DECK_OID)}
@@ -210,7 +207,7 @@ async def test_search_narrows_results_rather_than_widening_them():
     collection = FakeDecksCollection([UNRESTRICTED_DECK, DEV_DECK, other])
 
     result = await browse(
-        collection, search_query=SEARCH_TERM, viewer_role="user", viewer_is_beta=False,
+        collection, search_query=SEARCH_TERM, viewer_is_beta=False,
     )
 
     assert returned_ids(result) == {str(PUBLIC_DECK_OID)}
@@ -228,7 +225,6 @@ async def test_restriction_holds_when_search_combines_with_other_filters():
         language="en",
         difficulty=None,
         search_query=SEARCH_TERM,
-        viewer_role="user",
         viewer_is_beta=False,
     )
 
@@ -240,7 +236,7 @@ async def test_restriction_without_search_is_unchanged():
     """The no-search path keeps its existing top-level `$or` encoding."""
     collection = FakeDecksCollection(ALL_DECKS)
 
-    result = await browse(collection, viewer_role="user", viewer_is_beta=False)
+    result = await browse(collection, viewer_is_beta=False)
 
     assert returned_ids(result) == {str(PUBLIC_DECK_OID)}
     assert {"public_metadata.restricted_to": None} in collection.last_filter["$or"]
@@ -267,7 +263,6 @@ async def test_browse_stays_bounded_under_search():
         collection,
         search_query=SEARCH_TERM,
         page_size=10_000,
-        viewer_role="user",
         viewer_is_beta=False,
     )
 

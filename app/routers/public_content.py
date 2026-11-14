@@ -218,7 +218,7 @@ async def browse_public_books(
 ):
     """
     Browse public books.
-    No authentication required, but logged-in users see more content based on their role.
+    No authentication required, but logged-in beta testers also see beta-only content.
     
     Query Parameters:
     - category: Filter by category (e.g., "Science", "Math")
@@ -234,14 +234,12 @@ async def browse_public_books(
     from bson import ObjectId
     
     # Try to get current user (optional)
-    viewer_role = None
     viewer_is_beta = False
     try:
         if current_user:  # optional_auth already handled the token
             user_id = current_user.get("user_id")
             user = await users_collection.find_one({"_id": ObjectId(user_id)})
             if user:
-                viewer_role = user.get("role", "user")
                 viewer_is_beta = user.get("is_beta", False)
     except:
         pass  # Continue as anonymous user
@@ -258,7 +256,6 @@ async def browse_public_books(
         sort_by=sort_by,
         page=page,
         page_size=page_size,
-        viewer_role=viewer_role,
         viewer_is_beta=viewer_is_beta
     )
     
@@ -285,7 +282,7 @@ async def browse_public_decks(
 ) -> PublicDeckBrowsePage:
     """
     Browse public decks.
-    No authentication required, but logged-in users see more content based on their role.
+    No authentication required, but logged-in beta testers also see beta-only content.
 
     Query Parameters (curated discovery, ADR-004):
     - official: when true, return only approved decks owned by the configured
@@ -303,14 +300,12 @@ async def browse_public_decks(
     _validate_curated_browse(official, sort_by, category)
 
     # Try to get current user (optional)
-    viewer_role = None
     viewer_is_beta = False
     try:
         if current_user:  # optional_auth already handled the token
             user_id = current_user.get("user_id")
             user = await users_collection.find_one({"_id": ObjectId(user_id)})
             if user:
-                viewer_role = user.get("role", "user")
                 viewer_is_beta = user.get("is_beta", False)
     except:
         pass  # Continue as anonymous user
@@ -327,7 +322,6 @@ async def browse_public_decks(
         sort_by=sort_by,
         page=page,
         page_size=page_size,
-        viewer_role=viewer_role,
         viewer_is_beta=viewer_is_beta,
         official=official,
     )
@@ -345,27 +339,24 @@ async def get_public_book(
     """
     Get a single public book.
     Tracks view for analytics.
-    No authentication required, but access may be restricted based on user role.
+    No authentication required, but beta-only content needs a beta tester.
     """
     from app.config.database import users_collection
     from bson import ObjectId
     
     viewer_id = current_user.get("user_id") if current_user else None
-    viewer_role = None
     viewer_is_beta = False
     
     if current_user:
         user_id = current_user.get("user_id")
         user = await users_collection.find_one({"_id": ObjectId(user_id)})
         if user:
-            viewer_role = user.get("role", "user")
             viewer_is_beta = user.get("is_beta", False)
     
     book = await service.get_public_content_by_id(
         content_type="book",
         content_id=book_id,
         viewer_user_id=viewer_id,
-        viewer_role=viewer_role,
         viewer_is_beta=viewer_is_beta,
         track_view=True
     )
@@ -383,27 +374,24 @@ async def get_public_deck(
     """
     Get a single public deck.
     Tracks view for analytics.
-    No authentication required, but access may be restricted based on user role.
+    No authentication required, but beta-only content needs a beta tester.
     """
     from app.config.database import users_collection
     from bson import ObjectId
     
     viewer_id = current_user.get("user_id") if current_user else None
-    viewer_role = None
     viewer_is_beta = False
     
     if current_user:
         user_id = current_user.get("user_id")
         user = await users_collection.find_one({"_id": ObjectId(user_id)})
         if user:
-            viewer_role = user.get("role", "user")
             viewer_is_beta = user.get("is_beta", False)
     
     deck = await service.get_public_content_by_id(
         content_type="deck",
         content_id=deck_id,
         viewer_user_id=viewer_id,
-        viewer_role=viewer_role,
         viewer_is_beta=viewer_is_beta,
         track_view=True
     )

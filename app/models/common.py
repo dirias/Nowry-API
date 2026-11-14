@@ -66,7 +66,6 @@ class UserAuthResponse(BaseModel):
     email: str
     username: Optional[str] = None
     photo_url: Optional[str] = None
-    role: Optional[str] = None
     wizard_completed: bool = False
     subscription: Optional[Dict[str, Any]] = None
 
