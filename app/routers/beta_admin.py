@@ -57,6 +57,7 @@ def summary_fields(row: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         "sent_at": row.get("sent_at"),
         "send_count": int(row.get("send_count") or 0),
         "last_error": row.get("last_error"),
+        "lifetime_days": int(row.get("lifetime_days") or 14),
     }
 
 

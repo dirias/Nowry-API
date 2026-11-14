@@ -326,6 +326,7 @@ def test_what_the_operator_reads_has_no_token_and_no_hash():
     assert set(InviteSummary.model_fields) == {
         "id", "email", "cohort", "state", "note", "created_at", "expires_at", "used_at", "revoked_at",
         "locale", "sent_at", "send_count", "last_error",  # INVITE-008: the letter
+        "lifetime_days",  # INVITE-009: how long a resent link lasts
     }
 
 

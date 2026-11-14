@@ -100,6 +100,8 @@ class InviteSummary(BaseModel):
     sent_at: Optional[datetime] = None
     send_count: int = 0
     last_error: Optional[str] = None
+    # How long a link made for this row lasts; a resend makes the new one as long (INVITE-009).
+    lifetime_days: int = 14
 
 
 class InviteCreated(InviteSummary):
