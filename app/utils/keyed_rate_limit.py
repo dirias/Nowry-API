@@ -50,6 +50,17 @@ async def seconds_to_wait(feature: str, key: str, limit: int, window_seconds: in
     return 0
 
 
+async def current_count(feature: str, key: str, window_seconds: int) -> int:
+    """How many slots this window has taken, without taking one. A store that cannot be read counts as full."""
+    bucket_id, _, _ = bucket(feature, key, window_seconds, time.time())
+    try:
+        row = await rate_limits_collection.find_one({"_id": bucket_id}, {"count": 1})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("keyed_rate_limit: counter unavailable for %s: %s", feature, exc)
+        return 1 << 30
+    return int((row or {}).get("count", 0))
+
+
 async def longest_wait(checks: list[tuple[str, str, int, int]]) -> int:
     """Take a slot in every (feature, key, limit, window) and return the longest wait among them."""
     waits = [await seconds_to_wait(*check) for check in checks]

@@ -75,6 +75,7 @@ from app.routers import (
     goal_ai,
     comments,
     contact,
+    account_password,
     beta,
     beta_admin,
     copyright,
@@ -215,6 +216,7 @@ app.include_router(contact.router)        # The public contact form — POST /co
 app.include_router(beta_admin.router)     # Personal invitations, admin-only (ADR-077)
 app.include_router(email_webhooks.router) # Resend: bounces and complaints, by signature (ADR-080)
 app.include_router(beta.router)           # The beta gate — GET /beta/config, invites, waitlist (ADR-038)
+app.include_router(account_password.router)  # Change or set a password through the API (ADR-092)
 
 # The dev-only outbox (ADR-090): never mounted in production.
 from app.services import dev_outbox as _dev_outbox  # noqa: E402

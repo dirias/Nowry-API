@@ -26,6 +26,8 @@ KINDS: dict[str, dict[str, str]] = {
     "account.google": {"class": "account", "sender": "account"},
     # The notice right after a deletion (ADR-089, FR-039): no button; a reply reaches support.
     "account.deleted": {"class": "account", "sender": "account", "button": "none"},
+    # After a password change or set (ADR-092, FR-046): no button; a reply reaches support.
+    "account.password": {"class": "account", "sender": "account", "button": "none"},
     # To the operator only, in English (ADR-091, AI-007): an AI provider stopped answering.
     "ops.ai_provider": {"class": "notice", "sender": "account", "button": "none", "locale": "en"},
     "ops.ai_urgent": {"class": "notice", "sender": "account", "button": "none", "locale": "en"},

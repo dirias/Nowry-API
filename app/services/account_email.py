@@ -109,7 +109,7 @@ def _google_only(user) -> bool:
 async def send_google_notice(email: str, language: Optional[str]) -> None:
     """`account.google`: this account signs in with Google. No Firebase fallback: Firebase has nothing to send."""
     try:
-        link = f"{email_service.frontend_url()}/login"
+        link = f"{email_service.frontend_url()}/set-password"  # signs in with Google, then Set a password (FR-047)
         outcome = await email_service.send_email("account.google", email, language, {"link": link})
     except Exception as exc:  # noqa: BLE001 - runs after the answer; nothing to raise to
         outcome = f"failed: {type(exc).__name__}"

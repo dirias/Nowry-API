@@ -37,9 +37,9 @@
       "subject": "Tu cuenta de Nowry inicia sesión con Google",
       "before": [
         "Hola:",
-        "Alguien pidió restablecer la contraseña de la cuenta de Nowry con esta dirección. Esta cuenta inicia sesión con Google, no con una contraseña, así que no hay nada que restablecer. Usa Iniciar sesión con Google en la página de inicio de sesión:"
+        "Alguien pidió restablecer la contraseña de la cuenta de Nowry con esta dirección. Esta cuenta inicia sesión con Google, así que no tiene contraseña que restablecer. Puedes iniciar sesión con Google, o crear una contraseña para entrar también con tu correo; primero iniciarás sesión con Google:"
       ],
-      "button": "Iniciar sesión en Nowry",
+      "button": "Crear una contraseña",
       "after": [
         "Si no lo pediste, ignora este correo. No ha cambiado nada."
       ],
@@ -54,6 +54,15 @@
       ],
       "signature": "Nowry",
       "footer": "Enviado a $email porque se eliminó la cuenta de Nowry con esta dirección."
+    },
+    "password": {
+      "subject": "Tu contraseña de Nowry se ha cambiado",
+      "before": [
+        "Hola:",
+        "Tu contraseña de Nowry se ha cambiado. Si no fuiste tú, escribe a $support."
+      ],
+      "signature": "Nowry",
+      "footer": "Enviado a $email porque se cambió la contraseña de la cuenta de Nowry con esta dirección."
     }
   },
   "waitlist": {

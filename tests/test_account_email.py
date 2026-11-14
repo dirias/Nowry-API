@@ -155,7 +155,7 @@ async def test_a_google_only_address_is_told_it_signs_in_with_google_and_gets_no
             patch.object(service.email_service, "send_email", send), \
             patch.object(service, "firebase_sends_reset", firebase):
         await service.send_reset("ana@example.com", "fr")
-    send.assert_awaited_once_with("account.google", "ana@example.com", "fr", {"link": "https://nowry.app/login"})
+    send.assert_awaited_once_with("account.google", "ana@example.com", "fr", {"link": "https://nowry.app/set-password"})  # FR-047: Set a password, via Google
     make.assert_not_called()
     firebase.assert_not_awaited()
 

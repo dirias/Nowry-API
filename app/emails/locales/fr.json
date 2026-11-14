@@ -37,9 +37,9 @@
       "subject": "Votre compte Nowry se connecte avec Google",
       "before": [
         "Bonjour,",
-        "Quelqu'un a demandé à réinitialiser le mot de passe du compte Nowry lié à cette adresse. Ce compte se connecte avec Google, pas avec un mot de passe : il n'y a rien à réinitialiser. Utilisez Continuer avec Google sur la page de connexion :"
+        "Quelqu'un a demandé à réinitialiser le mot de passe du compte Nowry lié à cette adresse. Ce compte se connecte avec Google : il n'a pas de mot de passe à réinitialiser. Vous pouvez vous connecter avec Google, ou définir un mot de passe pour vous connecter aussi avec votre e-mail ; vous vous connecterez d'abord avec Google :"
       ],
-      "button": "Se connecter à Nowry",
+      "button": "Définir un mot de passe",
       "after": [
         "Si vous n'avez rien demandé, ignorez cet e-mail. Rien n'a changé."
       ],
@@ -54,6 +54,15 @@
       ],
       "signature": "Nowry",
       "footer": "Envoyé à $email parce que le compte Nowry lié à cette adresse a été supprimé."
+    },
+    "password": {
+      "subject": "Votre mot de passe Nowry a été modifié",
+      "before": [
+        "Bonjour,",
+        "Votre mot de passe Nowry a été modifié. Si ce n'était pas vous, écrivez à $support."
+      ],
+      "signature": "Nowry",
+      "footer": "Envoyé à $email parce que le mot de passe du compte Nowry lié à cette adresse a été modifié."
     }
   },
   "waitlist": {
