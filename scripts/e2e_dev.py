@@ -31,6 +31,9 @@ from typing import Any, Dict, List
 ALIAS = re.compile(r"^rikydier\+e2e-[a-z0-9]+-[a-z0-9-]+@gmail\.com$")
 RUN = re.compile(r"^[a-z0-9]{4,16}$")
 DEV_DATABASE = "nowry-db"
+#: Reports an account sent are kept when it is deleted (they are the operator's record),
+#: so a run's cleanup removes the suite's own here (E2E-ADMIN-4).
+SUITE_KEPT_ON_DELETION = (("bugs", "user_id"), ("content_reports", "reporter_user_id"))
 
 
 def refuse(message: str) -> None:
@@ -174,7 +177,7 @@ async def cleanup(db, run: str) -> Dict[str, Any]:
     for user in users:
         uid = str(user["_id"])
         emails.add((user.get("deleted_identity") or {}).get("email") or user.get("email"))
-        for name, owner in OWNED:
+        for name, owner in OWNED + SUITE_KEPT_ON_DELETION:
             result = await db[name].delete_many({owner: uid})
             removed[name] = removed.get(name, 0) + result.deleted_count
         await db.users.delete_one({"_id": user["_id"]})

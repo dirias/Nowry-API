@@ -71,3 +71,9 @@ async def test_marks_a_live_suite_account_verified():
     assert await e2e_dev.mark_verified(db, "rikydier+e2e-abc-mod-a@gmail.com") == {"changed": 1}
     query, update = db.users.update_one.await_args.args
     assert query["deleted_at"] is None and update == {"$set": {"email_verified": True}}
+
+
+def test_cleanup_reaches_the_reports_kept_on_deletion():
+    import inspect
+    assert e2e_dev.SUITE_KEPT_ON_DELETION == (("bugs", "user_id"), ("content_reports", "reporter_user_id"))
+    assert "OWNED + SUITE_KEPT_ON_DELETION" in inspect.getsource(e2e_dev.cleanup)
