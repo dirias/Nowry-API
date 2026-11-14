@@ -62,3 +62,12 @@ async def test_backdates_created_and_sent_times_of_the_address_invitations():
 async def test_backdating_refuses_an_unbounded_shift():
     with pytest.raises(SystemExit):
         await e2e_dev.backdate_invites(MagicMock(), "rikydier+e2e-abc-adm-a@gmail.com", 500)
+
+
+@pytest.mark.asyncio
+async def test_marks_a_live_suite_account_verified():
+    db = MagicMock()
+    db.users.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+    assert await e2e_dev.mark_verified(db, "rikydier+e2e-abc-mod-a@gmail.com") == {"changed": 1}
+    query, update = db.users.update_one.await_args.args
+    assert query["deleted_at"] is None and update == {"$set": {"email_verified": True}}

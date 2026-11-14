@@ -9,6 +9,7 @@ every address must be one of the run's aliases, ``rikydier+e2e-<run>-<case>@gmai
     python -I -m scripts.e2e_dev waitlist <email>           the waitlist row
     python -I -m scripts.e2e_dev make-admin <email>         is_admin on a suite account
     python -I -m scripts.e2e_dev admin-log <email>          the admin log rows about a suite address
+    python -I -m scripts.e2e_dev mark-verified <email>      the account's address recorded as verified
     python -I -m scripts.e2e_dev backdate-invites <email> <hours>   its invitations' created_at and sent_at, moved back
     python -I -m scripts.e2e_dev expire-invites <email>     open invitations to that alias end now
     python -I -m scripts.e2e_dev backdate-deletion <email> <days>   the deleted record and its rows, moved back
@@ -125,6 +126,12 @@ async def backdate_invites(db, email: str, hours: float) -> Dict[str, Any]:
     return {"changed": len(rows)}
 
 
+async def mark_verified(db, email: str) -> Dict[str, Any]:
+    """Record a suite account's address as verified (ADR-076), without spending a verification email (E2E-ADMIN-3)."""
+    result = await db.users.update_one({**alias_query("email", email), "deleted_at": None}, {"$set": {"email_verified": True}})
+    return {"changed": result.modified_count}
+
+
 async def admin_log(db, email: str) -> Dict[str, Any]:
     """The admin log rows about a suite address, oldest first: action and outcome only (E2E-ADMIN-1)."""
     rows = await db.admin_actions.find(alias_query("target_title", email)).sort("created_at", 1).to_list(length=50)
@@ -216,6 +223,8 @@ async def main(argv: List[str]) -> None:
             result = await expire_invites(db, email)
         elif command == "backdate-invites":
             result = await backdate_invites(db, email, float(args[1]))
+        elif command == "mark-verified":
+            result = await mark_verified(db, email)
         elif command == "admin-log":
             result = await admin_log(db, email)
         elif command == "set-xp":
