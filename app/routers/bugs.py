@@ -5,12 +5,21 @@ from datetime import datetime, timezone
 from bson import ObjectId
 
 from app.models.Bug import (
+    BUG_STATUSES,
+    SEVERITIES,
+    BugCategory,
     BugReport,
     BugReportCreate,
     BugReportResponse,
+    BugRow,
+    BugSeverity,
+    BugStatus,
+    BugStatusChanged,
     BugStatusUpdate,
+    current_status,
+    stored_statuses,
 )
-from app.models.common import BugStatsResponse, BugStatusUpdateResponse, MessageResponse
+from app.models.common import BugStatsResponse, MessageResponse
 from app.config.database import bugs_collection, users_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_admin, require_recent_admin
@@ -161,147 +170,160 @@ async def get_my_bug_reports(current_user=Depends(get_firebase_user)):
     return bugs
 
 
-# ========== ADMIN-ONLY ENDPOINTS (ADMIN-001, ADR-086) ==========
+# ========== ADMIN-ONLY ENDPOINTS (ADMIN-001, ADMIN-007b, ADR-086) ==========
 # These must come BEFORE /{bug_id} routes to prevent "all" and "stats" being treated as bug IDs.
 # `require_admin` reads `is_admin` from the account; `role` grants nothing.
 
-#: The most reports one triage listing returns.
-ALL_BUGS_LIMIT = 500
-STATUS_COUNTS = {"open": "open", "in_progress": "in-progress", "resolved": "resolved"}
-SEVERITIES = ("critical", "high", "medium", "low")
+#: The most reports one triage listing returns, and how many it returns unasked.
+ALL_BUGS_LIMIT = 200
+ALL_BUGS_DEFAULT = 100
+#: What a malformed id answers on read, delete and change (ADMIN-007b).
+BAD_ID: Dict[str, str] = {"code": "bad_id"}
 
 
-def bug_filter(bug_status: Optional[str], severity: Optional[str], category: Optional[str]) -> Dict[str, str]:
-    """The listing's filter: only the fields the caller named."""
-    named = {"status": bug_status, "severity": severity, "category": category}
-    return {field: value for field, value in named.items() if value}
+def bug_oid(bug_id: str) -> ObjectId:
+    """The path's report id, or `400 {"code": "bad_id"}` before anything is read."""
+    if not ObjectId.is_valid(bug_id):
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=BAD_ID)
+    return ObjectId(bug_id)
 
 
-@router.get("/all", response_model=List[BugReport])
+async def find_bug(bug_id: str) -> Dict[str, Any]:
+    """The stored report, or 400 for a malformed id and 404 for an unknown one."""
+    bug = await bugs_collection.find_one({"_id": bug_oid(bug_id)})
+    if not bug:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug report not found")
+    return bug
+
+
+def bug_filter(bug_status: Optional[str], severity: Optional[str], category: Optional[str]) -> Dict[str, Any]:
+    """The listing's filter: only the fields the caller named; a status matches its old names too."""
+    query: Dict[str, Any] = {field: value for field, value in (("severity", severity), ("category", category)) if value}
+    if bug_status:
+        query["status"] = {"$in": stored_statuses(bug_status)}
+    return query
+
+
+def note_history(bug: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The notes oldest first; a note from before the history (`dev_notes`) is the first entry."""
+    legacy = [{"text": bug["dev_notes"], "by": None, "at": None}] if bug.get("dev_notes") else []
+    return legacy + list(bug.get("notes") or [])
+
+
+async def usernames(user_ids: List[str]) -> Dict[str, str]:
+    """{user id: username} for the reporters of a page of reports, read in one bounded query."""
+    oids = list({ObjectId(uid) for uid in user_ids if isinstance(uid, str) and ObjectId.is_valid(uid)})
+    accounts = await users_collection.find({"_id": {"$in": oids}}, {"username": 1}).to_list(length=len(oids) or 1)
+    return {str(account["_id"]): account.get("username") or "" for account in accounts}
+
+
+def bug_row(bug: Dict[str, Any], username: str, with_notes: bool = True) -> BugRow:
+    """One stored report as the tab reads it: status mapped, reporter by username, never the address."""
+    browser = bug.get("browser_info") if isinstance(bug.get("browser_info"), dict) else None
+    fields = {key: bug[key] for key in BugRow.model_fields if key in bug and bug[key] is not None}
+    return BugRow(**{
+        **fields,
+        "id": str(bug["_id"]),
+        "status": current_status(bug.get("status")),
+        "browser_info": browser,
+        "screen_size": (browser or {}).get("screen_resolution"),
+        "reporter_username": username,
+        "notes": note_history(bug) if with_notes else [],
+    })
+
+
+@router.get("/all", response_model=List[BugRow])
 async def get_all_bugs(
-    bug_status: Optional[str] = Query(default=None, alias="status", max_length=40),
-    severity: Optional[str] = Query(default=None, max_length=40),
-    category: Optional[str] = Query(default=None, max_length=40),
+    bug_status: Optional[BugStatus] = Query(default=None, alias="status"),
+    severity: Optional[BugSeverity] = Query(default=None),
+    category: Optional[BugCategory] = Query(default=None),
+    limit: int = Query(default=ALL_BUGS_DEFAULT, ge=1, le=ALL_BUGS_LIMIT),
     current_user: dict = Depends(require_admin),
-) -> List[dict]:
-    """Every bug report, newest first, optionally filtered (admin only).
-
-    - status: open, in-progress, resolved, closed
-    - severity: low, medium, high, critical
-    - category: ui, functionality, performance, other
-    """
-    bugs = await bugs_collection.find(bug_filter(bug_status, severity, category)).sort("created_at", -1).to_list(ALL_BUGS_LIMIT)
-    for bug in bugs:
-        bug["_id"] = str(bug["_id"])
-    return bugs
+) -> List[BugRow]:
+    """Reports newest first, optionally filtered by status, severity and category (admin only)."""
+    bugs = await bugs_collection.find(bug_filter(bug_status, severity, category)).sort("created_at", -1).limit(limit).to_list(length=limit)
+    names = await usernames([bug.get("user_id") for bug in bugs])
+    return [bug_row(bug, names.get(bug.get("user_id"), "")) for bug in bugs]
 
 
 @router.get("/stats", response_model=BugStatsResponse)
 async def get_bug_stats(current_user: dict = Depends(require_admin)) -> BugStatsResponse:
-    """Counts by status and severity (admin only)."""
-    by_status = {key: await bugs_collection.count_documents({"status": value}) for key, value in STATUS_COUNTS.items()}
+    """Counts by status (old names counted under their new ones) and severity (admin only)."""
+    by_status = {name: await bugs_collection.count_documents({"status": {"$in": stored_statuses(name)}}) for name in BUG_STATUSES}
     by_severity = {name: await bugs_collection.count_documents({"severity": name}) for name in SEVERITIES}
     return BugStatsResponse(total=await bugs_collection.count_documents({}), by_status=by_status, by_severity=by_severity)
 
 
-# ========== USER ENDPOINTS (with path parameters) ==========
+# ========== ENDPOINTS WITH PATH PARAMETERS ==========
 
 
-@router.get("/{bug_id}", response_model=BugReport)
-async def get_bug_by_id(
-    bug_id: str, current_user=Depends(get_firebase_user)
-):
-    """
-    Get a specific bug report by ID.
+@router.get("/{bug_id}", response_model=BugRow)
+async def get_bug_by_id(bug_id: str, current_user: dict = Depends(get_firebase_user)) -> BugRow:
+    """One report. An admin reads any, with its note history; a reporter reads their own, without it."""
+    bug = await find_bug(bug_id)
+    if bug.get("user_id") != current_user.get("user_id"):
+        await require_admin(current_user)  # 403 for anyone but an admin
+        return bug_row(bug, (await usernames([bug.get("user_id")])).get(bug.get("user_id"), ""))
+    is_admin = await caller_is_admin(current_user)
+    return bug_row(bug, await reporter_username(bug["user_id"]), with_notes=is_admin)
 
-    Users can only view their own bug reports.
-    """
 
+async def caller_is_admin(current_user: dict) -> bool:
+    """True when the caller's account holds `is_admin` (the same check as `require_admin`)."""
     try:
-        bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
-    except Exception:
-        raise HTTPException(
-            status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
-        )
-
-    if not bug:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug report not found"
-        )
-
-    # Check if user owns this bug report
-    user_id = current_user.get("user_id")
-    if bug["user_id"] != user_id:
-        raise HTTPException(
-            status_code=http_status.HTTP_403_FORBIDDEN,
-            detail="You can only view your own bug reports",
-        )
-
-    bug["_id"] = str(bug["_id"])
-    return bug
+        await require_admin(current_user)
+    except HTTPException:
+        return False
+    return True
 
 
 @router.delete("/{bug_id}", response_model=MessageResponse)
-async def delete_bug_report(
-    bug_id: str, current_user=Depends(get_firebase_user)
-):
-    """
-    Delete a bug report.
-
-    Users can only delete their own bug reports.
-    Useful if submitted by mistake.
-    """
-
-    try:
-        bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
-    except Exception:
-        raise HTTPException(
-            status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format"
-        )
-
-    if not bug:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug report not found"
-        )
-
-    # Check if user owns this bug report
-    user_id = current_user.get("user_id")
-    if bug["user_id"] != user_id:
+async def delete_bug_report(bug_id: str, current_user: dict = Depends(get_firebase_user)) -> MessageResponse:
+    """Delete one of the caller's own reports (sent by mistake)."""
+    bug = await find_bug(bug_id)
+    if bug["user_id"] != current_user.get("user_id"):
         raise HTTPException(
             status_code=http_status.HTTP_403_FORBIDDEN,
             detail="You can only delete your own bug reports",
         )
-
-    # Delete the bug report
-    await bugs_collection.delete_one({"_id": ObjectId(bug_id)})
-
-    return {"message": "Bug report deleted successfully"}
+    await bugs_collection.delete_one({"_id": bug["_id"]})
+    return MessageResponse(message="Bug report deleted successfully")
 
 
-@router.patch("/{bug_id}/status", response_model=BugStatusUpdateResponse)
+def triage_changes(bug: Dict[str, Any], change: BugStatusUpdate, admin_id: str, now: datetime) -> Dict[str, Any]:
+    """The update: always the new name of the status, the priority if given, the note appended."""
+    to_status = change.status or current_status(bug.get("status"))
+    fields: Dict[str, Any] = {"status": to_status, "updated_at": now}
+    if change.status == "fixed":
+        fields["resolved_at"] = now
+    if change.priority:
+        fields["priority"] = change.priority
+    update: Dict[str, Any] = {"$set": fields}
+    if change.note:
+        update["$push"] = {"notes": {"text": change.note, "by": admin_id, "at": now}}
+    return update
+
+
+@router.patch("/{bug_id}/status", response_model=BugStatusChanged)
 async def update_bug_status(
     bug_id: str,
     status_update: BugStatusUpdate,
     current_user: dict = Depends(require_recent_admin),
-) -> BugStatusUpdateResponse:
-    """Change a report's status, priority and notes (admin only). Logged as `bug.status`."""
-    if not ObjectId.is_valid(bug_id):
-        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid bug ID format")
-    bug = await bugs_collection.find_one({"_id": ObjectId(bug_id)})
-    if not bug:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Bug not found")
-
-    now = datetime.now(timezone.utc)
-    update_data: Dict[str, Any] = {"status": status_update.status, "updated_at": now}
-    if status_update.priority:
-        update_data["priority"] = status_update.priority
-    if status_update.notes:
-        update_data["dev_notes"] = status_update.notes
-    if status_update.status == "resolved":
-        update_data["resolved_at"] = now
-    await bugs_collection.update_one({"_id": ObjectId(bug_id)}, {"$set": update_data})
+) -> BugStatusChanged:
+    """Change a report's status or priority and append a note (admin only). Logged as `bug.status`."""
+    bug = await find_bug(bug_id)
+    update = triage_changes(bug, status_update, current_user["user_id"], datetime.now(timezone.utc))
+    await bugs_collection.update_one({"_id": bug["_id"]}, update)
+    to_status = update["$set"]["status"]
     await record_admin_action(
         current_user["user_id"], "bug.status", "bug", bug_id, bug.get("title"),
-        details={"from": bug.get("status"), "to": status_update.status, "priority": status_update.priority},
+        details={
+            "from": current_status(bug.get("status")), "to": to_status,
+            "note_added": status_update.note is not None, "priority": status_update.priority,
+        },
     )
-    return BugStatusUpdateResponse(message="Bug status updated successfully", bug_id=bug_id, status=status_update.status)
+    changed = await bugs_collection.find_one({"_id": bug["_id"]}) or bug
+    return BugStatusChanged(
+        message="Bug status updated successfully", bug_id=bug_id, status=to_status,
+        priority=changed.get("priority"), notes=note_history(changed),
+    )

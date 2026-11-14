@@ -78,7 +78,7 @@ def act_as(caller: dict, who: ObjectId) -> None:
 def test_an_account_without_the_flag_is_refused_403_whatever_its_role(world, method, path):
     client, caller, _ = world
     act_as(caller, TESTER)  # role "dev": that used to pass
-    response = client.request(method, path, json={"status": "resolved"} if method == "PATCH" else None)
+    response = client.request(method, path, json={"status": "fixed"} if method == "PATCH" else None)
     assert response.status_code == 403
 
 
@@ -87,9 +87,9 @@ def test_an_admin_reads_every_report_with_string_ids_and_filters(world):
     act_as(caller, ADMIN)
     everything = client.get("/bugs/all")
     assert everything.status_code == 200
-    assert len(everything.json()) == 2 and all(isinstance(row["_id"], str) for row in everything.json())
-    resolved = client.get("/bugs/all", params={"status": "resolved"}).json()
-    assert [row["status"] for row in resolved] == ["resolved"]
+    assert len(everything.json()) == 2 and all(isinstance(row["id"], str) for row in everything.json())
+    fixed = client.get("/bugs/all", params={"status": "fixed"}).json()  # ADMIN-007b: "resolved" reads as "fixed"
+    assert [row["status"] for row in fixed] == ["fixed"]
 
 
 def test_an_admin_reads_the_counts(world):
@@ -98,7 +98,7 @@ def test_an_admin_reads_the_counts(world):
     stats = client.get("/bugs/stats").json()
     assert stats == {
         "total": 2,
-        "by_status": {"open": 1, "in_progress": 0, "resolved": 1},
+        "by_status": {"new": 1, "in_progress": 0, "fixed": 1, "wont_fix": 0},
         "by_severity": {"critical": 0, "high": 1, "medium": 0, "low": 1},
     }
 
@@ -108,32 +108,35 @@ def test_an_admin_status_change_is_written_and_logged(world):
 
     client, caller, database = world
     act_as(caller, ADMIN)
-    target = client.get("/bugs/all", params={"status": "open"}).json()[0]["_id"]
-    response = client.patch(f"/bugs/{target}/status", json={"status": "resolved", "notes": "fixed in 1.2"})
-    assert response.status_code == 200 and response.json()["status"] == "resolved"
+    target = client.get("/bugs/all", params={"status": "new"}).json()[0]["id"]
+    response = client.patch(f"/bugs/{target}/status", json={"status": "fixed", "note": "fixed in 1.2"})
+    assert response.status_code == 200 and response.json()["status"] == "fixed"
 
     loop = asyncio.new_event_loop()
     stored = loop.run_until_complete(database["bugs"].find_one({"_id": ObjectId(target)}))
-    assert stored["status"] == "resolved" and stored["dev_notes"] == "fixed in 1.2" and stored["resolved_at"]
+    assert stored["status"] == "fixed" and stored["notes"][0]["text"] == "fixed in 1.2" and stored["resolved_at"]
     rows = loop.run_until_complete(database["admin_actions"].find({}).to_list(length=10))
     assert [(r["actor_id"], r["action"], r["target_id"]) for r in rows] == [(str(ADMIN), "bug.status", target)]
-    assert rows[0]["details"]["from"] == "open" and rows[0]["details"]["to"] == "resolved"
+    assert rows[0]["details"]["from"] == "new" and rows[0]["details"]["to"] == "fixed"
 
 
 def test_a_malformed_or_unknown_bug_id_on_the_status_change(world):
     client, caller, _ = world
     act_as(caller, ADMIN)
-    assert client.patch("/bugs/not-an-id/status", json={"status": "resolved"}).status_code == 400
-    assert client.patch(f"/bugs/{ObjectId()}/status", json={"status": "resolved"}).status_code == 404
+    malformed = client.patch("/bugs/not-an-id/status", json={"status": "fixed"})
+    assert malformed.status_code == 400 and malformed.json()["detail"] == {"code": "bad_id"}
+    assert client.patch(f"/bugs/{ObjectId()}/status", json={"status": "fixed"}).status_code == 404
 
 
 def test_a_reporter_reads_only_their_own_reports(world):
-    client, caller, _ = world
+    import asyncio
+
+    client, caller, database = world
     act_as(caller, TESTER)
     mine = client.get("/bugs/my-reports").json()
     assert len(mine) == 2
-    act_as(caller, ADMIN)
-    assert client.get(f"/bugs/{mine[0]['_id']}").status_code == 403
+    other = asyncio.new_event_loop().run_until_complete(database["bugs"].insert_one(bug(ADMIN))).inserted_id
+    assert client.get(f"/bugs/{other}").status_code == 403
 
 
 def test_the_news_cache_route_is_gone():
@@ -147,6 +150,6 @@ def test_a_stale_admin_sign_in_is_asked_again_before_a_status_change(world):
     client, caller, _ = world
     act_as(caller, ADMIN)
     caller["auth_time"] = int(datetime.now(timezone.utc).timestamp()) - 13 * 3600
-    target = client.get("/bugs/all").json()[0]["_id"]
-    response = client.patch(f"/bugs/{target}/status", json={"status": "resolved"})
+    target = client.get("/bugs/all").json()[0]["id"]
+    response = client.patch(f"/bugs/{target}/status", json={"status": "fixed"})
     assert response.status_code == 401 and response.json()["detail"] == {"code": "reauth_required"}
