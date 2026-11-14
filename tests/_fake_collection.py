@@ -76,7 +76,7 @@ class FakeCollection:
     async def find_one(self, query: Dict[str, Any], projection: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return next((copy.deepcopy(row) for row in self.rows if _matches(row, query)), None)
 
-    def find(self, query: Dict[str, Any]) -> _Cursor:
+    def find(self, query: Dict[str, Any], projection: Optional[Dict[str, Any]] = None) -> _Cursor:
         return _Cursor([row for row in self.rows if _matches(row, query)])
 
     async def update_many(self, query: Dict[str, Any], update: Dict[str, Any]) -> SimpleNamespace:
