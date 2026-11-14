@@ -203,6 +203,18 @@ async def test_a_batch_over_todays_share_is_refused_whole(world, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_letters_the_dev_outbox_keeps_spend_no_budget(world, monkeypatch):
+    """Suite addresses are kept by the dev outbox and never posted, so a spent day does not hold them (ADR-090)."""
+    monkeypatch.setattr(invite_batch.email_ledger, "sent_today", AsyncMock(return_value=100))
+    monkeypatch.setattr(invite_batch.dev_outbox, "outbox_only", lambda address: address.startswith("a@") or address.startswith("b@"))
+    answer = await invite_batch.run_batch(["a@x.com", "b@x.com"], "c1-waitlist", 14, "en", False, ADMIN, NOW)
+    assert [result["outcome"] for result in answer["results"]] == ["sent", "sent"]
+    with pytest.raises(HTTPException) as refused:
+        await invite_batch.run_batch(["a@y.com", "fresh@z.com"], "c1-waitlist", 14, "en", False, ADMIN, NOW)
+    assert refused.value.detail == {"code": "over_budget", "needed": 1, "left": 0}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("budget, sent, left", [("125", 0, 100), ("10", 3, 5), ("10", 9, 0), (None, 0, 72)])
 async def test_invitations_left_today(monkeypatch, budget, sent, left):
     if budget is None:

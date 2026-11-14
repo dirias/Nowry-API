@@ -65,7 +65,8 @@ async def check_resend(row: Dict[str, Any], invites: Any, now: datetime) -> None
     opens = resend_opens_at(await newest_invitation(row["email"], invites))
     if opens is not None and now < opens:
         raise HTTPException(status_code=429, detail={"code": RESEND_TOO_SOON_CODE, "retry_at": opens.isoformat()})
-    invite_batch.refuse_over_budget(1, await invite_batch.invitations_left_today())
+    if invite_batch.spends_budget(row["email"]):
+        invite_batch.refuse_over_budget(1, await invite_batch.invitations_left_today())
 
 
 async def resend_invite(invite_id: str, admin_id: str, invites: Any = None, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:

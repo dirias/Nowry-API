@@ -29,7 +29,7 @@ from app.config import invites as rules
 from app.config.database import invites_collection, users_collection, waitlist_collection
 from app.emails.budget import ceiling, parse_budget
 from app.emails.render import resolve_locale
-from app.services import beta_invites, email_ledger, email_suppressions, invitation_email
+from app.services import beta_invites, dev_outbox, email_ledger, email_suppressions, invitation_email
 from app.services.email import delivered
 from app.services.admin_actions import record_admin_action
 
@@ -129,6 +129,11 @@ def count_outcomes(results: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+def spends_budget(address: str) -> bool:
+    """Whether a letter to this address would spend the day's budget: not when the dev outbox keeps it (ADR-090)."""
+    return not dev_outbox.outbox_only(address)
+
+
 def refuse_over_budget(needed: int, left: int) -> None:
     """The whole batch is refused when it needs more invitations than today has left."""
     if needed > left:
@@ -158,7 +163,7 @@ async def run_batch(
     left = await invitations_left_today()
     if not dry_run:
         to_invite = [result for result in results if result["outcome"] == WILL_INVITE]
-        refuse_over_budget(len(to_invite), left)
+        refuse_over_budget(sum(1 for result in to_invite if spends_budget(result["email"])), left)
         for result in to_invite:
             address = result["email"]
             result["outcome"], result["invite_id"] = await invite_one(address, cohort, days, facts.locales.get(address, locale), admin_id, at)

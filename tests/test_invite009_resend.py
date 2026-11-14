@@ -136,6 +136,14 @@ async def test_with_nothing_left_today_the_old_link_keeps_working(world, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_a_letter_the_dev_outbox_keeps_is_resent_on_a_spent_day(world, monkeypatch):
+    monkeypatch.setattr(invite_batch.email_ledger, "sent_today", AsyncMock(return_value=100))
+    monkeypatch.setattr(invite_batch.dev_outbox, "outbox_only", lambda address: True)
+    old_id, _ = await sent_invitation(world, NOW - timedelta(hours=2))
+    assert await invite_resend.resend_invite(old_id, ADMIN, now=NOW) is not None
+
+
+@pytest.mark.asyncio
 async def test_a_failed_letter_keeps_the_new_invitation_open_with_its_error(world):
     world["send"].return_value = "failed"
     old_id, _ = await sent_invitation(world, NOW - timedelta(hours=2))

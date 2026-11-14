@@ -8,9 +8,9 @@ admin log (`actor_id: "script"`). It refuses, writing nothing, unless exactly
 one active account has exactly that address (lowercased; never a pattern).
 Nothing but the address and the flag is printed.
 
-    railway run --environment Production --service Nowry -- .venv/bin/python -I -m scripts.set_admin --email <address>
-    railway run --environment Production --service Nowry -- .venv/bin/python -I -m scripts.set_admin --email <address> --apply
-    railway run --environment Production --service Nowry -- .venv/bin/python -I -m scripts.set_admin --email <address> --revoke --apply
+    railway run --environment Production --service Nowry -- .venv/bin/python -m scripts.set_admin --email <address>
+    railway run --environment Production --service Nowry -- .venv/bin/python -m scripts.set_admin --email <address> --apply
+    railway run --environment Production --service Nowry -- .venv/bin/python -m scripts.set_admin --email <address> --revoke --apply
 """
 from __future__ import annotations
 
