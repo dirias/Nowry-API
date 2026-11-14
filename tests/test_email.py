@@ -67,10 +67,20 @@ def test_every_kind_has_its_words():
         assert {"subject", "before", "signature", "footer"} | action <= set(english[group][name])
 
 
+def _kind_values(kind, locale):
+    """The values a kind asks for beyond the shared ones (ADMIN-003's removal notice)."""
+    if kind != "content.removed":
+        return {}
+    from app.services.moderation import removal_email_values
+
+    return removal_email_values(locale, "deck", "Capitals", "copyright", "See the notice", False)
+
+
 @pytest.mark.parametrize("locale", LOCALES)
 @pytest.mark.parametrize("kind", sorted(kind for kind, traits in KINDS.items() if traits["sender"] == "account" and not traits.get("locale")))
 def test_both_parts_render_in_every_language_with_nothing_left_unfilled(kind, locale):
-    rendered = render_email(kind, locale, VALUES, logo_url="https://nowry.app/logo192.png")
+    values = {**VALUES, **_kind_values(kind, locale)}
+    rendered = render_email(kind, locale, values, logo_url="https://nowry.app/logo192.png")
     assert rendered.locale == locale and rendered.subject
     for part in (rendered.subject, rendered.text, rendered.html):
         assert "$" not in part

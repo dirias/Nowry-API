@@ -265,6 +265,11 @@ async def create_indexes():
     # Content reports (moderation): status, created_at
     await db["content_reports"].create_index("status")
     await db["content_reports"].create_index("created_at")
+    # Moderation (ADR-087): an item's reports by state; a removal walks copies by their source; removed items by time.
+    await db["content_reports"].create_index([("content_type", 1), ("content_id", 1), ("status", 1)], name="content_reports_item")
+    for content in (decks_collection, books_collection):
+        await content.create_index("forked_from.id", sparse=True, name="copies_by_source")
+        await content.create_index("removal.removed_at", sparse=True, name="removed_by_time")
 
     # Curated official browse + unique approved (topic, rank) — ADR-004
     await create_curation_indexes(decks_collection)

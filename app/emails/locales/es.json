@@ -121,5 +121,40 @@
       "signature": "Didier, Nowry",
       "footer": "Enviado a $email porque esta dirección recibió una invitación a la beta de Nowry."
     }
+  },
+  "content": {
+    "removed": {
+      "subject": "«$title» ya no es público en Nowry",
+      "before": [
+        "Hola:",
+        "$lead",
+        "$reason_line",
+        "$note_line",
+        "Puedes seguir usándolo en privado: sigue en tu biblioteca, donde puedes abrirlo, editarlo y estudiarlo como antes.",
+        "Si crees que es un error o tienes alguna pregunta, responde a este correo. Una persona lee cada respuesta."
+      ],
+      "signature": "Nowry",
+      "footer": "Enviado a $email porque se retiró de la vista pública contenido de la cuenta de Nowry con esta dirección.",
+      "types": {
+        "deck": "mazo",
+        "book": "libro"
+      },
+      "lead": {
+        "own": "Nowry ha retirado tu $type «$title» de la vista pública. Ya no es público y no se puede volver a publicar.",
+        "copy": "Tu $type «$title» era una copia pública de un contenido que Nowry retiró de la vista pública, así que tampoco es público ya y no se puede volver a publicar."
+      },
+      "reason_line": {
+        "own": "Motivo: $reason.",
+        "copy": "Motivo por el que se retiró el original: $reason."
+      },
+      "reasons": {
+        "copyright": "parece copiar una obra protegida por derechos de autor sin permiso",
+        "inappropriate": "contiene material que no es apropiado para Nowry",
+        "spam": "es spam o publicidad, no material de estudio",
+        "misinformation": "presenta como hechos información falsa o engañosa",
+        "other": "incumple las normas de Nowry para el contenido público"
+      },
+      "note_line": "Nota de la persona que lo revisó: $note"
+    }
   }
 }

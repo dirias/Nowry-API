@@ -73,6 +73,8 @@ WRITES = [
     ("app.routers.bugs", "PATCH", "/{bug_id}/status"),
     ("app.routers.moderation", "PUT", "/admin/reports/{report_id}/review"),
     ("app.routers.moderation", "DELETE", "/admin/content/{content_type}/{content_id}"),
+    ("app.routers.moderation", "POST", "/admin/queue/{content_type}/{content_id}/keep"),
+    ("app.routers.moderation", "POST", "/admin/queue/{content_type}/{content_id}/remove"),
 ]
 
 READS = [
@@ -82,6 +84,7 @@ READS = [
     ("app.routers.bugs", "GET", "/bugs/all"),
     ("app.routers.bugs", "GET", "/bugs/stats"),
     ("app.routers.moderation", "GET", "/admin/reports"),
+    ("app.routers.moderation", "GET", "/admin/queue"),
 ]
 
 

@@ -34,6 +34,7 @@ from app.models.deck_config import (
 )
 from app.core.model_config import get_client_for_tier
 from app.services import deck_field
+from app.services.public_content_service import removed_publish_refusal
 from app.utils.logger import get_logger
 
 router = APIRouter(
@@ -309,8 +310,11 @@ async def update_deck(
     # Do not allow updating internal or immutable fields.
     # forked_from is permanently set at fork time and must never be overwritten.
     # archived_at is a state written only by /archive and /restore (ADR-023).
-    for field in ["_id", "id", "user_id", "created_at", "forked_from", "archived_at"]:
+    # removal is moderation's marker (ADR-087): no owner write clears it, and a removed deck stays private.
+    for field in ["_id", "id", "user_id", "created_at", "forked_from", "archived_at", "removal"]:
         updates.pop(field, None)
+    if updates.get("is_public") and existing_deck.get("removal"):
+        raise removed_publish_refusal()
 
     try:
         await collection.update_one({"_id": ObjectId(existing_deck["_id"])}, {"$set": updates})
@@ -674,6 +678,8 @@ async def update_deck_settings(
         set_doc["config"] = body.config.model_dump()
 
     if body.is_public is not None:
+        if body.is_public and deck.get("removal"):
+            raise removed_publish_refusal()  # FR-005: a removed deck is never public again
         set_doc["is_public"] = body.is_public
         if body.is_public and not deck.get("published_at"):
             set_doc["published_at"] = datetime.now(timezone.utc)

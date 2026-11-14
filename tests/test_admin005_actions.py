@@ -19,10 +19,11 @@ from tests._fake_collection import FakeCollection
 NOW = datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc)
 
 
-def test_the_action_list_is_the_one_batch_1_writes():
+def test_the_action_list_is_batch_1_and_batch_3s():
     assert set(admin_actions.ADMIN_ACTIONS) == {
         "invite.create", "invite.send", "invite.resend", "invite.revoke",
         "curation.review", "admin.grant", "admin.revoke", "bug.status",
+        "report.review", "content.remove",
     }
 
 

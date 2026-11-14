@@ -29,6 +29,9 @@ KINDS: dict[str, dict[str, str]] = {
     "account.deleted": {"class": "account", "sender": "account", "button": "none"},
     # After a password change or set (ADR-092, FR-046): no button; a reply reaches support.
     "account.password": {"class": "account", "sender": "account", "button": "none"},
+    # Content of the account was removed from public view by moderation (ADR-087, FR-006):
+    # no button; a reply reaches support. A paragraph the values leave blank (no note) is left out.
+    "content.removed": {"class": "account", "sender": "account", "button": "none"},
     # To the operator only, in English (ADR-091, AI-007): an AI provider stopped answering.
     "ops.ai_provider": {"class": "notice", "sender": "account", "button": "none", "locale": "en"},
     "ops.ai_urgent": {"class": "notice", "sender": "account", "button": "none", "locale": "en"},
@@ -97,6 +100,11 @@ def _words(kind: str, locale: str) -> tuple[dict, dict]:
     return node, strings["common"]
 
 
+def _paragraphs(texts: list, values: Mapping[str, str]) -> list[str]:
+    """Each paragraph filled; one that fills to nothing (an optional value left blank) is left out."""
+    return [text for text in (_fill(p, values) for p in texts) if text.strip()]
+
+
 def _footer(words: dict, common: dict, values: Mapping[str, str], postal: str) -> list[str]:
     lines = [f"{_fill(words['footer'], values)} {_fill(common['questions'], values)}"]
     if postal.strip():
@@ -105,10 +113,10 @@ def _footer(words: dict, common: dict, values: Mapping[str, str], postal: str) -
 
 
 def _text_part(words: dict, common: dict, values: Mapping[str, str], postal: str, visitor: bool) -> str:
-    body = [_fill(p, values) for p in words["before"]]
+    body = _paragraphs(words["before"], values)
     if "button" in words:
         body.append(values["link"])  # alone on its line, so plain-text clients keep it whole
-    body += [_fill(p, values) for p in words.get("after", [])]
+    body += _paragraphs(words.get("after", []), values)
     body.append(words["signature"])
     lines = _footer(words, common, values, postal)
     if visitor:
@@ -120,17 +128,17 @@ def _text_part(words: dict, common: dict, values: Mapping[str, str], postal: str
 
 def _html_part(words: dict, common: dict, values: Mapping[str, str], postal: str, locale: str, logo_url: str, visitor: bool) -> str:
     safe = {key: html.escape(str(value), quote=True) for key, value in values.items()}
-    blocks = [_P.format(_fill(html.escape(p), safe)) for p in words["before"]]
+    blocks = [_P.format(p) for p in _paragraphs([html.escape(p) for p in words["before"]], safe)]
     if "button" in words:
         blocks.append(_BUTTON.format(href=safe["link"], label=html.escape(words["button"])))
         blocks.append(_LINK.format(_fill(html.escape(common["or_open"]), safe)))
-    blocks += [_P.format(_fill(html.escape(p), safe)) for p in words.get("after", [])]
+    blocks += [_P.format(p) for p in _paragraphs([html.escape(p) for p in words.get("after", [])], safe)]
     blocks.append(_P.format(html.escape(words["signature"])))
     footer = "<br>".join(html.escape(line) for line in _footer(words, common, values, postal))
     if visitor:
         footer += "<br>" + _LEAVE.format(prompt=html.escape(common["leave_prompt"]), href=safe["leave_link"], label=html.escape(common["leave_label"]))
     return _layout("layout.html").substitute(
-        lang=locale, subject=html.escape(words["subject"]), logo_url=html.escape(logo_url, quote=True),
+        lang=locale, subject=html.escape(_fill(words["subject"], values)), logo_url=html.escape(logo_url, quote=True),
         blocks="\n".join(blocks), footer=footer,
     )
 

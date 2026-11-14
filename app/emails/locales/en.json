@@ -141,5 +141,40 @@
       "signature": "Nowry",
       "footer": "Sent to $email, the operator address (NOTIFY_TO_EMAIL)."
     }
+  },
+  "content": {
+    "removed": {
+      "subject": "“$title” is no longer public on Nowry",
+      "before": [
+        "Hi,",
+        "$lead",
+        "$reason_line",
+        "$note_line",
+        "You can still use it privately: it stays in your library, where you can open, edit and study it as before.",
+        "If you think this is a mistake or have a question, reply to this email. A person reads every reply."
+      ],
+      "signature": "Nowry",
+      "footer": "Sent to $email because content of the Nowry account with this address was removed from public view.",
+      "types": {
+        "deck": "deck",
+        "book": "book"
+      },
+      "lead": {
+        "own": "Nowry removed your $type “$title” from public view. It is no longer public, and it can't be published again.",
+        "copy": "Your $type “$title” was a public copy of content that Nowry removed from public view, so it is no longer public either, and it can't be published again."
+      },
+      "reason_line": {
+        "own": "Why: $reason.",
+        "copy": "Why the original was removed: $reason."
+      },
+      "reasons": {
+        "copyright": "it appears to copy work protected by copyright without permission",
+        "inappropriate": "it contains material that isn't appropriate for Nowry",
+        "spam": "it is spam or advertising rather than study material",
+        "misinformation": "it presents false or misleading information as fact",
+        "other": "it breaks Nowry's rules for public content"
+      },
+      "note_line": "A note from the person who reviewed it: $note"
+    }
   }
 }

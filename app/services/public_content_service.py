@@ -75,12 +75,24 @@ def _source_not_publishable(reason: str) -> HTTPException:
     return HTTPException(status_code=409, detail={"code": SOURCE_NOT_PUBLISHABLE, "reason": reason})
 
 
+#: The refusal reason for content moderation removed from public view (ADR-087, FR-005).
+REMOVED_BY_MODERATION: str = "removed_by_moderation"
+
+
+def removed_publish_refusal() -> HTTPException:
+    """The 409 a removed deck or book earns on any way to publish it (FR-005)."""
+    return _source_not_publishable(REMOVED_BY_MODERATION)
+
+
 def direct_publish_block_reason(content_type: str, content: Dict[str, Any]) -> Optional[str]:
     """The refusal a document earns on its own fields, or None.
 
-    Books have carried `source` ("written" | "imported") since file import
-    existed; decks gained it with ADR-037 and read "created" when absent.
+    A removal marker refuses first and for good (ADR-087): only an admin script
+    clears it. Books have carried `source` ("written" | "imported") since file
+    import existed; decks gained it with ADR-037 and read "created" when absent.
     """
+    if content.get("removal"):
+        return REMOVED_BY_MODERATION
     if content.get("source") != "imported":
         return None
     return "imported_book" if content_type == "book" else "imported_deck"

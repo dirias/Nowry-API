@@ -1,24 +1,35 @@
 """
 Content Moderation API Router
-Handles reporting inappropriate/problematic public content
+Handles reporting inappropriate/problematic public content, and the admin's
+queue, Keep public and Unpublish (ADMIN-002, ADMIN-003, ADR-087). The review
+route and the direct removal route reach the same operations in
+`app/services/moderation.py`.
 """
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from typing import Any, Dict, Literal, Optional
 from pydantic import BaseModel
 from bson import ObjectId
-from datetime import datetime, timezone
 
 from app.config.database import db
 from app.models.PublicContent import ContentReport
 from app.models.moderation import (
+    NOTE_MAX_LENGTH,
     AdminReportPage,
-    AdminReportView,
+    KeepResult,
+    QueueResponse,
+    QueueState,
+    RemovableType,
+    RemovalRequest,
+    RemovalResult,
     ReportCreated,
     ReportPage,
-    ReportView,
+    ReportReason,
+    ReviewRequest,
+    ReviewResult,
 )
 from app.auth.firebase_auth import get_current_user
 from app.auth.dependencies import require_admin, require_recent_admin
+from app.services import moderation as moderation_service
 from app.services.notifications import notify, report_notification
 
 router = APIRouter(prefix="/moderation", tags=["Content Moderation"])
@@ -29,11 +40,6 @@ router = APIRouter(prefix="/moderation", tags=["Content Moderation"])
 class ReportContentRequest(BaseModel):
     reason: Literal["copyright", "inappropriate", "spam", "misinformation", "other"]
     description: Optional[str] = None
-
-
-class ReviewReportRequest(BaseModel):
-    action_taken: str  # "removed", "kept_public", "warned_creator"
-    resolution_notes: Optional[str] = None
 
 
 # ========== Ids (ADMIN-002) ==========
@@ -196,104 +202,78 @@ async def get_all_reports(
     return await _report_page(query, page, page_size)
 
 
-@router.put("/admin/reports/{report_id}/review")
-async def review_report(
-    report_id: str,
-    review_data: ReviewReportRequest,
-    current_user: dict = Depends(require_recent_admin),
-    report_object_id: ObjectId = Depends(report_oid),
+#: The most items one queue read answers.
+QUEUE_LIMIT_MAX: int = 100
+
+
+@router.get("/admin/queue", response_model=QueueResponse)
+async def get_moderation_queue(
+    state: QueueState = "to_review",
+    limit: int = Query(50, ge=1, le=QUEUE_LIMIT_MAX),
+    current_user: dict = Depends(require_admin),
 ):
-    """
-    Review and resolve a content report (Admin only).
-    """
-    
-    # Get report
-    report = await db["content_reports"].find_one({"_id": report_object_id})
-    
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-    
-    # Update report
-    update_data = {
-        "status": "resolved",
-        "reviewed_by": current_user.get("user_id"),
-        "reviewed_at": datetime.now(timezone.utc),
-        "action_taken": review_data.action_taken,
-        "resolution_notes": review_data.resolution_notes,
-        "updated_at": datetime.now(timezone.utc)
-    }
-    
-    await db["content_reports"].update_one(
-        {"_id": report_object_id},
-        {"$set": update_data}
-    )
-    
-    # If action is "removed", unpublish the content
-    if review_data.action_taken == "removed":
-        collection = db[f"{report['content_type']}s"]
-        await collection.update_one(
-            {"_id": ObjectId(report["content_id"])},
-            {
-                "$set": {
-                    "is_public": False,
-                    "updated_at": datetime.now(timezone.utc)
-                }
-            }
-        )
-    
-    # TODO: Send notification to reporter and content creator
-    
-    return {
-        "message": "Report reviewed successfully",
-        "report_id": report_id,
-        "action_taken": review_data.action_taken
-    }
+    """The Moderation tab: items to review (oldest report first), kept, or removed (newest first)."""
+    return await moderation_service.moderation_queue(state, limit)
 
 
-@router.delete("/admin/content/{content_type}/{content_id}")
-async def remove_public_content(
-    content_type: Literal["book", "deck"],
+@router.post("/admin/queue/{content_type}/{content_id}/keep", response_model=KeepResult)
+async def keep_content_public(
+    content_type: RemovableType,
     content_id: str,
-    reason: str,
     current_user: dict = Depends(require_recent_admin),
     content_object_id: ObjectId = Depends(content_oid),
 ):
-    """
-    Remove content from public access (Admin only).
-    Makes content private and notifies creator.
-    """
-    
-    collection = db[f"{content_type}s"]
-    
-    content = await collection.find_one({
-        "_id": content_object_id,
-        "is_public": True
-    })
-    
-    if not content:
-        raise HTTPException(status_code=404, detail="Public content not found")
-    
-    # Unpublish content
-    await collection.update_one(
-        {"_id": content_object_id},
-        {
-            "$set": {
-                "is_public": False,
-                "updated_at": datetime.now(timezone.utc)
-            }
-        }
+    """Keep public: every open report on the item is dismissed, one `report.review` row."""
+    dismissed = await moderation_service.keep_public(content_type, content_id, current_user["user_id"])
+    return {"dismissed": dismissed}
+
+
+@router.post("/admin/queue/{content_type}/{content_id}/remove", response_model=RemovalResult)
+async def unpublish_content(
+    content_type: RemovableType,
+    content_id: str,
+    body: RemovalRequest,
+    current_user: dict = Depends(require_recent_admin),
+    content_object_id: ObjectId = Depends(content_oid),
+):
+    """Unpublish, finally: the item and its public copies, the owners told (ADR-087)."""
+    return await moderation_service.remove_content(content_type, content_id, body.reason, body.note, current_user["user_id"])
+
+
+@router.put("/admin/reports/{report_id}/review", response_model=ReviewResult)
+async def review_report(
+    report_id: str,
+    review_data: ReviewRequest,
+    current_user: dict = Depends(require_recent_admin),
+    report_object_id: ObjectId = Depends(report_oid),
+):
+    """Decide one report: `kept` keeps its item public, `removed` unpublishes it (same operations as the queue)."""
+    report = await db["content_reports"].find_one({"_id": report_object_id})
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if report.get("status") not in moderation_service.OPEN_STATUSES:
+        raise HTTPException(status_code=409, detail={"code": "already_reviewed"})
+    content_type, content_id = report["content_type"], report["content_id"]
+    actor = current_user["user_id"]
+    if review_data.action == "kept":
+        dismissed = await moderation_service.keep_public(content_type, content_id, actor, review_data.note)
+        return {"report_id": report_id, "action": "kept", "dismissed": dismissed}
+    if content_type not in moderation_service.REMOVABLE_TYPES or not ObjectId.is_valid(content_id):
+        raise HTTPException(status_code=400, detail={"code": "not_removable"})
+    removal = await moderation_service.remove_content(
+        content_type, content_id, review_data.reason or report["reason"], review_data.note, actor, report_id=report_id,
     )
-    
-    # TODO: Send notification to content creator
-    # await notify_creator(
-    #     user_id=content["user_id"],
-    #     content_type=content_type,
-    #     content_id=content_id,
-    #     reason=reason
-    # )
-    
-    return {
-        "message": "Content removed from public access",
-        "content_id": content_id,
-        "reason": reason
-    }
+    return {"report_id": report_id, "action": "removed", "removal": removal}
+
+
+@router.delete("/admin/content/{content_type}/{content_id}", response_model=RemovalResult)
+async def remove_public_content(
+    content_type: RemovableType,
+    content_id: str,
+    reason: ReportReason,
+    note: Optional[str] = Query(None, max_length=NOTE_MAX_LENGTH),
+    current_user: dict = Depends(require_recent_admin),
+    content_object_id: ObjectId = Depends(content_oid),
+):
+    """The direct removal: the same operation as Unpublish in the queue."""
+    return await moderation_service.remove_content(content_type, content_id, reason, note, current_user["user_id"])

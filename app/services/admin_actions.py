@@ -16,7 +16,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-#: The fixed list of what an admin can do. Later batches add `report.review` and `content.remove`.
+#: The fixed list of what an admin can do. Batch 3 (ADMIN-003) adds the moderation decisions.
 AdminAction = Literal[
     "invite.create",
     "invite.send",
@@ -26,6 +26,8 @@ AdminAction = Literal[
     "admin.grant",
     "admin.revoke",
     "bug.status",
+    "report.review",
+    "content.remove",
 ]
 ADMIN_ACTIONS: tuple = get_args(AdminAction)
 

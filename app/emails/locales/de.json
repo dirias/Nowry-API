@@ -121,5 +121,40 @@
       "signature": "Didier, Nowry",
       "footer": "Gesendet an $email, weil diese Adresse zur Nowry-Beta eingeladen wurde."
     }
+  },
+  "content": {
+    "removed": {
+      "subject": "„$title“ ist auf Nowry nicht mehr öffentlich",
+      "before": [
+        "Hallo,",
+        "$lead",
+        "$reason_line",
+        "$note_line",
+        "Du kannst es weiterhin privat nutzen: Es bleibt in deiner Bibliothek, wo du es wie bisher öffnen, bearbeiten und lernen kannst.",
+        "Wenn du das für einen Fehler hältst oder eine Frage hast, antworte einfach auf diese E-Mail. Jede Antwort liest ein Mensch."
+      ],
+      "signature": "Nowry",
+      "footer": "Gesendet an $email, weil Inhalte des Nowry-Kontos mit dieser Adresse aus dem öffentlichen Bereich entfernt wurden.",
+      "types": {
+        "deck": "Deck",
+        "book": "Buch"
+      },
+      "lead": {
+        "own": "Nowry hat dein $type „$title“ aus dem öffentlichen Bereich entfernt. Es ist nicht mehr öffentlich und kann nicht erneut veröffentlicht werden.",
+        "copy": "dein $type „$title“ war eine öffentliche Kopie von Inhalten, die Nowry aus dem öffentlichen Bereich entfernt hat. Deshalb ist es ebenfalls nicht mehr öffentlich und kann nicht erneut veröffentlicht werden."
+      },
+      "reason_line": {
+        "own": "Grund: $reason.",
+        "copy": "Grund für die Entfernung des Originals: $reason."
+      },
+      "reasons": {
+        "copyright": "es scheint urheberrechtlich geschützte Werke ohne Erlaubnis zu kopieren",
+        "inappropriate": "es enthält Material, das für Nowry nicht angemessen ist",
+        "spam": "es ist Spam oder Werbung statt Lernmaterial",
+        "misinformation": "es stellt falsche oder irreführende Informationen als Tatsachen dar",
+        "other": "es verstößt gegen die Regeln von Nowry für öffentliche Inhalte"
+      },
+      "note_line": "Eine Notiz der Person, die es geprüft hat: $note"
+    }
   }
 }

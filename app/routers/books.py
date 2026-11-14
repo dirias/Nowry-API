@@ -14,6 +14,7 @@ from app.models.ai_expand import AIExpandRequest, AIExpandResponse
 from app.config.database import books_collection, cards_collection, users_collection
 from app.models.CardGenerationRequest import compute_effective_cap
 from app.services.book_sections import PLUS_CARDS_PER_SECTION, annotate_with_cards, document_stats, parse_lexical, split_sections
+from app.services.public_content_service import removed_publish_refusal
 from app.config.subscription_plans import SUBSCRIPTION_PLANS, SubscriptionTier
 
 DOCUMENT_TOO_LONG_CODE = "document_too_long"
@@ -137,6 +138,8 @@ async def edit_book(
                         "source_hash", "source_filename", "search_terms"]
     for field in fields_to_remove:
         update_data.pop(field, None)
+    if update_data.get("is_public") and existing_book.get("removal"):
+        raise removed_publish_refusal()  # FR-005: a removed book is never public again
 
     if "title" in update_data:
         update_data["title"] = clean_label(update_data["title"], TITLE_MAX_LENGTH)

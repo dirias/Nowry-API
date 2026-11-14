@@ -121,5 +121,40 @@
       "signature": "Didier, Nowry",
       "footer": "Envoyé à $email parce que cette adresse a été invitée à la bêta de Nowry."
     }
+  },
+  "content": {
+    "removed": {
+      "subject": "« $title » n'est plus public sur Nowry",
+      "before": [
+        "Bonjour,",
+        "$lead",
+        "$reason_line",
+        "$note_line",
+        "Vous pouvez toujours l'utiliser en privé : il reste dans votre bibliothèque, où vous pouvez l'ouvrir, le modifier et l'étudier comme avant.",
+        "Si vous pensez qu'il s'agit d'une erreur ou si vous avez une question, répondez à cet e-mail. Une personne lit chaque réponse."
+      ],
+      "signature": "Nowry",
+      "footer": "Envoyé à $email parce qu'un contenu du compte Nowry lié à cette adresse a été retiré de l'espace public.",
+      "types": {
+        "deck": "paquet",
+        "book": "livre"
+      },
+      "lead": {
+        "own": "Nowry a retiré votre $type « $title » de l'espace public. Il n'est plus public et ne peut plus être publié.",
+        "copy": "Votre $type « $title » était une copie publique d'un contenu que Nowry a retiré de l'espace public : il n'est donc plus public non plus et ne peut plus être publié."
+      },
+      "reason_line": {
+        "own": "Motif : $reason.",
+        "copy": "Motif du retrait de l'original : $reason."
+      },
+      "reasons": {
+        "copyright": "il semble reproduire une œuvre protégée par le droit d'auteur sans autorisation",
+        "inappropriate": "il contient des éléments qui ne conviennent pas à Nowry",
+        "spam": "il s'agit de spam ou de publicité, pas de matériel d'étude",
+        "misinformation": "il présente comme des faits des informations fausses ou trompeuses",
+        "other": "il enfreint les règles de Nowry pour le contenu public"
+      },
+      "note_line": "Note de la personne qui l'a examiné : $note"
+    }
   }
 }
