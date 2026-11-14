@@ -38,6 +38,8 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import HTTPException
 
+from app.config.environment import is_production
+
 #: The header a sign-up request carries its invite code in.
 INVITE_HEADER: str = "X-Invite-Code"
 
@@ -181,11 +183,28 @@ def parse_invite_codes(raw: Optional[str]) -> Dict[str, str]:
     return {code: rule.cohort for code, rule in parse_code_rules(raw).items()}
 
 
+#: The cohort of test sign-ups on development; production never honours it (ADR-088, FR-014).
+DEV_COHORT: str = "dev"
+
+
+def refused_here(rule: CodeRule) -> bool:
+    """Whether this environment ignores the rule's cohort: `dev` in production (ADR-088)."""
+    return rule.cohort == DEV_COHORT and is_production()
+
+
 def code_rule(code: Optional[str]) -> Optional[CodeRule]:
-    """The rule for a code, or None when the code is not one of ours."""
+    """The rule for a code, or None when the code is not one of ours.
+
+    In production a code of cohort `dev` is answered as unknown, and the
+    warning names the cohort, never the code (BETA-006, ADR-088).
+    """
     if not code:
         return None
-    return code_rules().get(code.strip().lower())
+    rule = code_rules().get(code.strip().lower())
+    if rule is not None and refused_here(rule):
+        logger.warning("beta: a code of cohort '%s' was ignored: that cohort is refused in production", rule.cohort)
+        return None
+    return rule
 
 
 def invite_cohort(code: Optional[str]) -> Optional[str]:
@@ -228,6 +247,8 @@ def describe_code_rules() -> List[str]:
     for rule in code_rules().values():
         limits = f"max {rule.max_uses if rule.max_uses is not None else 'none'}, last day {rule.expires or 'none'}"
         state = "" if rule.usable else " — UNREADABLE LIMIT, this code is refused"
+        if refused_here(rule):
+            state += " — refused in production (ADR-088)"
         lines.append(f"cohort '{rule.cohort or '(unnamed)'}': {limits}{state}")
     return lines
 
