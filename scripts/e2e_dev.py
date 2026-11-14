@@ -10,6 +10,7 @@ every address must be one of the run's aliases, ``rikydier+e2e-<run>-<case>@gmai
     python -I -m scripts.e2e_dev make-admin <email>         is_admin on a suite account
     python -I -m scripts.e2e_dev expire-invites <email>     open invitations to that alias end now
     python -I -m scripts.e2e_dev backdate-deletion <email> <days>   the deleted record and its rows, moved back
+    python -I -m scripts.e2e_dev set-xp <email> <xp>         the account's XP total, e.g. one review short of a stage
     python -I -m scripts.e2e_dev cleanup <run>              everything the run made, gone (Firebase included)
 
 Prints one JSON object. Never prints a token or a secret.
@@ -109,6 +110,14 @@ async def expire_invites(db, email: str) -> Dict[str, Any]:
     return {"changed": result.modified_count}
 
 
+async def set_xp(db, email: str, xp: int) -> Dict[str, Any]:
+    """Put a suite account at `xp` total, e.g. one review short of a stage (EVO-020)."""
+    if xp < 0:
+        refuse("xp cannot be negative")
+    result = await db.users.update_one({**alias_query("email", email), "deleted_at": None}, {"$set": {"agent.xp": xp}})
+    return {"changed": result.modified_count, "xp": xp}
+
+
 async def backdate_deletion(db, email: str, days: float) -> Dict[str, Any]:
     from app.services.account_deletion import OWNED
 
@@ -184,6 +193,8 @@ async def main(argv: List[str]) -> None:
             result = await make_admin(db, email)
         elif command == "expire-invites":
             result = await expire_invites(db, email)
+        elif command == "set-xp":
+            result = await set_xp(db, email, int(args[1]))
         elif command == "backdate-deletion":
             result = await backdate_deletion(db, email, float(args[1]))
         else:
