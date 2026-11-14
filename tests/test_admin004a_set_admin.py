@@ -110,4 +110,4 @@ def test_the_email_is_required():
 
 
 def test_the_docstring_names_the_railway_command():
-    assert "railway run --environment Production --service Nowry -- .venv/bin/python -I -m scripts.set_admin --email" in set_admin.__doc__
+    assert "railway run --environment Production --service Nowry -- .venv/bin/python -m scripts.set_admin --email" in set_admin.__doc__
