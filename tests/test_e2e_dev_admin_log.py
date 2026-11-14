@@ -40,3 +40,25 @@ async def test_is_reached_only_through_the_guarded_dispatch(monkeypatch):
 def test_cleanup_reaches_the_admin_log():
     import inspect
     assert '("admin_actions", "target_title")' in inspect.getsource(e2e_dev.cleanup)
+
+
+@pytest.mark.asyncio
+async def test_backdates_created_and_sent_times_of_the_address_invitations():
+    from datetime import datetime, timedelta, timezone
+    at = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)
+    db = MagicMock()
+    cursor = MagicMock()
+    cursor.to_list = AsyncMock(return_value=[{"_id": 1, "created_at": at, "sent_at": at}, {"_id": 2, "created_at": at}])
+    db.invites.find = MagicMock(return_value=cursor)
+    db.invites.update_one = AsyncMock()
+    result = await e2e_dev.backdate_invites(db, "rikydier+e2e-abc-adm-a@gmail.com", 2)
+    assert result == {"changed": 2}
+    first, second = db.invites.update_one.await_args_list
+    assert first.args[1] == {"$set": {"created_at": at - timedelta(hours=2), "sent_at": at - timedelta(hours=2)}}
+    assert second.args[1] == {"$set": {"created_at": at - timedelta(hours=2)}}
+
+
+@pytest.mark.asyncio
+async def test_backdating_refuses_an_unbounded_shift():
+    with pytest.raises(SystemExit):
+        await e2e_dev.backdate_invites(MagicMock(), "rikydier+e2e-abc-adm-a@gmail.com", 500)

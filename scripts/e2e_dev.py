@@ -9,6 +9,7 @@ every address must be one of the run's aliases, ``rikydier+e2e-<run>-<case>@gmai
     python -I -m scripts.e2e_dev waitlist <email>           the waitlist row
     python -I -m scripts.e2e_dev make-admin <email>         is_admin on a suite account
     python -I -m scripts.e2e_dev admin-log <email>          the admin log rows about a suite address
+    python -I -m scripts.e2e_dev backdate-invites <email> <hours>   its invitations' created_at and sent_at, moved back
     python -I -m scripts.e2e_dev expire-invites <email>     open invitations to that alias end now
     python -I -m scripts.e2e_dev backdate-deletion <email> <days>   the deleted record and its rows, moved back
     python -I -m scripts.e2e_dev set-xp <email> <xp>         the account's XP total, e.g. one review short of a stage
@@ -111,6 +112,19 @@ async def expire_invites(db, email: str) -> Dict[str, Any]:
     return {"changed": result.modified_count}
 
 
+async def backdate_invites(db, email: str, hours: float) -> Dict[str, Any]:
+    """Move a suite address's invitations back in time, so Resend's hourly limit is passed (E2E-ADMIN-1)."""
+    if hours <= 0 or hours > 48:
+        refuse("hours must be between 0 and 48")
+    rows = await db.invites.find(alias_query("email", email)).to_list(length=20)
+    shift = timedelta(hours=hours)
+    for row in rows:
+        moved = {name: row[name] - shift for name in ("created_at", "sent_at") if isinstance(row.get(name), datetime)}
+        if moved:
+            await db.invites.update_one({"_id": row["_id"]}, {"$set": moved})
+    return {"changed": len(rows)}
+
+
 async def admin_log(db, email: str) -> Dict[str, Any]:
     """The admin log rows about a suite address, oldest first: action and outcome only (E2E-ADMIN-1)."""
     rows = await db.admin_actions.find(alias_query("target_title", email)).sort("created_at", 1).to_list(length=50)
@@ -200,6 +214,8 @@ async def main(argv: List[str]) -> None:
             result = await make_admin(db, email)
         elif command == "expire-invites":
             result = await expire_invites(db, email)
+        elif command == "backdate-invites":
+            result = await backdate_invites(db, email, float(args[1]))
         elif command == "admin-log":
             result = await admin_log(db, email)
         elif command == "set-xp":
