@@ -421,3 +421,22 @@ def test_the_reads_have_their_indexes():
         assert keys("waitlist")["waitlist_status_created"] == [("status", 1), ("created_at", 1)]
         assert keys("bugs")["bugs_status_severity"] == [("status", 1), ("severity", 1)]
         assert keys("email_sends")["email_sends_day_class"] == [("day", 1), ("class", 1), ("outcome", 1)]
+
+
+def test_a_copy_row_is_flagged_without_its_source_id():
+    assert admin_log.safe_details({"copy_of": "65f0a1b2c3d4e5f6a7b8c9d0", "note": "x"}) == {"is_copy": True}
+    assert "is_copy" not in admin_log.safe_details({"copies": [{"content_id": "a"}]})
+
+
+@pytest.mark.asyncio
+async def test_the_overview_leaves_a_removals_copies_to_its_own_row(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+    cursor = MagicMock()
+    cursor.sort.return_value = cursor
+    cursor.limit.return_value = cursor
+    cursor.to_list = AsyncMock(return_value=[])
+    find = MagicMock(return_value=cursor)
+    monkeypatch.setattr(admin_log.admin_actions_collection, "find", find)
+    from datetime import datetime, timezone
+    await admin_log.recent_actions(datetime(2026, 11, 8, tzinfo=timezone.utc), 8, None)
+    assert find.call_args.args[0]["details.copy_of"] == {"$exists": False}

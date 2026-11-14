@@ -43,12 +43,14 @@ def _plain(value: Any) -> bool:
 
 
 def safe_details(details: Any) -> Dict[str, Any]:
-    """The subset of a row's details any admin may read; `copies` becomes their count."""
+    """The subset of a row's details any admin may read; `copies` becomes their count, `copy_of` a flag."""
     if not isinstance(details, dict):
         return {}
     kept = {key: details[key] for key in SAFE_DETAIL_KEYS if key in details and _plain(details[key])}
     if isinstance(details.get("copies"), list):
         kept["copies"] = len(details["copies"])
+    if details.get("copy_of"):
+        kept["is_copy"] = True  # a public copy taken by a removal; the item's own row names the copies
     return kept
 
 
@@ -164,7 +166,8 @@ async def read_actions(kind: Optional[str], before: Optional[str], limit: int, c
 
 
 async def recent_actions(since: datetime, limit: int, caller_id: Optional[str]) -> List[Dict[str, Any]]:
-    """The newest rows after `since`, at most `limit`."""
-    rows = await admin_actions_collection.find(actions_query(None, since=since)).sort(NEWEST_FIRST).limit(
+    """The newest rows after `since`, at most `limit`; a removal's copies are left to its own row, which counts them."""
+    query = {**actions_query(None, since=since), "details.copy_of": {"$exists": False}}
+    rows = await admin_actions_collection.find(query).sort(NEWEST_FIRST).limit(
         limit).to_list(length=limit)
     return await _views(rows, caller_id)
