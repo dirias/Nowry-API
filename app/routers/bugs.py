@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi import status as http_status
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from bson import ObjectId
 
@@ -15,42 +15,25 @@ from app.config.database import bugs_collection, users_collection
 from app.auth.firebase_auth import get_firebase_user
 from app.auth.dependencies import require_admin, require_recent_admin
 from app.services.admin_actions import record_admin_action
+from app.services.notifications import notify
+from app.config.beta import beta_config
 
 router = APIRouter(prefix="/bugs", tags=["bugs"])
 
 
-@router.post("", response_model=BugReportResponse)
-async def submit_bug_report(
-    bug_data: BugReportCreate, current_user=Depends(get_firebase_user)
-):
-    """
-    Submit a new bug report.
+#: What `POST /bugs` answers when the beta is off (FR-007).
+REPORTS_CLOSED: Dict[str, str] = {"code": "reports_closed"}
 
-    Available to all users (especially beta testers).
-    Captures bug details, screenshots, and browser information.
-    """
 
-    # Check if user has beta features (optional - for now allow all users)
-    user_id = current_user.get("user_id")
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+def ensure_reports_open() -> None:
+    """Reports are taken only while the beta is on; otherwise 403 `reports_closed`."""
+    if not beta_config()["active"]:
+        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail=REPORTS_CLOSED)
 
-    # For beta, we can allow all users to report bugs
-    # Later, we can restrict to beta testers only
-    # if not user.get("beta_features", {}).get("bug_reporting", False):
-    #     raise HTTPException(
-    #         status_code=http_status.HTTP_403_FORBIDDEN,
-    #         detail="Bug reporting is only available for beta testers"
-    #     )
 
-    # Validate screenshot count (max 3)
-    if len(bug_data.screenshots) > 3:
-        raise HTTPException(
-            status_code=http_status.HTTP_400_BAD_REQUEST,
-            detail="Maximum 3 screenshots allowed per bug report",
-        )
-
-    # Create bug report document
-    bug_dict = {
+def new_bug_document(bug_data: BugReportCreate, user_id: str, now: datetime) -> Dict[str, Any]:
+    """The stored report: today's fields, the client's platform, and an empty note history."""
+    return {
         "user_id": user_id,
         "title": bug_data.title,
         "description": bug_data.description,
@@ -59,24 +42,72 @@ async def submit_bug_report(
         "actual_behavior": bug_data.actual_behavior,
         "severity": bug_data.severity,
         "category": bug_data.category,
-        "url": bug_data.url,
-        "browser_info": bug_data.browser_info.model_dump(),
+        "url": bug_data.url or "",
+        "browser_info": bug_data.browser_info.model_dump() if bug_data.browser_info else None,
         "screenshots": [s.model_dump() for s in bug_data.screenshots],
-        "status": "open",
+        "platform": bug_data.platform,
+        "app_version": bug_data.app_version,
+        "device": bug_data.device,
+        "status": "new",
         "priority": None,
+        "notes": [],
         "tags": [],
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
+        "created_at": now,
+        "updated_at": now,
         "resolved_at": None,
     }
 
-    # Insert into database
-    result = await bugs_collection.insert_one(bug_dict)
 
+def bug_notification(bug: Dict[str, Any], username: str) -> Tuple[str, str]:
+    """Subject and body of the operator notice. The reporter by username, never by address."""
+    lines = [
+        f"Severity: {bug['severity']}",
+        f"Category: {bug['category']}",
+        f"Platform: {bug['platform']}",
+        f"Device: {bug.get('device') or ''}",
+        f"App version: {bug.get('app_version') or ''}",
+        f"Page: {bug.get('url') or ''}",
+        f"Reporter: {username}",
+        "",
+        bug["description"],
+    ]
+    return f"[Nowry] Bug: {bug['title']}", "\n".join(lines)
+
+
+async def reporter_username(user_id: str) -> str:
+    """The reporter's username, or "" when the account cannot be read."""
+    if not ObjectId.is_valid(user_id):
+        return ""
+    account = await users_collection.find_one({"_id": ObjectId(user_id)}, {"username": 1})
+    return (account or {}).get("username") or ""
+
+
+async def notify_operator(bug: Dict[str, Any]) -> None:
+    """Tell the operator about a new report. `notify` never raises."""
+    subject, text = bug_notification(bug, await reporter_username(bug["user_id"]))
+    await notify(subject, text)
+
+
+@router.post("", response_model=BugReportResponse)
+async def submit_bug_report(
+    bug_data: BugReportCreate,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_firebase_user),
+) -> BugReportResponse:
+    """Store a tester's report while the beta is on, then tell the operator (BUG-001, FR-007)."""
+    ensure_reports_open()
+    if len(bug_data.screenshots) > 3:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 3 screenshots allowed per bug report",
+        )
+    bug_dict = new_bug_document(bug_data, current_user.get("user_id"), datetime.now(timezone.utc))
+    result = await bugs_collection.insert_one(bug_dict)
+    background_tasks.add_task(notify_operator, bug_dict)
     return BugReportResponse(
         bug_id=str(result.inserted_id),
         message="Bug report submitted successfully. Thank you for helping us improve!",
-        status="open",
+        status=bug_dict["status"],
         created_at=bug_dict["created_at"],
     )
 
