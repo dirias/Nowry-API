@@ -67,11 +67,18 @@ async def set_password(uid: str, password: str) -> None:
     await asyncio.to_thread(firebase_admin_auth.update_user, uid, password=password)
 
 
-async def revocation_time(uid: str) -> int:
-    """Firebase's own cut after a password change, in seconds; now when it has none."""
+async def revocation_time(uid: str, not_before: int) -> int:
+    """Firebase's own cut after a password change, in seconds, never older than `not_before`.
+
+    `not_before` is when the change began. Firebase can still answer with its
+    earlier valid-after just after the update (found by the dev suite: the
+    account's creation time), which put the cut before another device's sign-in
+    and left that device signed in.
+    """
     record = await asyncio.to_thread(firebase_admin_auth.get_user, uid)
     valid_after_ms = getattr(record, "tokens_valid_after_timestamp", None)
-    return int(valid_after_ms // 1000) if valid_after_ms else int(datetime.now(timezone.utc).timestamp())
+    firebase_cut = int(valid_after_ms // 1000) if valid_after_ms else 0
+    return max(firebase_cut, int(not_before))
 
 
 async def cut_sessions(user_id: str, uid: str, at: int) -> None:

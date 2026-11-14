@@ -73,8 +73,10 @@ async def change_password(
         if wait:
             raise _too_many(wait)
         raise HTTPException(status_code=400, detail={"code": "wrong_password"})
+    # Taken before the update: the cut is never older than the change itself.
+    began = int(time.time())
     await account_password.set_password(uid, payload.new_password)
-    await account_password.cut_sessions(current_user["user_id"], uid, await account_password.revocation_time(uid))
+    await account_password.cut_sessions(current_user["user_id"], uid, await account_password.revocation_time(uid, began))
     background.add_task(account_password.send_notice, user["email"], _locale(payload.language, user))
     return PasswordResult(status="changed")
 

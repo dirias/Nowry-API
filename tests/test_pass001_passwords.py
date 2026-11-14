@@ -158,3 +158,23 @@ def test_our_verified_flag_is_read_from_firebase_never_set_alone():
     assert verification_update({"email_verified": False}, {"email_verified": True})["email_verified"] is True
     assert verification_update({"email_verified": None}, {"email_verified": False}) == {"email_verified": False}
     assert verification_update({"email_verified": True}, {"email_verified": True}) == {}
+
+
+@pytest.mark.asyncio
+async def test_the_cut_is_never_older_than_the_change_even_when_firebase_answers_late(monkeypatch):
+    """Found by the dev suite: Firebase can still answer with its earlier
+    valid-after (here, when the account was made) just after the password is
+    updated. The cut then fell before another device's sign-in and that device
+    stayed in. The cut is never older than the moment the change began."""
+    from unittest.mock import MagicMock
+
+    from app.services import account_password as svc
+
+    began = int(time.time())
+    stale = MagicMock(tokens_valid_after_timestamp=(began - 600) * 1000)
+    monkeypatch.setattr(svc.firebase_admin_auth, "get_user", lambda uid: stale)
+    assert await svc.revocation_time("uid-1", not_before=began) == began
+
+    fresh = MagicMock(tokens_valid_after_timestamp=(began + 1) * 1000)
+    monkeypatch.setattr(svc.firebase_admin_auth, "get_user", lambda uid: fresh)
+    assert await svc.revocation_time("uid-1", not_before=began) == began + 1
