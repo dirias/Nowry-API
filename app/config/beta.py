@@ -241,6 +241,11 @@ async def open_code_rule(code: Optional[str], count_uses: CountUses, now: Option
     return rule if uses < rule.max_uses else None
 
 
+def configured_cohorts() -> List[str]:
+    """The named cohorts of the cohort codes this environment honours, sorted (for the admin's cohort list)."""
+    return sorted({rule.cohort for rule in code_rules().values() if rule.cohort and not refused_here(rule)})
+
+
 def describe_code_rules() -> List[str]:
     """One line per cohort code for the start-up log: cohort and limits, never the code."""
     lines: List[str] = []

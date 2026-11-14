@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from string import Template
+from datetime import datetime
 from typing import Mapping, Optional
 
 HERE = Path(__file__).parent
@@ -35,6 +36,9 @@ KINDS: dict[str, dict[str, str]] = {
     "waitlist.confirm": {"class": "confirmation", "sender": "personal"},
     # The form met an address that already has an account (ADR-084): the waitlist's look and sender, but not a list email, so no leave link.
     "waitlist.account": {"class": "confirmation", "sender": "personal", "leave": "none"},
+    # The personal invitation (ADR-077 amendment, FR-012): a letter to a visitor (ADR-078 point 1b),
+    # so it carries the leave link and the one-click header; one button to /register?invite=….
+    "beta.invitation": {"class": "invitation", "sender": "personal"},
 }
 
 _P = '<p style="margin:0 0 14px;">{}</p>'
@@ -67,6 +71,12 @@ def resolve_locale(locale: Optional[str]) -> str:
 @lru_cache(maxsize=None)
 def load_strings(locale: str) -> dict:
     return json.loads((HERE / "locales" / f"{locale}.json").read_text(encoding="utf-8"))
+
+
+def format_day(moment: datetime, locale: Optional[str]) -> str:
+    """A day and month in the reader's language: "28 November", "28 de noviembre", "11月28日"."""
+    common = load_strings(resolve_locale(locale))["common"]
+    return Template(common["date"]).substitute(day=moment.day, month=common["months"][moment.month - 1])
 
 
 @lru_cache(maxsize=None)

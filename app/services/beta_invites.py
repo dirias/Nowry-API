@@ -38,7 +38,7 @@ async def count_code_uses(code: str, ceiling: int) -> int:
 
 async def create_invite(
     email: str, cohort: str, created_by: str, days: Optional[int] = None, note: Optional[str] = None,
-    collection=None, now: Optional[datetime] = None,
+    collection=None, now: Optional[datetime] = None, locale: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Make an invitation for one address and return its row and its token.
 
@@ -52,7 +52,7 @@ async def create_invite(
         {"$set": {"status": rules.STATUS_REVOKED, "revoked_at": at, "revoked_by": created_by}},
     )
     token = rules.make_token()
-    row = rules.new_invite_document(email, cohort, token, created_by, at, days, note)
+    row = rules.new_invite_document(email, cohort, token, created_by, at, days, note, locale)
     result = await collection.insert_one(row)
     row["_id"] = result.inserted_id
     return row, token

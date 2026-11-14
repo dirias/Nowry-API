@@ -64,9 +64,15 @@ def ttl_days(requested: Optional[int] = None) -> int:
 
 
 def new_invite_document(
-    email: str, cohort: str, token: str, created_by: str, now: datetime, days: Optional[int] = None, note: Optional[str] = None
+    email: str, cohort: str, token: str, created_by: str, now: datetime, days: Optional[int] = None, note: Optional[str] = None,
+    locale: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """The row a new invitation is stored as. The token itself is not in it."""
+    """The row a new invitation is stored as. The token itself is not in it.
+
+    `locale` is the language its letter is written in; `sent_at`, `send_count`
+    and `last_error` record the letter (INVITE-008). A row made without a
+    letter (the single-address call) keeps them empty.
+    """
     return {
         "token_hash": hash_token(token),
         "email": normalize_email(email),
@@ -81,6 +87,11 @@ def new_invite_document(
         "used_by_uid": None,
         "revoked_at": None,
         "revoked_by": None,
+        "locale": locale,
+        "lifetime_days": ttl_days(days),
+        "sent_at": None,
+        "send_count": 0,
+        "last_error": None,
     }
 
 

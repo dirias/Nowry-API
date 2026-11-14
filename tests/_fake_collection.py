@@ -1,7 +1,7 @@
 """A small in-memory stand-in for a Motor collection, for the invitation tests.
 
 It understands the filters those tests use (equality, `$or`, `$gt`, `$lte`,
-`$lt`, `$ne`, `$exists`, `$regex`) and applies `$set`, `$unset` and, on an upsert,
+`$lt`, `$ne`, `$in`, `$exists`, `$regex`) and applies `$set`, `$unset` and, on an upsert,
 `$setOnInsert`, so an atomic claim is exercised as a query, not as a mock that
 returns whatever the test told it to.
 """
@@ -29,6 +29,8 @@ def _matches(row: Dict[str, Any], query: Dict[str, Any]) -> bool:
             if "$lt" in wanted and not (value is not None and value < wanted["$lt"]):
                 return False
             if "$ne" in wanted and value == wanted["$ne"]:
+                return False
+            if "$in" in wanted and value not in wanted["$in"]:
                 return False
             if "$exists" in wanted and (key in row) != bool(wanted["$exists"]):
                 return False

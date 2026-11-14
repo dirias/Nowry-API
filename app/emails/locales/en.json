@@ -4,7 +4,22 @@
     "questions": "Questions: $support",
     "sender_personal": "Didier from Nowry",
     "leave_prompt": "Didn't ask for this, or changed your mind?",
-    "leave_label": "Leave the list"
+    "leave_label": "Leave the list",
+    "months": [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December"
+    ],
+    "date": "$day $month"
   },
   "account": {
     "verify": {
@@ -90,6 +105,21 @@
       ],
       "signature": "Didier, Nowry",
       "footer": "Sent to $email because this address was entered on the Nowry waitlist."
+    }
+  },
+  "beta": {
+    "invitation": {
+      "subject": "Your invitation to Nowry",
+      "before": [
+        "Hi,",
+        "Your place in the Nowry beta is open. This invitation is for $email only. It works once, until $expires."
+      ],
+      "button": "Create your account",
+      "after": [
+        "Testing the Android app? Create your account with this button first, then sign in on the app with the same address."
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "Sent to $email because this address was invited to the Nowry beta."
     }
   },
   "ops": {

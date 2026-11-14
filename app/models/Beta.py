@@ -6,7 +6,7 @@ before an account exists, and a waitlist entry is written by someone who was
 not let in.
 """
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Annotated, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -69,13 +69,16 @@ class WaitlistEntry(BaseModel):
 # ── Personal invitations (ADR-077, FR-019) ───────────────────────────────────
 
 InviteState = Literal["open", "used", "revoked", "expired"]
+InviteLocale = Literal["en", "es", "fr", "de", "ja"]
+#: A cohort name: lowercase letters, digits and hyphens, up to 40.
+COHORT_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 
 
 class InviteCreate(BaseModel):
     """What the operator posts to invite one address."""
 
     email: EmailStr
-    cohort: str = Field(min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    cohort: str = Field(min_length=1, max_length=40, pattern=COHORT_PATTERN)
     expires_in_days: Optional[int] = Field(default=None, ge=1, le=90)
     note: Optional[str] = Field(default=None, max_length=200)
 
@@ -92,6 +95,11 @@ class InviteSummary(BaseModel):
     expires_at: datetime
     used_at: Optional[datetime] = None
     revoked_at: Optional[datetime] = None
+    # The letter (INVITE-008): its language, when it last left, how many times, and why the last try did not.
+    locale: Optional[str] = None
+    sent_at: Optional[datetime] = None
+    send_count: int = 0
+    last_error: Optional[str] = None
 
 
 class InviteCreated(InviteSummary):
@@ -103,3 +111,44 @@ class InviteCreated(InviteSummary):
 class InviteListResponse(BaseModel):
     invites: List[InviteSummary]
     counts: Dict[str, Dict[str, int]]
+    #: Every invitation by state, for the list's filter chips.
+    totals: Dict[InviteState, int]
+
+
+class InviteBatchRequest(BaseModel):
+    """Up to 50 pasted entries, already split by the client; checked first (`dry_run`), then sent."""
+
+    addresses: List[Annotated[str, Field(max_length=320)]] = Field(min_length=1, max_length=50)
+    cohort: str = Field(min_length=1, max_length=40, pattern=COHORT_PATTERN)
+    expires_in_days: int = Field(default=14, ge=1, le=90)
+    locale: InviteLocale = "en"
+    dry_run: bool = True
+
+
+InviteBatchOutcome = Literal["will_invite", "open_invite", "has_account", "invalid", "left_list", "sent", "send_failed"]
+
+
+class InviteBatchResult(BaseModel):
+    """One distinct entry and what happened to it. Never a link."""
+
+    input: str
+    email: Optional[str] = None
+    outcome: InviteBatchOutcome
+    invite_id: Optional[str] = None
+
+
+class InviteBatchResponse(BaseModel):
+    dry_run: bool
+    results: List[InviteBatchResult]
+    counts: Dict[str, int]
+    invitations_left_today: int
+
+
+class InviteCohortsResponse(BaseModel):
+    """What the paste form offers: cohorts in use, link lifetimes, and today's invitations left."""
+
+    cohorts: List[str]
+    default_cohort: str
+    lifetimes: List[int]
+    default_lifetime: int
+    invitations_left_today: int

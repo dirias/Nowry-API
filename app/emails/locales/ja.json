@@ -4,7 +4,22 @@
     "questions": "お問い合わせ：$support",
     "sender_personal": "Nowry の Didier",
     "leave_prompt": "お心当たりがない場合や、気が変わった場合は",
-    "leave_label": "リストから外れる"
+    "leave_label": "リストから外れる",
+    "months": [
+      "1月",
+      "2月",
+      "3月",
+      "4月",
+      "5月",
+      "6月",
+      "7月",
+      "8月",
+      "9月",
+      "10月",
+      "11月",
+      "12月"
+    ],
+    "date": "$month$day日"
   },
   "account": {
     "verify": {
@@ -90,6 +105,21 @@
       ],
       "signature": "Didier, Nowry",
       "footer": "このアドレスが Nowry のウェイトリストに入力されたため、$email にお送りしました。"
+    }
+  },
+  "beta": {
+    "invitation": {
+      "subject": "Nowry へのご招待",
+      "before": [
+        "こんにちは。",
+        "Nowry ベータへの順番が来ました。この招待は $email 専用で、$expires まで一度だけ使えます。"
+      ],
+      "button": "アカウントを作成する",
+      "after": [
+        "Android アプリをお試しの場合は、まずこのボタンからアカウントを作成し、そのあと同じアドレスでアプリにログインしてください。"
+      ],
+      "signature": "Didier, Nowry",
+      "footer": "このメールは、$email が Nowry ベータに招待されたためお送りしています。"
     }
   }
 }
